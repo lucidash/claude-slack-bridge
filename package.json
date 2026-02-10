@@ -1,0 +1,29 @@
+{
+  "name": "claude-slack-bridge",
+  "version": "1.0.0",
+  "description": "Slack에서 Claude Code CLI를 원격 제어하는 브릿지 서버",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "slack",
+    "claude",
+    "claude-code",
+    "bridge",
+    "remote"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.63",
+    "@slack/web-api": "^7.13.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.0",
+    "node-cron": "^4.2.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
