@@ -48,6 +48,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
       saveThread(effectiveThreadKey, userId, detectedDir);
       lines.push(`📂 작업 디렉토리 자동 설정: \`${detectedDir}\``);
+      lines.push(`\`\`\`cd ${detectedDir} && claude --resume ${newSessionId}\`\`\``);
     } else {
       lines.push(`⚠️ 세션 파일을 찾을 수 없습니다. resume 실패 시 \`!wd\`로 디렉토리를 맞춰주세요.`);
     }
