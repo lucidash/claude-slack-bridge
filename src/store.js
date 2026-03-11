@@ -267,4 +267,8 @@ export function saveCrons(jobs) {
   writeJson(CRONS_FILE, jobs);
 }
 
+export function getAllThreads() {
+  return readJson(THREADS_FILE);
+}
+
 export { BRIDGE_DIR, SESSIONS_FILE, INBOX_FILE };
