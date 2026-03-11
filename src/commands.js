@@ -1,7 +1,7 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -246,6 +246,90 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       lines.push('📭 대기열 비어있음');
     }
     await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
+    return true;
+  }
+
+  // sync-all [duration] — 모든 활성 세션 일괄 동기화
+  const syncAllMatch = userMessage.match(/^[!\/]sync-all(?:\s+(\d+[hm]?))?$/i);
+  if (syncAllMatch) {
+    const durationStr = syncAllMatch[1] || '24h';
+    const durMatch = durationStr.match(/^(\d+)([hm])?$/);
+    const num = parseInt(durMatch[1]);
+    const unit = durMatch[2] || 'h';
+    const durationMs = unit === 'm' ? num * 60 * 1000 : num * 3600 * 1000;
+    const cutoff = Date.now() - durationMs;
+
+    const allSessions = getAllSessions();
+    const allThreads = getAllThreads();
+
+    // threads.json 순회 → sessionKey 역매핑으로 변경된 세션 탐색
+    const synced = [];
+    const unchanged = [];
+
+    for (const [threadKey, threadData] of Object.entries(allThreads)) {
+      const dashIdx = threadKey.indexOf('-');
+      if (dashIdx < 0) continue;
+      const threadChannel = threadKey.substring(0, dashIdx);
+      const threadTs = threadKey.substring(dashIdx + 1);
+      const sessionKey = `${threadData.userId}-${threadTs}`;
+      const sessionId = allSessions[sessionKey];
+      if (!sessionId) continue;
+
+      const file = findSessionFile(sessionId);
+      if (!file) continue;
+
+      const mtime = statSync(file).mtimeMs;
+      if (mtime < cutoff) continue;
+
+      const syncPoint = getSyncPoint(sessionId);
+      const summary = readSessionSummary(sessionId);
+      if (!summary) continue;
+
+      const newTurnCount = summary.turns.length - syncPoint;
+      if (newTurnCount <= 0) {
+        unchanged.push({ sessionId, cwd: summary.cwd });
+        continue;
+      }
+
+      // 해당 스레드에 간단한 동기화 알림 전송
+      const newTurns = summary.turns.slice(syncPoint);
+      const lastUser = [...newTurns].reverse().find(t => t.role === 'user');
+      const lastAssistant = [...newTurns].reverse().find(t => t.role === 'assistant');
+
+      const lines = [`🔄 자동 동기화: 로컬에서 +${newTurnCount}턴 추가됨 (전체 ${summary.turns.length}턴)`];
+      if (lastUser) {
+        const preview = lastUser.text.length > 100 ? lastUser.text.substring(0, 100) + '…' : lastUser.text;
+        lines.push(`👤 마지막 요청: ${preview}`);
+      }
+      if (lastAssistant?.text) {
+        const preview = lastAssistant.text.length > 200 ? lastAssistant.text.substring(0, 200) + '…' : lastAssistant.text;
+        lines.push(`🤖 마지막 응답: ${preview}`);
+      }
+
+      await slack.chat.postMessage({ channel: threadChannel, text: lines.join('\n'), thread_ts: threadTs });
+      saveSyncPoint(sessionId, summary.turns.length);
+
+      synced.push({ sessionId, cwd: summary.cwd, newTurnCount, totalTurns: summary.turns.length });
+    }
+
+    // 명령어가 실행된 스레드에 결과 요약 전송
+    const reportLines = [`📊 일괄 동기화 완료 (최근 ${durationStr})`];
+    if (synced.length > 0) {
+      reportLines.push(`\n✅ 동기화: ${synced.length}건`);
+      for (const s of synced) {
+        const sid = s.sessionId.substring(0, 8);
+        const dir = s.cwd ? s.cwd.replace(homedir(), '~') : '?';
+        reportLines.push(`  \`${sid}…\` +${s.newTurnCount}턴 — ${dir}`);
+      }
+    }
+    if (unchanged.length > 0) {
+      reportLines.push(`\n📭 변경 없음: ${unchanged.length}건`);
+    }
+    if (synced.length === 0 && unchanged.length === 0) {
+      reportLines.push('\n📭 대상 세션 없음');
+    }
+
+    await slack.chat.postMessage({ channel, text: reportLines.join('\n'), thread_ts: replyThreadTs });
     return true;
   }
 
