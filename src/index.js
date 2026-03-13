@@ -21,6 +21,24 @@ const PORT = process.env.PORT || 3005;
 // 세션별 lock/queue: 동일 세션에 대한 동시 resume 방지
 const sessionLocks = new Map();
 
+// Slack 이벤트 중복 처리 방지 (event_id → timestamp)
+const seenEvents = new Map();
+const EVENT_DEDUP_TTL = 60_000; // 60초
+
+function isDuplicateEvent(eventId) {
+  if (!eventId) return false;
+  if (seenEvents.has(eventId)) return true;
+  seenEvents.set(eventId, Date.now());
+  // TTL 지난 항목 정리 (100개 이상 쌓였을 때만)
+  if (seenEvents.size > 100) {
+    const cutoff = Date.now() - EVENT_DEDUP_TTL;
+    for (const [id, ts] of seenEvents) {
+      if (ts < cutoff) seenEvents.delete(id);
+    }
+  }
+  return false;
+}
+
 // AskUserQuestion 대기 중인 질문 (sessionKey → { resolve, reject, questions, timeoutId })
 const pendingQuestions = new Map();
 
@@ -46,6 +64,11 @@ app.post('/slack/events', (req, res) => {
   }
 
   if (type === 'event_callback' && event) {
+    const eventId = req.body.event_id;
+    if (isDuplicateEvent(eventId)) {
+      console.log(`[Dedup] Duplicate event ignored: ${eventId}`);
+      return res.status(200).send('OK');
+    }
     handleSlackEvent(event);
   }
 
