@@ -21,8 +21,49 @@ function formatCtx(usage) {
 /**
  * 특수 명령어 처리. 처리했으면 true (또는 resume 객체), 아니면 false 반환.
  */
+const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
+
+*세션 관리*
+\`!new\` / \`!reset\` — 새 세션 시작 (기존 세션 초기화)
+\`!session\` — 현재 세션 ID 확인
+\`!session <id>\` — 다른 세션으로 전환 (작업 디렉토리 자동 감지)
+\`!sync <id>\` — 로컬 세션 대화를 슬랙에 동기화 후 이어서 작업
+\`!sync-all\` — 최근 24h 내 변경된 모든 세션 일괄 동기화
+\`!sync-all <duration>\` — 지정 기간 내 변경 세션 동기화 (예: \`6h\`, \`30m\`)
+
+*작업 디렉토리*
+\`!wd <path>\` — 이 스레드의 작업 디렉토리 지정
+\`!pwd\` — 현재 작업 디렉토리 확인
+
+*실행 제어*
+\`!status\` — 진행 중인 작업 상태 확인 (경과 시간, 도구 사용, 컨텍스트)
+\`!stop\` — 현재 작업 중단 (대기열은 이어서 처리)
+\`!stop all\` — 현재 작업 중단 + 대기열 비우기
+\`!queue\` — 대기열 확인
+
+*스레드 제어*
+\`!pause\` — 스레드 일시정지 (메시지 무시)
+\`!resume\` — 스레드 재개 (놓친 메시지 자동 처리)
+
+*Cron*
+\`!cron\` — 등록된 cron 목록
+\`!cron add "schedule" message -- 설명\` — cron 등록
+\`!cron remove <id>\` — cron 삭제
+\`!cron pause <id>\` / \`!cron resume <id>\` — 일시정지/재개
+\`!cron run <id>\` — 즉시 실행
+\`!cron history <id>\` — 실행 이력
+
+*기타*
+\`!help\` — 이 도움말 표시`;
+
 export async function handleCommand(userMessage, { channel, replyThreadTs, sessionKey, userId, threadKey, sessionLocks }) {
   const msg = userMessage.toLowerCase();
+
+  // help
+  if (['!help', '/help', '!h', 'help'].includes(msg)) {
+    await slack.chat.postMessage({ channel, text: HELP_TEXT, thread_ts: replyThreadTs });
+    return true;
+  }
 
   // new / reset
   if (['!new', '!reset', '/new', '/reset', 'new', 'reset'].includes(msg)) {
