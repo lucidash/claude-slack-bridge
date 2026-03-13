@@ -219,8 +219,8 @@ async function processMessage({ userMessage, channel, replyThreadTs, userId, eve
   lock.aborted = false;
   try {
     while (lock.queue.length > 0 && !lock.aborted) {
-      const items = lock.queue.splice(0);
-      await executeClaudeRequest(sessionKey, items);
+      const item = lock.queue.shift();
+      await executeClaudeRequest(sessionKey, item);
     }
   } finally {
     lock.processing = false;
@@ -271,30 +271,16 @@ function formatCtx(usage) {
   return ` | ctx: ${ctx}`;
 }
 
-async function executeClaudeRequest(sessionKey, queuedItems) {
-  const { channel, replyThreadTs, userId, threadTs } = queuedItems[0];
+async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs }) {
   const effectiveThreadKey = `${channel}-${replyThreadTs}`;
   const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
-
-  // 여러 메시지를 하나의 프롬프트로 결합
-  let userMessage;
-  if (queuedItems.length === 1) {
-    userMessage = queuedItems[0].userMessage;
-  } else {
-    console.log(`[Queue] Batching ${queuedItems.length} messages for ${sessionKey}`);
-    userMessage = queuedItems
-      .map((m, i) => `[메시지 ${i + 1}] ${m.userMessage}`)
-      .join('\n');
-    userMessage += '\n\n위 메시지들을 순서대로 모두 처리해주세요.';
-  }
 
   // "처리 중" 메시지 전송
   let processingTs = null;
   try {
-    const batchLabel = queuedItems.length > 1 ? ` (${queuedItems.length}개 메시지)` : '';
     const processingMsg = await slack.chat.postMessage({
       channel,
-      text: `⏳ 처리 중...${batchLabel}`,
+      text: `⏳ 처리 중...`,
       thread_ts: replyThreadTs,
     });
     processingTs = processingMsg.ts;

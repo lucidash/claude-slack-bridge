@@ -200,21 +200,29 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     return true;
   }
 
-  // stop (실행 중인 작업 중단 + 큐 비우기)
-  if (['!stop', '/stop', '!kill', '/kill'].includes(msg)) {
+  // stop (실행 중인 작업 중단, 큐에 남은 메시지는 계속 처리)
+  // !stop all — 작업 중단 + 큐 비우기
+  if (['!stop', '/stop', '!kill', '/kill', '!stop all', '/stop all'].includes(msg)) {
+    const clearQueue = msg.endsWith(' all');
     const killed = stopClaudeQuery(sessionKey);
     let queueCleared = 0;
+    let queueRemaining = 0;
     if (sessionLocks) {
       const lock = sessionLocks.get(sessionKey);
       if (lock) {
-        queueCleared = lock.queue.length;
-        lock.queue.length = 0;
-        lock.aborted = true;
+        if (clearQueue) {
+          queueCleared = lock.queue.length;
+          lock.queue.length = 0;
+          lock.aborted = true;
+        } else {
+          queueRemaining = lock.queue.length;
+        }
       }
     }
     const parts = [];
     if (killed) parts.push('실행 중인 작업을 중단했습니다');
     if (queueCleared > 0) parts.push(`대기열 ${queueCleared}건을 비웠습니다`);
+    if (queueRemaining > 0) parts.push(`대기열 ${queueRemaining}건은 이어서 처리됩니다`);
     const text = parts.length > 0
       ? `🛑 ${parts.join(', ')}.`
       : '🛑 현재 실행 중인 작업이 없습니다.';
