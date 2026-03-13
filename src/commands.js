@@ -1,7 +1,7 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -297,6 +297,75 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     }
     await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
     return true;
+  }
+
+  // split — 새 스레드로 세션 이동 (긴 스레드 분할)
+  if (['!split', '/split'].includes(msg)) {
+    const currentSession = getSession(sessionKey);
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
+
+    if (!currentSession) {
+      await slack.chat.postMessage({
+        channel,
+        text: '❌ 활성 세션이 없어 분할할 수 없습니다.',
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    // 실행 중인 작업이 있으면 거부
+    const lock = sessionLocks?.get(sessionKey);
+    if (lock?.processing) {
+      await slack.chat.postMessage({
+        channel,
+        text: '❌ 작업 진행 중에는 분할할 수 없습니다. `!stop` 후 다시 시도하세요.',
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    try {
+      // Thread A의 permalink 가져오기
+      const oldPermalink = await slack.chat.getPermalink({ channel, message_ts: replyThreadTs });
+
+      // 채널에 새 top-level 메시지를 보내서 Thread B 생성
+      const newThread = await slack.chat.postMessage({
+        channel,
+        text: `✂️ 스레드 분할 — 이전 스레드에서 계속\n🔗 이전: ${oldPermalink.permalink}\n📍 세션: \`${currentSession}\`${workdir ? `\n📂 작업 디렉토리: \`${workdir}\`` : ''}`,
+      });
+      const newThreadTs = newThread.ts;
+      const newThreadKey = `${channel}-${newThreadTs}`;
+      const newSessionKey = `${userId}-${newThreadTs}`;
+
+      // Thread B에 세션/스레드 데이터 복사
+      saveThread(newThreadKey, userId, workdir);
+      saveSession(newSessionKey, currentSession);
+
+      // Thread A 세션 해제 + 아카이브
+      clearSession(sessionKey);
+      archiveThread(effectiveThreadKey, newThreadKey);
+
+      // Thread B의 permalink 가져오기
+      const newPermalink = await slack.chat.getPermalink({ channel, message_ts: newThreadTs });
+
+      // Thread A에 이동 안내
+      await slack.chat.postMessage({
+        channel,
+        text: `✂️ 새 스레드로 이동했습니다 → ${newPermalink.permalink}`,
+        thread_ts: replyThreadTs,
+      });
+
+      return true;
+    } catch (err) {
+      console.error('[Split] Error:', err.message);
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ 스레드 분할 실패: ${err.message}`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
   }
 
   // sync-all [duration] — 모든 활성 세션 일괄 동기화

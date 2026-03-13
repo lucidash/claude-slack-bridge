@@ -10,6 +10,7 @@ import {
   saveSttResult, popSttResult,
   getPausedThread, markPauseNotified,
   readSessionSummary, saveSyncPoint,
+  isArchivedThread,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -142,6 +143,27 @@ async function handleSlackEvent(event) {
         thread_ts: replyThreadTs,
       });
       markPauseNotified(effectiveThreadKey);
+    }
+    return;
+  }
+
+  // archived 스레드 체크 (!split으로 분할된 스레드)
+  const archiveInfo = isArchivedThread(effectiveThreadKey);
+  if (archiveInfo) {
+    try {
+      const [newChannel, newTs] = archiveInfo.splitTo.split('-');
+      const newPermalink = await slack.chat.getPermalink({ channel: newChannel, message_ts: newTs });
+      await slack.chat.postMessage({
+        channel,
+        text: `✂️ 이 스레드는 분할되었습니다. 새 스레드에서 계속해주세요 → ${newPermalink.permalink}`,
+        thread_ts: replyThreadTs,
+      });
+    } catch {
+      await slack.chat.postMessage({
+        channel,
+        text: '✂️ 이 스레드는 분할되었습니다. 새 스레드에서 계속해주세요.',
+        thread_ts: replyThreadTs,
+      });
     }
     return;
   }
@@ -567,5 +589,6 @@ app.listen(PORT, () => {
   console.log(`         !status              - Show current task status`);
   console.log(`         !stop                - Stop running task & clear queue`);
   console.log(`         !queue               - Show queued messages`);
+  console.log(`         !split              - Split thread (continue in new thread)`);
   console.log(`         !cron                - Manage cron jobs`);
 });
