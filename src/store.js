@@ -83,6 +83,24 @@ export function getThreadWorkdir(threadKey) {
   return readJson(THREADS_FILE)[threadKey]?.workdir || null;
 }
 
+export function getThread(threadKey) {
+  return readJson(THREADS_FILE)[threadKey] || null;
+}
+
+export function archiveThread(threadKey, splitTo) {
+  const threads = readJson(THREADS_FILE);
+  if (threads[threadKey]) {
+    threads[threadKey].archived = true;
+    threads[threadKey].splitTo = splitTo;
+    writeJson(THREADS_FILE, threads);
+  }
+}
+
+export function isArchivedThread(threadKey) {
+  const thread = readJson(THREADS_FILE)[threadKey];
+  return thread?.archived ? { splitTo: thread.splitTo } : null;
+}
+
 // STT 결과 저장 (인메모리, 스레드 단위)
 const sttResults = new Map();
 
