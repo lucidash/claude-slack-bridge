@@ -139,7 +139,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   const activities = [];
   let lastUsage = null;
   let resultUsage = null;
-  let contextWindow = 200000;
+  let contextWindow = 1000000;
 
   try {
     for await (const msg of q) {
