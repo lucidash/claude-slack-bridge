@@ -490,7 +490,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     if (silent) {
       cleanResult = cleanResult
         .split('\n')
-        .filter(line => !/^.{1,3}\s+(?:Read|Edit|Write|Bash|Grep|Glob|WebFetch|WebSearch|ToolSearch|Task)[:\s]/.test(line))
+        .filter(line => !/^.{1,3}\s+(?:Read|Edit|Write|Bash|Grep|Glob|WebFetch|WebSearch|ToolSearch|Task|mcp_\S+)[:\s]/.test(line))
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim() || '(빈 응답)';
@@ -636,10 +636,32 @@ async function handleStt(file, { channel, replyThreadTs }) {
 
 // ── Channel Watch 핸들러 ──────────────────────────────────────
 
+/**
+ * Slack 메시지에서 전체 텍스트 추출 (text + attachments + blocks)
+ */
+function extractFullText(event) {
+  const parts = [];
+  if (event.text) parts.push(event.text);
+  // attachments (봇 메시지에서 주로 사용)
+  if (event.attachments) {
+    for (const att of event.attachments) {
+      if (att.title) parts.push(att.title);
+      if (att.text && att.text !== att.title) parts.push(att.text);
+      if (att.pretext) parts.push(att.pretext);
+    }
+  }
+  return parts.join('\n').trim();
+}
+
 async function handleWatchedMessage(event, watch) {
   const channel = event.channel;
   const messageTs = event.ts;
-  const messageText = event.text || '';
+  const messageText = extractFullText(event);
+
+  if (!messageText) {
+    console.log(`[Watch] Empty message in ${channel}, skipping`);
+    return;
+  }
 
   console.log(`[Watch] Triaging message in ${channel}: ${messageText.substring(0, 80)}...`);
 
