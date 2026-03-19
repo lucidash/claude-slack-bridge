@@ -11,6 +11,7 @@ import {
   getPausedThread, markPauseNotified,
   readSessionSummary, saveSyncPoint,
   isArchivedThread,
+  getWatches,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -655,7 +656,6 @@ app.listen(PORT, () => {
   console.log(`         !cron                - Manage cron jobs`);
   console.log(`         !watch              - Channel watch management`);
   // Watch 상태 로그
-  const { getWatches } = await import('./store.js');
   const watches = getWatches();
   const activeWatches = Object.entries(watches).filter(([, w]) => w.enabled && w.trigger && w.action && w.senders?.length);
   if (activeWatches.length > 0) {
