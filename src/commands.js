@@ -1,7 +1,7 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -52,6 +52,12 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!cron pause <id>\` / \`!cron resume <id>\` — 일시정지/재개
 \`!cron run <id>\` — 즉시 실행
 \`!cron history <id>\` — 실행 이력
+
+*Channel Watch*
+\`!watch <channel_id>\` — 채널 watching 등록 (멀티라인으로 sender/trigger/action 설정)
+\`!watch-set <channel_id> <field> <value>\` — watch 설정 개별 수정
+\`!unwatch <channel_id>\` — watching 해제
+\`!watches\` — 전체 watch 목록
 
 *기타*
 \`!help\` — 이 도움말 표시`;
@@ -717,6 +723,135 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
       return true;
     }
+  }
+
+  // watches (목록)
+  if (['!watches', '/watches', '!watch list', '/watch list'].includes(msg)) {
+    const watches = getWatches();
+    const entries = Object.entries(watches);
+    if (entries.length === 0) {
+      await slack.chat.postMessage({
+        channel,
+        text: '📭 등록된 watch가 없습니다.\n`!watch <channel_id>` + sender/trigger/action으로 등록하세요.',
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+    const lines = [`👀 Channel Watch 목록 (${entries.length}건):`];
+    for (const [chId, w] of entries) {
+      const status = w.enabled ? '✅' : '⏸️';
+      lines.push(`${status} \`${chId}\`${w.channelName ? ` (#${w.channelName})` : ''}`);
+      lines.push(`    sender: \`${(w.senders || []).join(', ')}\``);
+      lines.push(`    trigger: ${w.trigger || '(미설정)'}`);
+      lines.push(`    action: ${w.action || '(미설정)'}`);
+    }
+    await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
+    return true;
+  }
+
+  // unwatch <channel_id>
+  const unwatchMatch = userMessage.match(/^[!\/]unwatch\s+(\S+)$/i);
+  if (unwatchMatch) {
+    const chId = unwatchMatch[1];
+    const removed = removeWatch(chId);
+    await slack.chat.postMessage({
+      channel,
+      text: removed
+        ? `🗑️ Watch 해제: \`${chId}\`${removed.channelName ? ` (#${removed.channelName})` : ''}`
+        : `❌ \`${chId}\` watch를 찾을 수 없습니다.`,
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
+  // watch-set <channel_id> <field> <value>
+  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName)\s+([\s\S]+)$/i);
+  if (watchSetMatch) {
+    const [, chId, field, rawValue] = watchSetMatch;
+    const existing = getWatch(chId);
+    if (!existing) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ \`${chId}\` watch를 먼저 등록하세요: \`!watch ${chId}\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    let value = rawValue.trim();
+    const update = {};
+    if (field === 'sender') {
+      // 콤마 구분 또는 단일 값
+      const senders = value.split(/[,，]\s*/).map(s => s.trim()).filter(Boolean);
+      update.senders = [...new Set([...(existing.senders || []), ...senders])];
+    } else if (field === 'enabled') {
+      update.enabled = value === 'true' || value === '1';
+    } else {
+      update[field] = value;
+    }
+
+    saveWatch(chId, update);
+    await slack.chat.postMessage({
+      channel,
+      text: `✅ Watch 설정 업데이트: \`${chId}\` ${field} → ${JSON.stringify(update[field] ?? update.senders)}`,
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
+  // watch <channel_id> (멀티라인으로 sender/trigger/action 설정)
+  const watchMatch = userMessage.match(/^[!\/]watch\s+(\S+)([\s\S]*)$/i);
+  if (watchMatch) {
+    const chId = watchMatch[1];
+    const body = watchMatch[2] || '';
+
+    // 멀티라인 파싱: "key: value" 형태
+    const config = { enabled: true, addedBy: userId, createdAt: new Date().toISOString() };
+    const lines = body.split('\n');
+    for (const line of lines) {
+      const kv = line.match(/^\s*(sender|trigger|action|channelName)\s*:\s*(.+)$/i);
+      if (kv) {
+        const [, key, val] = kv;
+        const k = key.toLowerCase();
+        if (k === 'sender') {
+          const senders = val.trim().split(/[,，]\s*/).map(s => s.trim()).filter(Boolean);
+          config.senders = [...new Set([...(config.senders || []), ...senders])];
+        } else {
+          config[k === 'channelname' ? 'channelName' : k] = val.trim();
+        }
+      }
+    }
+
+    // 기존 설정이 있으면 머지
+    const existing = getWatch(chId);
+    if (existing) {
+      if (config.senders && existing.senders) {
+        config.senders = [...new Set([...existing.senders, ...config.senders])];
+      }
+    }
+
+    saveWatch(chId, config);
+    const saved = getWatch(chId);
+
+    const report = [`👀 Watch ${existing ? '업데이트' : '등록'}: \`${chId}\``];
+    if (saved.channelName) report.push(`채널: #${saved.channelName}`);
+    report.push(`sender: \`${(saved.senders || []).join(', ') || '(미설정)'}\``);
+    report.push(`trigger: ${saved.trigger || '(미설정)'}`);
+    report.push(`action: ${saved.action || '(미설정)'}`);
+
+    const missing = [];
+    if (!saved.senders?.length) missing.push('sender');
+    if (!saved.trigger) missing.push('trigger');
+    if (!saved.action) missing.push('action');
+    if (missing.length > 0) {
+      report.push(`\n⚠️ 필수 설정 누락: ${missing.join(', ')}`);
+      report.push('`!watch-set` 으로 추가 설정하세요.');
+    } else {
+      report.push(`\n✅ 활성 상태 — 메시지 감지를 시작합니다.`);
+    }
+
+    await slack.chat.postMessage({ channel, text: report.join('\n'), thread_ts: replyThreadTs });
+    return true;
   }
 
   return false;

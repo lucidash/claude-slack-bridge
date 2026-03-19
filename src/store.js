@@ -10,10 +10,11 @@ const INBOX_FILE = join(BRIDGE_DIR, 'inbox.json');
 const PAUSED_FILE = join(BRIDGE_DIR, 'paused.json');
 const CRONS_FILE = join(BRIDGE_DIR, 'crons.json');
 const SYNC_POINTS_FILE = join(BRIDGE_DIR, 'sync-points.json');
+const WATCHES_FILE = join(BRIDGE_DIR, 'watches.json');
 
 // 디렉토리 및 파일 초기화
 if (!existsSync(BRIDGE_DIR)) mkdirSync(BRIDGE_DIR, { recursive: true });
-for (const file of [SESSIONS_FILE, THREADS_FILE, WORKDIRS_FILE, PAUSED_FILE]) {
+for (const file of [SESSIONS_FILE, THREADS_FILE, WORKDIRS_FILE, PAUSED_FILE, WATCHES_FILE]) {
   if (!existsSync(file)) writeFileSync(file, JSON.stringify({}, null, 2));
 }
 if (!existsSync(CRONS_FILE)) {
@@ -287,6 +288,30 @@ export function saveCrons(jobs) {
 
 export function getAllThreads() {
   return readJson(THREADS_FILE);
+}
+
+// Channel Watches
+export function getWatches() {
+  return readJson(WATCHES_FILE);
+}
+
+export function getWatch(channelId) {
+  return readJson(WATCHES_FILE)[channelId] || null;
+}
+
+export function saveWatch(channelId, config) {
+  const watches = readJson(WATCHES_FILE);
+  watches[channelId] = { ...watches[channelId], ...config };
+  writeJson(WATCHES_FILE, watches);
+  return watches[channelId];
+}
+
+export function removeWatch(channelId) {
+  const watches = readJson(WATCHES_FILE);
+  const removed = watches[channelId];
+  delete watches[channelId];
+  writeJson(WATCHES_FILE, watches);
+  return removed || null;
 }
 
 export { BRIDGE_DIR, SESSIONS_FILE, INBOX_FILE };

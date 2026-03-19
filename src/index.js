@@ -15,6 +15,7 @@ import {
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
+import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -80,8 +81,21 @@ app.post('/slack/events', (req, res) => {
 // ── 이벤트 핸들러 ──────────────────────────────────────────────
 
 async function handleSlackEvent(event) {
-  // 봇 자신의 메시지는 무시
-  if (event.bot_id || event.subtype === 'bot_message') return;
+  const isBotMessage = event.bot_id || event.subtype === 'bot_message';
+
+  // Channel Watch: 봇 메시지여도 watched channel + sender 매칭이면 처리
+  if (isBotMessage) {
+    // top-level 메시지만 triage (스레드 답장은 무시)
+    if (!event.thread_ts) {
+      const watch = getActiveWatch(event.channel);
+      if (watch && matchesSender(event, watch.senders)) {
+        handleWatchedMessage(event, watch).catch(err =>
+          console.error('[Watch] Error:', err.message)
+        );
+      }
+    }
+    return;
+  }
 
   // 사용자 화이트리스트 검증
   if (!isUserAllowed(event.user)) {
@@ -557,6 +571,54 @@ async function handleStt(file, { channel, replyThreadTs }) {
   }
 }
 
+// ── Channel Watch 핸들러 ──────────────────────────────────────
+
+async function handleWatchedMessage(event, watch) {
+  const channel = event.channel;
+  const messageTs = event.ts;
+  const messageText = event.text || '';
+
+  console.log(`[Watch] Triaging message in ${channel}: ${messageText.substring(0, 80)}...`);
+
+  // Haiku로 triage
+  const triage = await triageMessage(messageText, watch);
+  if (!triage.shouldRespond) {
+    console.log(`[Watch] Skipped: ${triage.reason}`);
+    return;
+  }
+
+  console.log(`[Watch] Triggered: ${triage.reason}`);
+
+  // Action 프롬프트 구성
+  const actionPrompt = `[Channel Watch 알림]
+채널: ${watch.channelName ? `#${watch.channelName}` : channel}
+감지 이유: ${triage.reason}
+
+원본 메시지:
+---
+${messageText}
+---
+
+위 메시지에 대해 다음 행동을 수행하세요:
+${watch.action}
+
+참고:
+- 응답은 해당 메시지의 Slack 스레드에 게시됩니다.
+- Slack 멘션 형식: <@USER_ID>
+- 필요하면 코드베이스를 분석하세요.`;
+
+  // processMessage를 통해 Claude 실행 (기존 큐/락/프로그래스 재사용)
+  const userId = watch.addedBy;
+  await processMessage({
+    userMessage: actionPrompt,
+    channel,
+    replyThreadTs: messageTs,
+    userId,
+    eventTs: null,
+    threadTs: null,
+  });
+}
+
 // ── 디버그 엔드포인트 ──────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
@@ -591,4 +653,15 @@ app.listen(PORT, () => {
   console.log(`         !queue               - Show queued messages`);
   console.log(`         !split              - Split thread (continue in new thread)`);
   console.log(`         !cron                - Manage cron jobs`);
+  console.log(`         !watch              - Channel watch management`);
+  // Watch 상태 로그
+  const { getWatches } = await import('./store.js');
+  const watches = getWatches();
+  const activeWatches = Object.entries(watches).filter(([, w]) => w.enabled && w.trigger && w.action && w.senders?.length);
+  if (activeWatches.length > 0) {
+    console.log(`[Watch] Active watches: ${activeWatches.length}`);
+    for (const [chId, w] of activeWatches) {
+      console.log(`         ${chId}${w.channelName ? ` (#${w.channelName})` : ''} — ${w.trigger.substring(0, 50)}`);
+    }
+  }
 });
