@@ -88,6 +88,18 @@ export function getThread(threadKey) {
   return readJson(THREADS_FILE)[threadKey] || null;
 }
 
+export function setThreadSilent(threadKey, silent = true) {
+  const threads = readJson(THREADS_FILE);
+  if (threads[threadKey]) {
+    threads[threadKey].silent = silent;
+    writeJson(THREADS_FILE, threads);
+  }
+}
+
+export function isThreadSilent(threadKey) {
+  return readJson(THREADS_FILE)[threadKey]?.silent || false;
+}
+
 export function archiveThread(threadKey, splitTo) {
   const threads = readJson(THREADS_FILE);
   if (threads[threadKey]) {
