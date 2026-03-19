@@ -12,6 +12,7 @@ import {
   readSessionSummary, saveSyncPoint,
   isArchivedThread,
   getWatches,
+  setThreadSilent, isThreadSilent,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -214,11 +215,15 @@ async function handleSlackEvent(event) {
     }
   }
 
-  // !silent 프리픽스 처리
+  // !silent 프리픽스 처리 또는 스레드 silent 상태 상속
+  const effectiveTk = threadKey || `${channel}-${replyThreadTs}`;
   let silent = false;
   if (/^!silent\s+/i.test(userMessage)) {
     silent = true;
     userMessage = userMessage.replace(/^!silent\s+/i, '');
+    setThreadSilent(effectiveTk, true);
+  } else if (isThreadSilent(effectiveTk)) {
+    silent = true;
   }
 
   // inbox에 메시지 추가
@@ -664,6 +669,11 @@ ${watch.action}
 - 응답은 해당 메시지의 Slack 스레드에 게시됩니다.
 - Slack 멘션 형식: <@USER_ID>
 - 필요하면 코드베이스를 분석하세요.`;
+
+  // 스레드를 silent로 마킹 (이후 muzi가 이 스레드에서 대화해도 silent 유지)
+  const watchThreadKey = `${channel}-${messageTs}`;
+  saveThread(watchThreadKey, watch.addedBy);
+  setThreadSilent(watchThreadKey, true);
 
   // processMessage를 통해 Claude 실행 (silent 모드 — 결과 텍스트만 게시)
   const userId = watch.addedBy;
