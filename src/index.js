@@ -319,14 +319,38 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
   const effectiveThreadKey = `${channel}-${replyThreadTs}`;
   const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
 
-  // "처리 중" 메시지 전송 (silent 모드에서는 생략)
+  // ── Silent DM shadow 설정 ──
+  // silent 모드: 원본 채널은 깨끗하게, 과정은 userId에게 DM으로 shadow logging
+  let dmChannel = null;
+  let dmThreadTs = null;
+  if (silent) {
+    try {
+      const dm = await slack.conversations.open({ users: userId });
+      dmChannel = dm.channel.id;
+      const permalink = await slack.chat.getPermalink({ channel, message_ts: replyThreadTs }).catch(() => null);
+      const link = permalink?.permalink || `${channel}/${replyThreadTs}`;
+      const dmMsg = await slack.chat.postMessage({
+        channel: dmChannel,
+        text: `🔕 *Silent 세션 시작*\n스레드: ${link}\n요청: ${userMessage.substring(0, 200)}${userMessage.length > 200 ? '…' : ''}`,
+      });
+      dmThreadTs = dmMsg.ts;
+    } catch (err) {
+      console.error('[Silent] Failed to open DM:', err.message);
+    }
+  }
+
+  // silent에서 로그를 보낼 채널/스레드 (DM이 없으면 로그 생략)
+  const logChannel = silent ? dmChannel : channel;
+  const logThreadTs = silent ? dmThreadTs : replyThreadTs;
+
+  // "처리 중" 메시지 전송
   let processingTs = null;
-  if (!silent) {
+  if (logChannel) {
     try {
       const processingMsg = await slack.chat.postMessage({
-        channel,
+        channel: logChannel,
         text: `⏳ 처리 중...`,
-        thread_ts: replyThreadTs,
+        thread_ts: logThreadTs,
       });
       processingTs = processingMsg.ts;
     } catch (err) {
@@ -353,8 +377,8 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     const MAX_UPDATE_DELAY = 60000;
     const BACKOFF_MULTIPLIER = 1.5;
 
-    // 프로그레스 업데이트 (silent 모드에서는 생략)
-    if (!silent) {
+    // 프로그레스 업데이트 (logChannel로 전송 — silent이면 DM, 아니면 원본 스레드)
+    if (processingTs && logChannel) {
       (function scheduleUpdate() {
         updateTimer = setTimeout(async () => {
           if (!processingTs || lock?.aborted) return;
@@ -365,7 +389,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
             ? `⏳ 처리 중... (${elapsed}${ctxInfo})\n  ${recentActivities}`
             : `⏳ 처리 중... (${elapsed}${ctxInfo})`;
           try {
-            await slack.chat.update({ channel, ts: processingTs, text: statusText });
+            await slack.chat.update({ channel: logChannel, ts: processingTs, text: statusText });
           } catch { /* ignore update errors */ }
           nextUpdateDelay = Math.min(nextUpdateDelay * BACKOFF_MULTIPLIER, MAX_UPDATE_DELAY);
           scheduleUpdate();
@@ -394,7 +418,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       }
     }
 
-    // AskUserQuestion을 Slack으로 릴레이하는 콜백 (silent 모드에서는 비활성)
+    // AskUserQuestion 콜백 (silent 모드에서는 비활성 — DM으로 질문받을 수 없으므로)
     const onAskUser = silent ? undefined : async (questions, signal, pendingText) => {
       if (pendingText) {
         const maxLen = 3900;
@@ -426,12 +450,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       });
     };
 
-    // 새 세션이면 init 이벤트에서 즉시 세션 ID를 스레드에 게시 (silent 모드에서는 생략)
-    const onSessionReady = (!silent && isNewSession) ? (sid) => {
+    // 새 세션이면 세션 ID를 게시 (silent이면 DM에, 아니면 원본 스레드에)
+    const onSessionReady = isNewSession ? (sid) => {
+      const target = logChannel || channel;
+      const targetTs = logThreadTs || replyThreadTs;
       slack.chat.postMessage({
-        channel,
+        channel: target,
         text: `🔗 Session: \`${sid}\`\n\`\`\`cd ${workdir || '~'} && claude --resume ${sid}\`\`\``,
-        thread_ts: replyThreadTs,
+        thread_ts: targetTs,
       }).catch(err => console.error('[Slack] Failed to post session ID:', err.message));
     } : undefined;
 
@@ -441,9 +467,9 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     const elapsed = formatElapsed(Date.now() - startTime);
     const ctxInfo = formatCtx(usage || lastUsage);
 
-    // "처리 중" → "처리완료"로 업데이트 (silent 모드에서는 생략)
-    if (processingTs) {
-      await slack.chat.update({ channel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
+    // "처리 중" → "처리완료"로 업데이트 (logChannel — silent이면 DM)
+    if (processingTs && logChannel) {
+      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
     }
 
     // 응답 텍스트 정리 (silent 모드에서는 도구 마커 라인 제거)
@@ -457,7 +483,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
         .trim() || '(빈 응답)';
     }
 
-    // 응답을 Slack 메시지 제한(4000자)에 맞춰 분할 전송
+    // 응답을 원본 스레드에 게시 (항상 — silent이든 아니든)
     const chunks = splitMessage(cleanResult);
     for (const chunk of chunks) {
       await slack.chat.postMessage({ channel, text: chunk, thread_ts: replyThreadTs });
@@ -486,15 +512,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
 
     const elapsed = formatElapsed(Date.now() - startTime);
     const ctxInfo = formatCtx(lastUsage);
-    if (processingTs) {
-      await slack.chat.update({ channel, ts: processingTs, text: `❌ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
+    // "처리 중" → 에러로 업데이트 (logChannel — silent이면 DM)
+    if (processingTs && logChannel) {
+      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `❌ 오류 (${elapsed}${ctxInfo}): ${err.message}` }).catch(() => {});
     }
 
     if (!silent) {
       const errorText = `❌ 오류 발생: ${err.message}`;
       await slack.chat.postMessage({ channel, text: errorText, thread_ts: replyThreadTs }).catch(() => {});
-    } else {
-      console.error(`[Silent] Error suppressed for ${sessionKey}: ${err.message}`);
     }
   }
 }
