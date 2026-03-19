@@ -457,10 +457,11 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       });
     };
 
-    // 새 세션이면 세션 ID를 게시 (silent이면 DM에, 아니면 원본 스레드에)
+    // 새 세션이면 세션 ID를 게시 (silent이면 DM에, DM 실패 시 생략)
     const onSessionReady = isNewSession ? (sid) => {
-      const target = logChannel || channel;
-      const targetTs = logThreadTs || replyThreadTs;
+      if (silent && !logChannel) return; // DM 실패 시 원본 채널에 노출하지 않음
+      const target = silent ? logChannel : channel;
+      const targetTs = silent ? logThreadTs : replyThreadTs;
       slack.chat.postMessage({
         channel: target,
         text: `🔗 Session: \`${sid}\`\n\`\`\`cd ${workdir || '~'} && claude --resume ${sid}\`\`\``,
