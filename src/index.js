@@ -214,6 +214,13 @@ async function handleSlackEvent(event) {
     }
   }
 
+  // !silent 프리픽스 처리
+  let silent = false;
+  if (/^!silent\s+/i.test(userMessage)) {
+    silent = true;
+    userMessage = userMessage.replace(/^!silent\s+/i, '');
+  }
+
   // inbox에 메시지 추가
   appendInbox({
     id: `${channel}-${event.ts}`,
@@ -227,20 +234,20 @@ async function handleSlackEvent(event) {
 
   await processMessage({
     userMessage, channel, replyThreadTs, userId,
-    eventTs: event.ts, threadTs: event.thread_ts,
+    eventTs: event.ts, threadTs: event.thread_ts, silent,
   });
 }
 
 /**
  * 메시지를 세션 큐에 넣고 Claude 실행. Cron에서도 재사용.
  */
-async function processMessage({ userMessage, channel, replyThreadTs, userId, eventTs, threadTs }) {
+async function processMessage({ userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false }) {
   const sessionKey = `${userId}-${replyThreadTs}`;
 
   const lock = sessionLocks.get(sessionKey) || { processing: false, queue: [] };
   if (!sessionLocks.has(sessionKey)) sessionLocks.set(sessionKey, lock);
 
-  lock.queue.push({ userMessage, channel, replyThreadTs, userId, eventTs: eventTs || null, threadTs: threadTs || null });
+  lock.queue.push({ userMessage, channel, replyThreadTs, userId, eventTs: eventTs || null, threadTs: threadTs || null, silent });
 
   if (lock.processing) {
     console.log(`[Queue] Queued for busy session ${sessionKey} (${lock.queue.length} pending)`);
@@ -308,21 +315,23 @@ function formatCtx(usage) {
   return ` | ctx: ${ctx}`;
 }
 
-async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs }) {
+async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false }) {
   const effectiveThreadKey = `${channel}-${replyThreadTs}`;
   const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
 
-  // "처리 중" 메시지 전송
+  // "처리 중" 메시지 전송 (silent 모드에서는 생략)
   let processingTs = null;
-  try {
-    const processingMsg = await slack.chat.postMessage({
-      channel,
-      text: `⏳ 처리 중...`,
-      thread_ts: replyThreadTs,
-    });
-    processingTs = processingMsg.ts;
-  } catch (err) {
-    console.error('[Slack] Failed to send processing message:', err.message);
+  if (!silent) {
+    try {
+      const processingMsg = await slack.chat.postMessage({
+        channel,
+        text: `⏳ 처리 중...`,
+        thread_ts: replyThreadTs,
+      });
+      processingTs = processingMsg.ts;
+    } catch (err) {
+      console.error('[Slack] Failed to send processing message:', err.message);
+    }
   }
 
   const startTime = Date.now();
@@ -344,24 +353,25 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     const MAX_UPDATE_DELAY = 60000;
     const BACKOFF_MULTIPLIER = 1.5;
 
-    function scheduleUpdate() {
-      updateTimer = setTimeout(async () => {
-        if (!processingTs || lock?.aborted) return;
-        const elapsed = formatElapsed(Date.now() - startTime);
-        const ctxInfo = formatCtx(lastUsage);
-        const recentActivities = lastActivities.slice(-5).join('\n  ');
-        const statusText = recentActivities
-          ? `⏳ 처리 중... (${elapsed}${ctxInfo})\n  ${recentActivities}`
-          : `⏳ 처리 중... (${elapsed}${ctxInfo})`;
-        try {
-          await slack.chat.update({ channel, ts: processingTs, text: statusText });
-        } catch { /* ignore update errors */ }
-        nextUpdateDelay = Math.min(nextUpdateDelay * BACKOFF_MULTIPLIER, MAX_UPDATE_DELAY);
-        scheduleUpdate();
-      }, nextUpdateDelay);
+    // 프로그레스 업데이트 (silent 모드에서는 생략)
+    if (!silent) {
+      (function scheduleUpdate() {
+        updateTimer = setTimeout(async () => {
+          if (!processingTs || lock?.aborted) return;
+          const elapsed = formatElapsed(Date.now() - startTime);
+          const ctxInfo = formatCtx(lastUsage);
+          const recentActivities = lastActivities.slice(-5).join('\n  ');
+          const statusText = recentActivities
+            ? `⏳ 처리 중... (${elapsed}${ctxInfo})\n  ${recentActivities}`
+            : `⏳ 처리 중... (${elapsed}${ctxInfo})`;
+          try {
+            await slack.chat.update({ channel, ts: processingTs, text: statusText });
+          } catch { /* ignore update errors */ }
+          nextUpdateDelay = Math.min(nextUpdateDelay * BACKOFF_MULTIPLIER, MAX_UPDATE_DELAY);
+          scheduleUpdate();
+        }, nextUpdateDelay);
+      })();
     }
-
-    scheduleUpdate();
 
     const onProgress = (activities, usage) => {
       lastActivities = [...activities];
@@ -384,9 +394,8 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       }
     }
 
-    // AskUserQuestion을 Slack으로 릴레이하는 콜백
-    const onAskUser = async (questions, signal, pendingText) => {
-      // AskUserQuestion 전에 쌓인 텍스트가 있으면 먼저 전송 (코멘트 내용 등)
+    // AskUserQuestion을 Slack으로 릴레이하는 콜백 (silent 모드에서는 비활성)
+    const onAskUser = silent ? undefined : async (questions, signal, pendingText) => {
       if (pendingText) {
         const maxLen = 3900;
         const contextText = pendingText.length > maxLen
@@ -417,8 +426,8 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       });
     };
 
-    // 새 세션이면 init 이벤트에서 즉시 세션 ID를 스레드에 게시
-    const onSessionReady = isNewSession ? (sid) => {
+    // 새 세션이면 init 이벤트에서 즉시 세션 ID를 스레드에 게시 (silent 모드에서는 생략)
+    const onSessionReady = (!silent && isNewSession) ? (sid) => {
       slack.chat.postMessage({
         channel,
         text: `🔗 Session: \`${sid}\`\n\`\`\`cd ${workdir || '~'} && claude --resume ${sid}\`\`\``,
@@ -432,17 +441,28 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     const elapsed = formatElapsed(Date.now() - startTime);
     const ctxInfo = formatCtx(usage || lastUsage);
 
-    // "처리 중" → "처리완료"로 업데이트
+    // "처리 중" → "처리완료"로 업데이트 (silent 모드에서는 생략)
     if (processingTs) {
       await slack.chat.update({ channel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
     }
 
+    // 응답 텍스트 정리 (silent 모드에서는 도구 마커 라인 제거)
+    let cleanResult = result || '(빈 응답)';
+    if (silent) {
+      cleanResult = cleanResult
+        .split('\n')
+        .filter(line => !/^[📖✏️📝💻🔍📁🌐🔎⚙️🤖]\s/.test(line))
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim() || '(빈 응답)';
+    }
+
     // 응답을 Slack 메시지 제한(4000자)에 맞춰 분할 전송
-    const chunks = splitMessage(result || '(빈 응답)');
+    const chunks = splitMessage(cleanResult);
     for (const chunk of chunks) {
       await slack.chat.postMessage({ channel, text: chunk, thread_ts: replyThreadTs });
     }
-    console.log(`[Slack] Response sent to ${channel} (${chunks.length} message(s), ${result.length} chars)`);
+    console.log(`[Slack] Response sent to ${channel} (${chunks.length} message(s), ${cleanResult.length} chars${silent ? ', silent' : ''})`);
 
     // sync point 저장 (로컬 터미널에서 이어서 작업 후 !sync 시 사용)
     try {
@@ -470,8 +490,12 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       await slack.chat.update({ channel, ts: processingTs, text: `❌ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
     }
 
-    const errorText = `❌ 오류 발생: ${err.message}`;
-    await slack.chat.postMessage({ channel, text: errorText, thread_ts: replyThreadTs }).catch(() => {});
+    if (!silent) {
+      const errorText = `❌ 오류 발생: ${err.message}`;
+      await slack.chat.postMessage({ channel, text: errorText, thread_ts: replyThreadTs }).catch(() => {});
+    } else {
+      console.error(`[Silent] Error suppressed for ${sessionKey}: ${err.message}`);
+    }
   }
 }
 
@@ -608,7 +632,7 @@ ${watch.action}
 - Slack 멘션 형식: <@USER_ID>
 - 필요하면 코드베이스를 분석하세요.`;
 
-  // processMessage를 통해 Claude 실행 (기존 큐/락/프로그래스 재사용)
+  // processMessage를 통해 Claude 실행 (silent 모드 — 결과 텍스트만 게시)
   const userId = watch.addedBy;
   await processMessage({
     userMessage: actionPrompt,
@@ -617,6 +641,7 @@ ${watch.action}
     userId,
     eventTs: null,
     threadTs: null,
+    silent: true,
   });
 }
 

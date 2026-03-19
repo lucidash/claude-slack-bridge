@@ -60,6 +60,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!watches\` — 전체 watch 목록
 
 *기타*
+\`!silent <메시지>\` — 조용히 실행 (처리 과정 표시 없이 결과만 게시)
 \`!help\` — 이 도움말 표시`;
 
 export async function handleCommand(userMessage, { channel, replyThreadTs, sessionKey, userId, threadKey, sessionLocks }) {
