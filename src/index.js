@@ -247,6 +247,13 @@ async function processMessage({ userMessage, channel, replyThreadTs, userId, eve
   const lock = sessionLocks.get(sessionKey) || { processing: false, queue: [] };
   if (!sessionLocks.has(sessionKey)) sessionLocks.set(sessionKey, lock);
 
+  // 동일 텍스트 중복 큐잉 방지 (더블 클릭, 네트워크 재전송 등)
+  const isDuplicate = lock.queue.some(item => item.userMessage === userMessage);
+  if (isDuplicate) {
+    console.log(`[Queue] Duplicate message ignored for ${sessionKey}: ${userMessage.substring(0, 40)}...`);
+    return;
+  }
+
   lock.queue.push({ userMessage, channel, replyThreadTs, userId, eventTs: eventTs || null, threadTs: threadTs || null, silent });
 
   if (lock.processing) {
@@ -335,7 +342,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       });
       dmThreadTs = dmMsg.ts;
     } catch (err) {
-      console.error('[Silent] Failed to open DM:', err.message);
+      console.error('[Silent] Failed to open DM:', err.message, err.data?.error || '');
     }
   }
 
@@ -477,7 +484,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     if (silent) {
       cleanResult = cleanResult
         .split('\n')
-        .filter(line => !/^[📖✏️📝💻🔍📁🌐🔎⚙️🤖]\s/.test(line))
+        .filter(line => !/^.{1,3}\s+(?:Read|Edit|Write|Bash|Grep|Glob|WebFetch|WebSearch|ToolSearch|Task)[:\s]/.test(line))
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim() || '(빈 응답)';
