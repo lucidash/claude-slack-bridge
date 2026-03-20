@@ -355,6 +355,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
   const logChannel = silent ? dmChannel : channel;
   const logThreadTs = silent ? dmThreadTs : replyThreadTs;
 
+  // silent 모드: 트리거 메시지에 :loading2: 리액션으로 처리 중 표시
+  const silentReactionTs = silent ? (eventTs || replyThreadTs) : null;
+  if (silentReactionTs) {
+    try {
+      await slack.reactions.add({ channel, name: 'loading2', timestamp: silentReactionTs });
+    } catch { /* 이미 있거나 실패 시 무시 */ }
+  }
+
   // "처리 중" 메시지 전송
   let processingTs = null;
   if (logChannel) {
@@ -485,6 +493,16 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
     }
 
+    // silent 모드: :loading2: → :done: 으로 교체
+    if (silentReactionTs) {
+      try {
+        await slack.reactions.remove({ channel, name: 'loading2', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
+      try {
+        await slack.reactions.add({ channel, name: 'done', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
+    }
+
     // 응답 텍스트 정리 (silent 모드에서는 도구 마커 라인 제거)
     let cleanResult = result || '(빈 응답)';
     if (silent) {
@@ -528,6 +546,16 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     // "처리 중" → 에러로 업데이트 (logChannel — silent이면 DM)
     if (processingTs && logChannel) {
       await slack.chat.update({ channel: logChannel, ts: processingTs, text: `❌ 오류 (${elapsed}${ctxInfo}): ${err.message}` }).catch(() => {});
+    }
+
+    // silent 모드: :loading2: → :x: 으로 교체
+    if (silentReactionTs) {
+      try {
+        await slack.reactions.remove({ channel, name: 'loading2', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
+      try {
+        await slack.reactions.add({ channel, name: 'x', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
     }
 
     if (!silent) {
