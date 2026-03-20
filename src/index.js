@@ -490,7 +490,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     if (silent) {
       cleanResult = cleanResult
         .split('\n')
-        .filter(line => !/^.{1,3}\s+(?:Read|Edit|Write|Bash|Grep|Glob|WebFetch|WebSearch|ToolSearch|Task|mcp_\S+)[:\s]/.test(line))
+        .filter(line => !/^.{1,3}\s+(?:Read|Edit|Write|Bash|Grep|Glob|WebFetch|WebSearch|ToolSearch|Task|Agent|mcp_\S+)(?:[:\s]|$)/.test(line))
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim() || '(빈 응답)';
