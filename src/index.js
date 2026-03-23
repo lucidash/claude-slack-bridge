@@ -148,10 +148,10 @@ async function handleSlackEvent(event) {
     return;
   }
 
-  // pause 상태 체크
+  // pause 상태 체크 (멘션이면 pause 무시 — 명시적 호출은 응답)
   const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
   const pauseInfo = getPausedThread(effectiveThreadKey);
-  if (pauseInfo) {
+  if (pauseInfo && !isMention) {
     if (!pauseInfo.notified) {
       await slack.chat.postMessage({
         channel,
