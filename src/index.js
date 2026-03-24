@@ -8,7 +8,7 @@ import {
   getSession, saveThread, isActiveThread, getThreadWorkdir, appendInbox,
   getWorkdir, getInbox, clearInbox, getAllSessions,
   saveSttResult, popSttResult,
-  getPausedThread, markPauseNotified,
+  getPausedThread, markPauseNotified, pauseThread,
   readSessionSummary, saveSyncPoint,
   isArchivedThread,
   getWatches,
@@ -148,10 +148,10 @@ async function handleSlackEvent(event) {
     return;
   }
 
-  // pause 상태 체크
+  // pause 상태 체크 (멘션이면 pause 무시 — 명시적 호출은 응답)
   const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
   const pauseInfo = getPausedThread(effectiveThreadKey);
-  if (pauseInfo) {
+  if (pauseInfo && !isMention) {
     if (!pauseInfo.notified) {
       await slack.chat.postMessage({
         channel,
@@ -355,6 +355,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
   const logChannel = silent ? dmChannel : channel;
   const logThreadTs = silent ? dmThreadTs : replyThreadTs;
 
+  // silent 모드: 트리거 메시지에 :loading2: 리액션으로 처리 중 표시
+  const silentReactionTs = silent ? (eventTs || replyThreadTs) : null;
+  if (silentReactionTs) {
+    try {
+      await slack.reactions.add({ channel, name: 'loading2', timestamp: silentReactionTs });
+    } catch { /* 이미 있거나 실패 시 무시 */ }
+  }
+
   // "처리 중" 메시지 전송
   let processingTs = null;
   if (logChannel) {
@@ -485,12 +493,22 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
     }
 
+    // silent 모드: :loading2: → :done: 으로 교체
+    if (silentReactionTs) {
+      try {
+        await slack.reactions.remove({ channel, name: 'loading2', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
+      try {
+        await slack.reactions.add({ channel, name: 'done', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
+    }
+
     // 응답 텍스트 정리 (silent 모드에서는 도구 마커 라인 제거)
     let cleanResult = result || '(빈 응답)';
     if (silent) {
       cleanResult = cleanResult
         .split('\n')
-        .filter(line => !/^.{1,3}\s+(?:Read|Edit|Write|Bash|Grep|Glob|WebFetch|WebSearch|ToolSearch|Task)[:\s]/.test(line))
+        .filter(line => !/^.{1,3}\s+(?:Read|Edit|Write|Bash|Grep|Glob|WebFetch|WebSearch|ToolSearch|Task|Agent|mcp_\S+)(?:[:\s]|$)/.test(line))
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim() || '(빈 응답)';
@@ -528,6 +546,16 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     // "처리 중" → 에러로 업데이트 (logChannel — silent이면 DM)
     if (processingTs && logChannel) {
       await slack.chat.update({ channel: logChannel, ts: processingTs, text: `❌ 오류 (${elapsed}${ctxInfo}): ${err.message}` }).catch(() => {});
+    }
+
+    // silent 모드: :loading2: → :x: 으로 교체
+    if (silentReactionTs) {
+      try {
+        await slack.reactions.remove({ channel, name: 'loading2', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
+      try {
+        await slack.reactions.add({ channel, name: 'x', timestamp: silentReactionTs });
+      } catch { /* ignore */ }
     }
 
     if (!silent) {
@@ -636,10 +664,32 @@ async function handleStt(file, { channel, replyThreadTs }) {
 
 // ── Channel Watch 핸들러 ──────────────────────────────────────
 
+/**
+ * Slack 메시지에서 전체 텍스트 추출 (text + attachments + blocks)
+ */
+function extractFullText(event) {
+  const parts = [];
+  if (event.text) parts.push(event.text);
+  // attachments (봇 메시지에서 주로 사용)
+  if (event.attachments) {
+    for (const att of event.attachments) {
+      if (att.title) parts.push(att.title);
+      if (att.text && att.text !== att.title) parts.push(att.text);
+      if (att.pretext) parts.push(att.pretext);
+    }
+  }
+  return parts.join('\n').trim();
+}
+
 async function handleWatchedMessage(event, watch) {
   const channel = event.channel;
   const messageTs = event.ts;
-  const messageText = event.text || '';
+  const messageText = extractFullText(event);
+
+  if (!messageText) {
+    console.log(`[Watch] Empty message in ${channel}, skipping`);
+    return;
+  }
 
   console.log(`[Watch] Triaging message in ${channel}: ${messageText.substring(0, 80)}...`);
 
@@ -670,9 +720,12 @@ ${watch.action}
 - Slack 멘션 형식: <@USER_ID>
 - 필요하면 코드베이스를 분석하세요.`;
 
-  // silent 모드로 실행 (스레드를 활성 등록하지 않음 — 이후 사용자 메시지에 자동 반응 방지)
+  // 스레드를 silent + pause로 마킹
+  // silent: 결과만 깨끗하게 게시, pause: 이후 유저 댓글에 반응하지 않음 (!resume으로 해제)
   const watchThreadKey = `${channel}-${messageTs}`;
   setThreadSilent(watchThreadKey, true);
+  pauseThread(watchThreadKey, watch.addedBy);
+  markPauseNotified(watchThreadKey); // "일시정지 상태입니다" 메시지 표시 방지
 
   // processMessage를 통해 Claude 실행 (silent 모드 — 결과 텍스트만 게시)
   const userId = watch.addedBy;

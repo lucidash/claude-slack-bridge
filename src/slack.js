@@ -23,7 +23,17 @@ export async function fetchThreadHistory(channel, threadTs) {
     const history = result.messages.slice(0, -1);
     const lines = history.map(msg => {
       const role = msg.bot_id ? '봇' : '사용자';
-      const text = (msg.text || '').replace(/<@[A-Z0-9]+>\s*/g, '').trim();
+      // text + attachments 내용 추출 (봇 메시지는 attachments에 주요 내용이 있을 수 있음)
+      const parts = [];
+      const mainText = (msg.text || '').replace(/<@[A-Z0-9]+>\s*/g, '').trim();
+      if (mainText) parts.push(mainText);
+      if (msg.attachments) {
+        for (const att of msg.attachments) {
+          if (att.title) parts.push(att.title);
+          if (att.text && att.text !== att.title) parts.push(att.text);
+        }
+      }
+      const text = parts.join('\n').trim();
       return `[${role}] ${text}`;
     });
     return lines.join('\n');
