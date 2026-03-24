@@ -670,9 +670,8 @@ ${watch.action}
 - Slack 멘션 형식: <@USER_ID>
 - 필요하면 코드베이스를 분석하세요.`;
 
-  // 스레드를 silent로 마킹 (이후 muzi가 이 스레드에서 대화해도 silent 유지)
+  // silent 모드로 실행 (스레드를 활성 등록하지 않음 — 이후 사용자 메시지에 자동 반응 방지)
   const watchThreadKey = `${channel}-${messageTs}`;
-  saveThread(watchThreadKey, watch.addedBy);
   setThreadSilent(watchThreadKey, true);
 
   // processMessage를 통해 Claude 실행 (silent 모드 — 결과 텍스트만 게시)
