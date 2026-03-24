@@ -8,7 +8,7 @@ import {
   getSession, saveThread, isActiveThread, getThreadWorkdir, appendInbox,
   getWorkdir, getInbox, clearInbox, getAllSessions,
   saveSttResult, popSttResult,
-  getPausedThread, markPauseNotified, pauseThread,
+  getPausedThread, markPauseNotified,
   readSessionSummary, saveSyncPoint,
   isArchivedThread,
   getWatches,
@@ -720,13 +720,10 @@ ${watch.action}
 - Slack 멘션 형식: <@USER_ID>
 - 필요하면 코드베이스를 분석하세요.`;
 
-  // 스레드를 silent + pause로 마킹
-  // silent: 결과만 깨끗하게 게시, pause: 이후 유저 댓글에 반응하지 않음 (!resume으로 해제)
+  // silent 모드로 실행 (스레드를 활성 등록하지 않음 — 이후 사용자 메시지에 자동 반응 방지)
+  // 필요 시 @멘션으로 명시적 호출 가능
   const watchThreadKey = `${channel}-${messageTs}`;
-  saveThread(watchThreadKey, watch.addedBy);
   setThreadSilent(watchThreadKey, true);
-  pauseThread(watchThreadKey, watch.addedBy);
-  markPauseNotified(watchThreadKey); // "일시정지 상태입니다" 메시지 표시 방지
 
   // processMessage를 통해 Claude 실행 (silent 모드 — 결과 텍스트만 게시)
   const userId = watch.addedBy;
