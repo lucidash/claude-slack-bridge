@@ -13,6 +13,8 @@ import {
   isArchivedThread,
   getWatches,
   setThreadSilent, isThreadSilent,
+  saveProcessing, clearProcessing, getStaleProcessing,
+  getSessionPrUrl,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -373,6 +375,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
         thread_ts: logThreadTs,
       });
       processingTs = processingMsg.ts;
+      saveProcessing(sessionKey, { channel: logChannel, ts: processingTs, threadTs: logThreadTs });
     } catch (err) {
       console.error('[Slack] Failed to send processing message:', err.message);
     }
@@ -490,8 +493,12 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
 
     // "처리 중" → "처리완료"로 업데이트 (logChannel — silent이면 DM)
     if (processingTs && logChannel) {
-      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
+      const sid = getSession(sessionKey);
+      const prUrl = sid ? getSessionPrUrl(sid) : null;
+      const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
+      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo}${prInfo})` }).catch(() => {});
     }
+    clearProcessing(sessionKey);
 
     // silent 모드: :loading2: → :done: 으로 교체
     if (silentReactionTs) {
@@ -547,6 +554,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     if (processingTs && logChannel) {
       await slack.chat.update({ channel: logChannel, ts: processingTs, text: `❌ 오류 (${elapsed}${ctxInfo}): ${err.message}` }).catch(() => {});
     }
+    clearProcessing(sessionKey);
 
     // silent 모드: :loading2: → :x: 으로 교체
     if (silentReactionTs) {
@@ -750,8 +758,21 @@ app.get('/sessions', (_req, res) => res.json(getAllSessions()));
 
 // ── 서버 시작 ──────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[Server] Claude Slack Bridge running on port ${PORT}`);
+
+  // 서버 재시작 시 stale "처리 중" 메시지 정리
+  const stale = getStaleProcessing();
+  for (const [key, { channel, ts }] of stale) {
+    try {
+      await slack.chat.update({ channel, ts, text: '⚠️ 서버 재시작으로 작업이 중단되었습니다. 다시 요청해주세요.' });
+      console.log(`[Cleanup] Updated stale processing message: ${key}`);
+    } catch (err) {
+      console.warn(`[Cleanup] Failed to update stale message ${key}: ${err.message}`);
+    }
+  }
+  if (stale.length > 0) console.log(`[Cleanup] Cleaned up ${stale.length} stale processing message(s)`);
+
   initCrons(processMessage);
   console.log(`[Server] Endpoints:`);
   console.log(`         POST   /slack/events  - Slack webhook`);

@@ -11,10 +11,11 @@ const PAUSED_FILE = join(BRIDGE_DIR, 'paused.json');
 const CRONS_FILE = join(BRIDGE_DIR, 'crons.json');
 const SYNC_POINTS_FILE = join(BRIDGE_DIR, 'sync-points.json');
 const WATCHES_FILE = join(BRIDGE_DIR, 'watches.json');
+const PROCESSING_FILE = join(BRIDGE_DIR, 'processing.json');
 
 // 디렉토리 및 파일 초기화
 if (!existsSync(BRIDGE_DIR)) mkdirSync(BRIDGE_DIR, { recursive: true });
-for (const file of [SESSIONS_FILE, THREADS_FILE, WORKDIRS_FILE, PAUSED_FILE, WATCHES_FILE]) {
+for (const file of [SESSIONS_FILE, THREADS_FILE, WORKDIRS_FILE, PAUSED_FILE, WATCHES_FILE, PROCESSING_FILE]) {
   if (!existsSync(file)) writeFileSync(file, JSON.stringify({}, null, 2));
 }
 if (!existsSync(CRONS_FILE)) {
@@ -223,6 +224,15 @@ export function findSessionWorkdir(sessionId) {
   return solve(encoded, '/');
 }
 
+// 세션별 PR URL 조회 (~/.claude/.pr-urls/{sessionId})
+export function getSessionPrUrl(sessionId) {
+  if (!sessionId) return null;
+  const file = join(homedir(), '.claude', '.pr-urls', sessionId);
+  try {
+    return existsSync(file) ? readFileSync(file, 'utf-8').trim() : null;
+  } catch { return null; }
+}
+
 // 세션 파일 읽기
 export function findSessionFile(sessionId) {
   const projectsDir = join(homedir(), '.claude', 'projects');
@@ -324,6 +334,27 @@ export function removeWatch(channelId) {
   delete watches[channelId];
   writeJson(WATCHES_FILE, watches);
   return removed || null;
+}
+
+// ── Processing 메시지 추적 (서버 재시작 시 stale 정리용) ──
+
+export function saveProcessing(sessionKey, { channel, ts, threadTs }) {
+  const data = readJson(PROCESSING_FILE);
+  data[sessionKey] = { channel, ts, threadTs, startedAt: new Date().toISOString() };
+  writeJson(PROCESSING_FILE, data);
+}
+
+export function clearProcessing(sessionKey) {
+  const data = readJson(PROCESSING_FILE);
+  delete data[sessionKey];
+  writeJson(PROCESSING_FILE, data);
+}
+
+export function getStaleProcessing() {
+  const data = readJson(PROCESSING_FILE);
+  const entries = Object.entries(data);
+  if (entries.length > 0) writeJson(PROCESSING_FILE, {});
+  return entries;
 }
 
 export { BRIDGE_DIR, SESSIONS_FILE, INBOX_FILE };
