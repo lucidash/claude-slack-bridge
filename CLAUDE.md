@@ -14,6 +14,9 @@ Slack에서 Claude Code CLI를 원격 제어하는 브릿지 서버. Slack DM이
 | **likey-admin-v2** | `~/projects/likey-admin-v2` | Nuxt4, Vue3, Vuetify3, Tailwind | 관리자 대시보드 (신 버전) |
 | **likey-android** | `~/projects/likey-android` | Kotlin, Gradle | Android 앱 |
 | **likey-ios** | `~/projects/likey-ios` | Swift, SPM, Fastlane | iOS 앱 |
+| **likey-web-4** | `~/projects/likey-web-4` | Nuxt4, Vue3, Tailwind, TanStack Query | 웹 프론트엔드 (신 버전) |
+| **likey-features** | `~/projects/likey-features` | Markdown | 피처 스펙 문서, git submodule로 앱 레포에서 참조 |
+| **tpc-agent** | `~/projects/tpc-agent` | TypeScript, Express 5, SWC, PostgreSQL, Cloud Run | GitHub↔Notion↔Sentry↔Slack 자동화 에이전트 |
 
 ## 기술 스택
 
