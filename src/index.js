@@ -14,6 +14,7 @@ import {
   getWatches,
   setThreadSilent, isThreadSilent,
   saveProcessing, clearProcessing, getStaleProcessing,
+  getSessionPrUrl,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -492,7 +493,10 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
 
     // "처리 중" → "처리완료"로 업데이트 (logChannel — silent이면 DM)
     if (processingTs && logChannel) {
-      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo})` }).catch(() => {});
+      const sid = getSession(sessionKey);
+      const prUrl = sid ? getSessionPrUrl(sid) : null;
+      const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
+      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo}${prInfo})` }).catch(() => {});
     }
     clearProcessing(sessionKey);
 

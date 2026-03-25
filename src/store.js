@@ -224,6 +224,15 @@ export function findSessionWorkdir(sessionId) {
   return solve(encoded, '/');
 }
 
+// 세션별 PR URL 조회 (~/.claude/.pr-urls/{sessionId})
+export function getSessionPrUrl(sessionId) {
+  if (!sessionId) return null;
+  const file = join(homedir(), '.claude', '.pr-urls', sessionId);
+  try {
+    return existsSync(file) ? readFileSync(file, 'utf-8').trim() : null;
+  } catch { return null; }
+}
+
 // 세션 파일 읽기
 export function findSessionFile(sessionId) {
   const projectsDir = join(homedir(), '.claude', 'projects');

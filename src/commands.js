@@ -1,7 +1,7 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -232,7 +232,10 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     }
     const elapsed = lock.startTime ? formatElapsed(Date.now() - lock.startTime) : '?';
     const ctxInfo = lock.lastUsage ? formatCtx(lock.lastUsage) : '';
-    const lines = [`▶️ 작업 진행 중 (${elapsed}${ctxInfo})`];
+    const sid = getSession(sessionKey);
+    const prUrl = sid ? getSessionPrUrl(sid) : null;
+    const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
+    const lines = [`▶️ 작업 진행 중 (${elapsed}${ctxInfo}${prInfo})`];
     if (lock.currentMessage) {
       lines.push(`📝 요청: ${lock.currentMessage}`);
     }
