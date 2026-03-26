@@ -131,7 +131,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   runningQueries.set(sessionKey, {
     abort: () => {
       abortController.abort(); // onAskUser의 signal을 fire하여 pending 질문 reject
-      q.close().catch(() => {}); // SDK subprocess 종료
+      q.close()?.catch(() => {}); // SDK subprocess 종료
     },
   });
 
