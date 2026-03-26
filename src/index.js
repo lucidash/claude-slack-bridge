@@ -1,6 +1,20 @@
 import 'dotenv/config';
 import express from 'express';
 
+// Agent SDK가 spawn한 claude CLI 자식 프로세스가 같은 process group에서 실행되므로
+// CLI 종료 시 SIGINT가 부모 프로세스로 전파될 수 있음 → 서버 크래시 방지
+process.on('SIGINT', () => {
+  console.log('[Server] SIGINT received, ignoring (PM2 managed)');
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Server] Unhandled rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught exception:', err.message, err.stack);
+});
+
 import { slack, fetchThreadHistory } from './slack.js';
 import { verifySlackRequest, isUserAllowed } from './security.js';
 import { handleCommand } from './commands.js';
