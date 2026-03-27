@@ -343,6 +343,20 @@ function formatCtx(usage) {
   return ` | ctx: ${ctx}`;
 }
 
+function formatRateLimit(rl) {
+  if (!rl || rl.pct == null) return '';
+  let reset = '';
+  if (rl.resetsAt) {
+    const remaining = Math.max(0, rl.resetsAt - Math.floor(Date.now() / 1000));
+    if (remaining > 0) {
+      const h = Math.floor(remaining / 3600);
+      const m = Math.floor((remaining % 3600) / 60);
+      reset = h > 0 ? ` ${h}h${m}m` : ` ${m}m`;
+    }
+  }
+  return ` | 5h: ${rl.pct}%${reset}`;
+}
+
 async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false }) {
   const effectiveThreadKey = `${channel}-${replyThreadTs}`;
   const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
@@ -398,6 +412,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
   const startTime = Date.now();
   let updateTimer = null;
   let lastUsage = null;
+  let lastRateLimit = null;
 
   // lock에 진행 상태 기록 (!status 명령어용)
   const lock = sessionLocks.get(sessionKey);
@@ -421,10 +436,11 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
           if (!processingTs || lock?.aborted) return;
           const elapsed = formatElapsed(Date.now() - startTime);
           const ctxInfo = formatCtx(lastUsage);
+          const rlInfo = formatRateLimit(lastRateLimit);
           const recentActivities = lastActivities.slice(-5).join('\n  ');
           const statusText = recentActivities
-            ? `⏳ 처리 중... (${elapsed}${ctxInfo})\n  ${recentActivities}`
-            : `⏳ 처리 중... (${elapsed}${ctxInfo})`;
+            ? `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo})\n  ${recentActivities}`
+            : `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo})`;
           try {
             await slack.chat.update({ channel: logChannel, ts: processingTs, text: statusText });
           } catch { /* ignore update errors */ }
@@ -434,12 +450,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       })();
     }
 
-    const onProgress = (activities, usage) => {
+    const onProgress = (activities, usage, rateLimit) => {
       lastActivities = [...activities];
       if (usage) lastUsage = usage;
+      if (rateLimit) lastRateLimit = rateLimit;
       if (lock) {
         lock.lastActivities = lastActivities;
         lock.lastUsage = lastUsage;
+        lock.lastRateLimit = lastRateLimit;
       }
     };
 
@@ -499,18 +517,20 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       }).catch(err => console.error('[Slack] Failed to post session ID:', err.message));
     } : undefined;
 
-    const { result, usage } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady });
+    const { result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady });
     clearTimeout(updateTimer);
+    if (rateLimit) lastRateLimit = rateLimit;
 
     const elapsed = formatElapsed(Date.now() - startTime);
     const ctxInfo = formatCtx(usage || lastUsage);
+    const rlInfo = formatRateLimit(lastRateLimit);
 
     // "처리 중" → "처리완료"로 업데이트 (logChannel — silent이면 DM)
     if (processingTs && logChannel) {
       const sid = getSession(sessionKey);
       const prUrl = sid ? getSessionPrUrl(sid) : null;
       const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
-      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo}${prInfo})` }).catch(() => {});
+      await slack.chat.update({ channel: logChannel, ts: processingTs, text: `✅ 처리완료 (${elapsed}${ctxInfo}${rlInfo}${prInfo})` }).catch(() => {});
     }
     clearProcessing(sessionKey);
 
