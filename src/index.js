@@ -437,10 +437,13 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
           const elapsed = formatElapsed(Date.now() - startTime);
           const ctxInfo = formatCtx(lastUsage);
           const rlInfo = formatRateLimit(lastRateLimit);
+          const sid = getSession(sessionKey);
+          const prUrl = sid ? getSessionPrUrl(sid) : null;
+          const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
           const recentActivities = lastActivities.slice(-5).join('\n  ');
           const statusText = recentActivities
-            ? `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo})\n  ${recentActivities}`
-            : `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo})`;
+            ? `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo}${prInfo})\n  ${recentActivities}`
+            : `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo}${prInfo})`;
           try {
             await slack.chat.update({ channel: logChannel, ts: processingTs, text: statusText });
           } catch { /* ignore update errors */ }
