@@ -140,6 +140,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   let lastUsage = null;
   let resultUsage = null;
   let contextWindow = 1000000;
+  let lastRateLimit = null;
 
   try {
     for await (const msg of q) {
@@ -180,7 +181,19 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
         if (lastUsage) {
           console.log(`[Claude] Usage: ${lastUsage.inputTokens} / ${lastUsage.contextWindow} tokens`);
         }
-        if (onProgress) onProgress(activities, lastUsage);
+        if (onProgress) onProgress(activities, lastUsage, lastRateLimit);
+      }
+
+      // rate limit 이벤트 — 5h 사용률 추적
+      if (msg.type === 'rate_limit_event' && msg.rate_limit_info) {
+        const rl = msg.rate_limit_info;
+        if (rl.utilization != null) {
+          lastRateLimit = {
+            pct: Math.round(rl.utilization * 100),
+            resetsAt: rl.resetsAt || null,
+            type: rl.rateLimitType || null,
+          };
+        }
       }
 
       // result 이벤트 — 최종 결과
@@ -241,5 +254,5 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   }
 
   const usage = resultUsage || lastUsage;
-  return { result: finalResult.trim(), usage };
+  return { result: finalResult.trim(), usage, rateLimit: lastRateLimit };
 }

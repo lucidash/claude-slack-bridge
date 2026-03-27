@@ -232,10 +232,12 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     }
     const elapsed = lock.startTime ? formatElapsed(Date.now() - lock.startTime) : '?';
     const ctxInfo = lock.lastUsage ? formatCtx(lock.lastUsage) : '';
+    const rl = lock.lastRateLimit;
+    const rlInfo = rl?.pct != null ? ` | 5h: ${rl.pct}%` : '';
     const sid = getSession(sessionKey);
     const prUrl = sid ? getSessionPrUrl(sid) : null;
     const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
-    const lines = [`▶️ 작업 진행 중 (${elapsed}${ctxInfo}${prInfo})`];
+    const lines = [`▶️ 작업 진행 중 (${elapsed}${ctxInfo}${rlInfo}${prInfo})`];
     if (lock.currentMessage) {
       lines.push(`📝 요청: ${lock.currentMessage}`);
     }
