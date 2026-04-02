@@ -1,7 +1,7 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -34,6 +34,11 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 *작업 디렉토리*
 \`!wd <path>\` — 이 스레드의 작업 디렉토리 지정
 \`!pwd\` — 현재 작업 디렉토리 확인
+
+*모델*
+\`!model\` — 현재 사용 중인 모델 확인
+\`!model <sonnet|opus|haiku>\` — 이 스레드의 모델 변경
+\`!model reset\` — 기본값으로 초기화
 
 *실행 제어*
 \`!status\` — 진행 중인 작업 상태 확인 (경과 시간, 도구 사용, 컨텍스트)
@@ -158,6 +163,53 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       text: workdir
         ? `📂 현재 작업 디렉토리 ${source}: \`${workdir}\``
         : '📂 작업 디렉토리 미설정 (기본 디렉토리 사용)',
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
+  // model — 이 스레드에서 사용할 Claude 모델 지정
+  const modelMatch = userMessage.match(/^[!\/]model(?:\s+(.+))?$/i);
+  if (modelMatch) {
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    const VALID_MODELS = ['sonnet', 'opus', 'haiku',
+      'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-4-5-20251001'];
+    const arg = modelMatch[1]?.trim().toLowerCase();
+
+    if (!arg || arg === 'current') {
+      const threadModel = getThreadModel(effectiveThreadKey);
+      const defaultModel = process.env.CLAUDE_MODEL || 'sonnet';
+      const text = threadModel
+        ? `🤖 현재 모델: \`${threadModel}\` (스레드 지정)\n기본값: \`${defaultModel}\``
+        : `🤖 현재 모델: \`${defaultModel}\` (기본값)\n변경: \`!model <sonnet|opus|haiku>\``;
+      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      return true;
+    }
+
+    if (arg === 'reset' || arg === 'default') {
+      setThreadModel(effectiveThreadKey, null);
+      const defaultModel = process.env.CLAUDE_MODEL || 'sonnet';
+      await slack.chat.postMessage({
+        channel,
+        text: `🔄 모델을 기본값으로 초기화했습니다: \`${defaultModel}\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    if (!VALID_MODELS.includes(arg)) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ 알 수 없는 모델: \`${arg}\`\n사용 가능: \`sonnet\`, \`opus\`, \`haiku\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    setThreadModel(effectiveThreadKey, arg);
+    await slack.chat.postMessage({
+      channel,
+      text: `🤖 이 스레드의 모델을 \`${arg}\`로 변경했습니다.`,
       thread_ts: replyThreadTs,
     });
     return true;

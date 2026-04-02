@@ -101,6 +101,21 @@ export function isThreadSilent(threadKey) {
   return readJson(THREADS_FILE)[threadKey]?.silent || false;
 }
 
+export function setThreadModel(threadKey, model) {
+  const threads = readJson(THREADS_FILE);
+  if (!threads[threadKey]) threads[threadKey] = {};
+  if (model) {
+    threads[threadKey].model = model;
+  } else {
+    delete threads[threadKey].model;
+  }
+  writeJson(THREADS_FILE, threads);
+}
+
+export function getThreadModel(threadKey) {
+  return readJson(THREADS_FILE)[threadKey]?.model || null;
+}
+
 export function archiveThread(threadKey, splitTo) {
   const threads = readJson(THREADS_FILE);
   if (threads[threadKey]) {

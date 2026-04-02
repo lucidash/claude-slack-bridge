@@ -28,7 +28,7 @@ import {
   getWatches,
   setThreadSilent, isThreadSilent,
   saveProcessing, clearProcessing, getStaleProcessing,
-  getSessionPrUrl,
+  getSessionPrUrl, getThreadModel,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -520,7 +520,8 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       }).catch(err => console.error('[Slack] Failed to post session ID:', err.message));
     } : undefined;
 
-    const { result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady });
+    const threadModel = getThreadModel(effectiveThreadKey);
+    const { result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady, model: threadModel || undefined });
     clearTimeout(updateTimer);
     if (rateLimit) lastRateLimit = rateLimit;
 
