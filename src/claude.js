@@ -66,13 +66,13 @@ function extractToolDetail(toolName, input) {
  * @param {function|null} callbacks.onAskUser - AskUserQuestion 릴레이 콜백 (questions) => Promise<answers>
  * @returns {Promise<{result: string, usage: object|null}>} 최종 응답 텍스트와 usage 정보
  */
-export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, onAskUser, onSessionReady } = {}) {
+export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, onAskUser, onSessionReady, model: modelOverride } = {}) {
   let sessionId = getSession(sessionKey);
   const isResume = !!sessionId;
 
   const allowedDirs = process.env.CLAUDE_ALLOWED_DIRS || '';
   const skipPermissions = process.env.CLAUDE_SKIP_PERMISSIONS === 'true';
-  const model = process.env.CLAUDE_MODEL || 'sonnet';
+  const model = modelOverride || process.env.CLAUDE_MODEL || 'sonnet';
 
   // SDK options 구성
   // systemPrompt: preset을 사용해야 CLI가 ~/.claude/settings.json (language, skills 등)을 정상 로드함
