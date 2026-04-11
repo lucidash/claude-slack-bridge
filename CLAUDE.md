@@ -1,6 +1,6 @@
 # Claude Slack Bridge
 
-Slack에서 Claude Code CLI를 원격 제어하는 브릿지 서버. Slack DM이나 멘션으로 메시지를 보내면 로컬 머신의 Claude Code CLI를 실행하고 결과를 스레드에 반환한다.
+Slack에서 Claude Code Agent SDK를 통해 Claude를 원격 제어하는 브릿지 서버. Slack DM이나 멘션으로 메시지를 보내면 로컬 머신에서 Agent SDK의 `query()` API로 Claude를 실행하고 결과를 스레드에 반환한다.
 
 ## 대상 프로젝트
 
@@ -22,7 +22,7 @@ Slack에서 Claude Code CLI를 원격 제어하는 브릿지 서버. Slack DM이
 
 - Node.js (ESM), Express
 - `@slack/web-api` — Slack 연동
-- Claude Code CLI (`claude -p --output-format stream-json`) — 실제 작업 수행
+- `@anthropic-ai/claude-agent-sdk` — Claude Code Agent SDK (`query()` API로 실행)
 - OpenAI API / Google STT — 음성 인식 (fallback 체인)
 
 ## 프로젝트 구조
@@ -30,7 +30,7 @@ Slack에서 Claude Code CLI를 원격 제어하는 브릿지 서버. Slack DM이
 ```
 src/
   index.js    — Express 서버, Slack 이벤트 수신 및 Claude 실행 오케스트레이션
-  claude.js   — Claude CLI spawn, stream-json 파싱, 프로세스 관리
+  claude.js   — Agent SDK query() 실행, 스트리밍 이벤트 처리, 세션 관리
   commands.js — 명령어 처리 (!new, !cd, !session, !pause, !resume, !status, !stop, !queue)
   store.js    — 세션/스레드/작업디렉토리/인박스 영속 저장 (~/.claude/slack-bridge/)
   slack.js    — Slack WebClient, 스레드 히스토리 조회
@@ -48,9 +48,9 @@ npm run dev    # 개발 (--watch)
 ## 핵심 동작 흐름
 
 1. Slack 이벤트 수신 → 서명 검증 + 화이트리스트 확인
-2. 명령어(`!` prefix)면 즉시 처리, 아니면 Claude CLI 실행
+2. 명령어(`!` prefix)면 즉시 처리, 아니면 Agent SDK `query()` 실행
 3. 세션별 lock/queue로 동시 요청 직렬화
-4. `stream-json` 스트리밍으로 진행 상태(도구 사용, ctx 사용량)를 Slack에 실시간 업데이트
+4. SDK 스트리밍 이벤트(`assistant`, `result`, `rate_limit_event`)로 진행 상태를 Slack에 실시간 업데이트
 5. 새 세션이면 세션 ID를 스레드에 댓글로 기록
 
 ## 개발 컨벤션
