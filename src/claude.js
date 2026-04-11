@@ -82,6 +82,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
 
   const options = {
     model,
+    effort: 'max',
     cwd: workdir || undefined,
     additionalDirectories: allowedDirs ? allowedDirs.split(',').map(d => d.trim()) : undefined,
     systemPrompt: { type: 'preset', preset: 'claude_code' },
