@@ -66,7 +66,7 @@ function extractToolDetail(toolName, input) {
  * @param {function|null} callbacks.onAskUser - AskUserQuestion 릴레이 콜백 (questions) => Promise<answers>
  * @returns {Promise<{result: string, usage: object|null}>} 최종 응답 텍스트와 usage 정보
  */
-export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, onAskUser, onSessionReady, model: modelOverride } = {}) {
+export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, onAskUser, onSessionReady, model: modelOverride, effort: effortOverride } = {}) {
   let sessionId = getSession(sessionKey);
   const isResume = !!sessionId;
 
@@ -82,6 +82,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
 
   const options = {
     model,
+    effort: effortOverride || 'max',
     cwd: workdir || undefined,
     additionalDirectories: allowedDirs ? allowedDirs.split(',').map(d => d.trim()) : undefined,
     systemPrompt: { type: 'preset', preset: 'claude_code' },

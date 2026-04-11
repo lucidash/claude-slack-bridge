@@ -1,7 +1,7 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -39,6 +39,11 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!model\` — 현재 사용 중인 모델 확인
 \`!model <sonnet|opus|haiku>\` — 이 스레드의 모델 변경
 \`!model reset\` — 기본값으로 초기화
+
+*Effort*
+\`!effort\` — 현재 effort 수준 확인
+\`!effort <low|medium|high|max>\` — 이 스레드의 effort 변경
+\`!effort reset\` — 기본값으로 초기화
 
 *실행 제어*
 \`!status\` — 진행 중인 작업 상태 확인 (경과 시간, 도구 사용, 컨텍스트)
@@ -210,6 +215,51 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     await slack.chat.postMessage({
       channel,
       text: `🤖 이 스레드의 모델을 \`${arg}\`로 변경했습니다.`,
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
+  // effort — 이 스레드에서 사용할 thinking effort 수준 지정
+  const effortMatch = userMessage.match(/^[!\/]effort(?:\s+(.+))?$/i);
+  if (effortMatch) {
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    const VALID_EFFORTS = ['low', 'medium', 'high', 'max'];
+    const arg = effortMatch[1]?.trim().toLowerCase();
+
+    if (!arg || arg === 'current') {
+      const threadEffort = getThreadEffort(effectiveThreadKey);
+      const defaultEffort = 'max';
+      const text = threadEffort
+        ? `⚡ 현재 effort: \`${threadEffort}\` (스레드 지정)\n기본값: \`${defaultEffort}\``
+        : `⚡ 현재 effort: \`${defaultEffort}\` (기본값)\n변경: \`!effort <low|medium|high|max>\``;
+      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      return true;
+    }
+
+    if (arg === 'reset' || arg === 'default') {
+      setThreadEffort(effectiveThreadKey, null);
+      await slack.chat.postMessage({
+        channel,
+        text: `🔄 effort를 기본값으로 초기화했습니다: \`max\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    if (!VALID_EFFORTS.includes(arg)) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ 알 수 없는 effort: \`${arg}\`\n사용 가능: \`low\`, \`medium\`, \`high\`, \`max\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    setThreadEffort(effectiveThreadKey, arg);
+    await slack.chat.postMessage({
+      channel,
+      text: `⚡ 이 스레드의 effort를 \`${arg}\`로 변경했습니다.`,
       thread_ts: replyThreadTs,
     });
     return true;
