@@ -28,7 +28,7 @@ import {
   getWatches,
   setThreadSilent, isThreadSilent,
   saveProcessing, clearProcessing, getStaleProcessing,
-  getSessionPrUrl, getThreadModel,
+  getSessionPrUrl, getThreadModel, getThreadEffort,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -521,7 +521,8 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     } : undefined;
 
     const threadModel = getThreadModel(effectiveThreadKey);
-    const { result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady, model: threadModel || undefined });
+    const threadEffort = getThreadEffort(effectiveThreadKey);
+    const { result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady, model: threadModel || undefined, effort: threadEffort || undefined });
     clearTimeout(updateTimer);
     if (rateLimit) lastRateLimit = rateLimit;
 
