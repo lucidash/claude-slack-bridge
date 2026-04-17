@@ -178,7 +178,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   if (modelMatch) {
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
     const VALID_MODELS = ['sonnet', 'opus', 'haiku',
-      'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-4-5-20251001'];
+      'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7', 'claude-haiku-4-5-20251001'];
     const arg = modelMatch[1]?.trim().toLowerCase();
 
     if (!arg || arg === 'current') {
