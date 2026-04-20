@@ -852,6 +852,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       lines.push(`    sender: \`${(w.senders || []).join(', ')}\``);
       lines.push(`    trigger: ${w.trigger || '(미설정)'}`);
       lines.push(`    action: ${w.action || '(미설정)'}`);
+      if (w.anchorChannel) lines.push(`    anchor: \`${w.anchorChannel}\``);
     }
     await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
     return true;
@@ -873,7 +874,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   }
 
   // watch-set <channel_id> <field> <value>
-  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName)\s+([\s\S]+)$/i);
+  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName|anchorChannel)\s+([\s\S]+)$/i);
   if (watchSetMatch) {
     const [, chId, field, rawValue] = watchSetMatch;
     const existing = getWatch(chId);
@@ -917,15 +918,19 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const config = { enabled: true, addedBy: userId, createdAt: new Date().toISOString() };
     const lines = body.split('\n');
     for (const line of lines) {
-      const kv = line.match(/^\s*(sender|trigger|action|channelName)\s*:\s*(.+)$/i);
+      const kv = line.match(/^\s*(sender|trigger|action|channelName|anchorChannel)\s*:\s*(.+)$/i);
       if (kv) {
         const [, key, val] = kv;
         const k = key.toLowerCase();
         if (k === 'sender') {
           const senders = val.trim().split(/[,，]\s*/).map(s => s.trim()).filter(Boolean);
           config.senders = [...new Set([...(config.senders || []), ...senders])];
+        } else if (k === 'channelname') {
+          config.channelName = val.trim();
+        } else if (k === 'anchorchannel') {
+          config.anchorChannel = val.trim();
         } else {
-          config[k === 'channelname' ? 'channelName' : k] = val.trim();
+          config[k] = val.trim();
         }
       }
     }
@@ -946,6 +951,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     report.push(`sender: \`${(saved.senders || []).join(', ') || '(미설정)'}\``);
     report.push(`trigger: ${saved.trigger || '(미설정)'}`);
     report.push(`action: ${saved.action || '(미설정)'}`);
+    if (saved.anchorChannel) report.push(`anchor: \`${saved.anchorChannel}\``);
 
     const missing = [];
     if (!saved.senders?.length) missing.push('sender');
