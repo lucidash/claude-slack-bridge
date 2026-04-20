@@ -262,7 +262,7 @@ async function handleSlackEvent(event) {
 /**
  * 메시지를 세션 큐에 넣고 Claude 실행. Cron에서도 재사용.
  */
-async function processMessage({ userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false }) {
+async function processMessage({ userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false, anchorChannel = null }) {
   const sessionKey = `${userId}-${replyThreadTs}`;
 
   const lock = sessionLocks.get(sessionKey) || { processing: false, queue: [] };
@@ -275,7 +275,7 @@ async function processMessage({ userMessage, channel, replyThreadTs, userId, eve
     return;
   }
 
-  lock.queue.push({ userMessage, channel, replyThreadTs, userId, eventTs: eventTs || null, threadTs: threadTs || null, silent });
+  lock.queue.push({ userMessage, channel, replyThreadTs, userId, eventTs: eventTs || null, threadTs: threadTs || null, silent, anchorChannel });
 
   if (lock.processing) {
     console.log(`[Queue] Queued for busy session ${sessionKey} (${lock.queue.length} pending)`);
@@ -357,18 +357,22 @@ function formatRateLimit(rl) {
   return ` | 5h: ${rl.pct}%${reset}`;
 }
 
-async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false }) {
+async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false, anchorChannel = null }) {
   const effectiveThreadKey = `${channel}-${replyThreadTs}`;
   const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
 
-  // ── Silent DM shadow 설정 ──
-  // silent 모드: 원본 채널은 깨끗하게, 과정은 userId에게 DM으로 shadow logging
+  // ── Silent shadow anchor 설정 ──
+  // silent 모드: 원본 채널은 깨끗하게, 과정은 anchorChannel(지정 시) 또는 userId DM으로 shadow logging
   let dmChannel = null;
   let dmThreadTs = null;
   if (silent) {
     try {
-      const dm = await slack.conversations.open({ users: userId });
-      dmChannel = dm.channel.id;
+      if (anchorChannel) {
+        dmChannel = anchorChannel;
+      } else {
+        const dm = await slack.conversations.open({ users: userId });
+        dmChannel = dm.channel.id;
+      }
       const permalink = await slack.chat.getPermalink({ channel, message_ts: replyThreadTs }).catch(() => null);
       const link = permalink?.permalink || `${channel}/${replyThreadTs}`;
       const dmMsg = await slack.chat.postMessage({
@@ -377,7 +381,8 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       });
       dmThreadTs = dmMsg.ts;
     } catch (err) {
-      console.error('[Silent] Failed to open DM:', err.message, err.data?.error || '');
+      console.error('[Silent] Failed to open anchor channel:', err.message, err.data?.error || '');
+      dmChannel = null;
     }
   }
 
@@ -782,6 +787,7 @@ ${watch.action}
     eventTs: null,
     threadTs: null,
     silent: true,
+    anchorChannel: watch.anchorChannel || null,
   });
 }
 
