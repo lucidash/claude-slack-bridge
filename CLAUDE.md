@@ -72,8 +72,24 @@ npm run dev    # 개발 (--watch)
 | `CLAUDE_MODEL` | Claude 모델 (기본: sonnet) |
 | `CLAUDE_ALLOWED_DIRS` | Claude CLI 허용 디렉토리 (콤마 구분) |
 | `CLAUDE_SKIP_PERMISSIONS` | 권한 프롬프트 스킵 여부 |
+| `CODEX_MODEL` | Codex 엔진 사용 시 기본 모델 (기본: `o3`) |
+| `CODEX_PATH` | Codex CLI 바이너리 경로 (기본: `codex`, PATH 탐색) |
+| `CODEX_ALLOWED_DIRS` | Codex CLI 허용 디렉토리 (미지정 시 `CLAUDE_ALLOWED_DIRS` 사용) |
 | `OPENAI_API_KEY` | STT용 OpenAI API 키 (선택) |
 | `PORT` | 서버 포트 (기본: 3005) |
+
+## AI 엔진
+
+스레드 단위로 백엔드를 선택할 수 있다.
+
+| 엔진 | 바이너리 | 세션 식별자 | 권한/샌드박스 |
+|---|---|---|---|
+| `claude` (기본) | Claude Agent SDK (`query()`) | session ID (UUID) | `CLAUDE_SKIP_PERMISSIONS` 기준 |
+| `codex` | `codex exec --experimental-json` subprocess | thread ID | `sandbox=danger-full-access` + `approval_policy=never` 고정 (YOLO) |
+
+- `!engine` / `!engine <claude\|codex>` / `!engine reset` 으로 전환. 전환 시 세션과 대기 큐가 초기화된다 (두 엔진의 세션 ID가 호환되지 않으므로)
+- `!model` 은 Claude 엔진에서만 allow-list 검증. Codex 엔진에서는 임의 모델 문자열 허용 (예: `o3`, `gpt-5-codex`) — Codex CLI가 직접 해석
+- `!effort`는 양쪽 공통. Codex 매핑: `low/medium/high→동일`, `max→xhigh`
 
 ## 주요 명령어
 
@@ -88,5 +104,8 @@ npm run dev    # 개발 (--watch)
 | `!status` | 진행 중인 작업 상태 확인 |
 | `!stop` | 실행 중 작업 중단 + 큐 비우기 |
 | `!queue` | 대기열 확인 |
+| `!engine` / `!engine <claude\|codex>` | 스레드 AI 엔진 확인/변경 |
+| `!model` / `!model <id>` | 스레드 모델 확인/변경 (엔진별 유효 모델) |
+| `!effort <low\|medium\|high\|max>` | thinking effort 조정 |
 | `!sync-all` | 최근 24h 내 변경된 모든 세션 일괄 동기화 |
 | `!sync-all <duration>` | 지정 기간 내 변경 세션 일괄 동기화 (예: `6h`, `30m`) |

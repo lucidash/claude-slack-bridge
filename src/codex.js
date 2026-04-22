@@ -234,7 +234,12 @@ export async function runCodex(sessionKey, prompt, workdir, { onProgress, onSess
       }
     }
 
-    if (spawnError) throw spawnError;
+    if (spawnError) {
+      if (spawnError.code === 'ENOENT') {
+        throw new Error(`Codex CLI를 찾을 수 없습니다 (\`${codexPath}\`).\n설치: https://github.com/openai/codex\n또는 \`CODEX_PATH\` 환경변수로 바이너리 경로를 지정하세요.`);
+      }
+      throw spawnError;
+    }
     const { code, signal } = await exitPromise;
     if (code !== 0 || signal) {
       const stderr = Buffer.concat(stderrChunks).toString('utf8');
