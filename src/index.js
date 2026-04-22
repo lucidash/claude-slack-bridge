@@ -41,14 +41,16 @@ const PORT = process.env.PORT || 3005;
 // 세션별 lock/queue: 동일 세션에 대한 동시 resume 방지
 const sessionLocks = new Map();
 
-// Slack 이벤트 중복 처리 방지 (event_id → timestamp)
+// Slack 이벤트 중복 처리 방지
+// 같은 메시지라도 app_mention / message.channels 가 서로 다른 event_id 로 각각 도착하므로
+// (channel:ts) 기반 dedup 이 필요. ts 가 없는 이벤트(reaction 등)는 event_id 로 fallback.
 const seenEvents = new Map();
 const EVENT_DEDUP_TTL = 60_000; // 60초
 
-function isDuplicateEvent(eventId) {
-  if (!eventId) return false;
-  if (seenEvents.has(eventId)) return true;
-  seenEvents.set(eventId, Date.now());
+function isDuplicateEvent(key) {
+  if (!key) return false;
+  if (seenEvents.has(key)) return true;
+  seenEvents.set(key, Date.now());
   // TTL 지난 항목 정리 (100개 이상 쌓였을 때만)
   if (seenEvents.size > 100) {
     const cutoff = Date.now() - EVENT_DEDUP_TTL;
@@ -85,8 +87,10 @@ app.post('/slack/events', (req, res) => {
 
   if (type === 'event_callback' && event) {
     const eventId = req.body.event_id;
-    if (isDuplicateEvent(eventId)) {
-      console.log(`[Dedup] Duplicate event ignored: ${eventId}`);
+    // (channel:ts) 기반 dedup — 같은 메시지에 대한 app_mention/message.channels 중복 이벤트 방어
+    const dedupKey = event.ts && event.channel ? `${event.channel}:${event.ts}` : eventId;
+    if (isDuplicateEvent(dedupKey)) {
+      console.log(`[Dedup] Duplicate event ignored: ${dedupKey} (event_id=${eventId})`);
       return res.status(200).send('OK');
     }
     handleSlackEvent(event);
