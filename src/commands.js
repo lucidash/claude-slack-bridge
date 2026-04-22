@@ -1,8 +1,9 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getAccounts, addAccount, removeAccount, setCurrentAccount, getThreadEngine, setThreadEngine } from './store.js';
 import { stopClaudeQuery } from './claude.js';
+import { stopCodexQuery } from './codex.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
 function formatElapsed(ms) {
@@ -44,6 +45,11 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!effort\` — 현재 effort 수준 확인
 \`!effort <low|medium|high|max>\` — 이 스레드의 effort 변경
 \`!effort reset\` — 기본값으로 초기화
+
+*엔진*
+\`!engine\` — 현재 AI 엔진 확인
+\`!engine <claude|codex>\` — 이 스레드의 엔진 변경
+\`!engine reset\` — 기본값(claude)으로 초기화
 
 *실행 제어*
 \`!status\` — 진행 중인 작업 상태 확인 (경과 시간, 도구 사용, 컨텍스트)
@@ -274,6 +280,57 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     return true;
   }
 
+  // engine — 이 스레드에서 사용할 AI 엔진 지정 (claude / codex)
+  const engineMatch = userMessage.match(/^[!\/]engine(?:\s+(.+))?$/i);
+  if (engineMatch) {
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    const VALID_ENGINES = ['claude', 'codex'];
+    const arg = engineMatch[1]?.trim().toLowerCase();
+
+    if (!arg || arg === 'current') {
+      const threadEngine = getThreadEngine(effectiveThreadKey) || 'claude';
+      const text = `🔧 현재 엔진: \`${threadEngine}\`\n변경: \`!engine <claude|codex>\``;
+      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      return true;
+    }
+
+    if (arg === 'reset' || arg === 'default') {
+      setThreadEngine(effectiveThreadKey, null);
+      clearSession(sessionKey);
+      await slack.chat.postMessage({
+        channel,
+        text: '🔄 엔진을 기본값으로 초기화했습니다: `claude`\n세션이 초기화되었습니다.',
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    if (!VALID_ENGINES.includes(arg)) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ 알 수 없는 엔진: \`${arg}\`\n사용 가능: \`claude\`, \`codex\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    const prevEngine = getThreadEngine(effectiveThreadKey) || 'claude';
+    setThreadEngine(effectiveThreadKey, arg);
+    // 엔진 변경 시 세션 초기화 (Claude 세션을 Codex로 resume 불가)
+    if (prevEngine !== arg) {
+      clearSession(sessionKey);
+    }
+    const modelHint = arg === 'codex'
+      ? `\n모델 기본값: \`${process.env.CODEX_MODEL || 'o3'}\` (변경: \`!model <model>\`)`
+      : '';
+    await slack.chat.postMessage({
+      channel,
+      text: `🔧 이 스레드의 엔진을 \`${arg}\`로 변경했습니다.${prevEngine !== arg ? '\n세션이 초기화되었습니다.' : ''}${modelHint}`,
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
   // pause
   if (['!pause', '/pause'].includes(msg)) {
     if (!threadKey) {
@@ -368,7 +425,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   // !stop all — 작업 중단 + 큐 비우기
   if (['!stop', '/stop', '!kill', '/kill', '!stop all', '/stop all'].includes(msg)) {
     const clearQueue = msg.endsWith(' all');
-    const killed = stopClaudeQuery(sessionKey);
+    const effectiveTk = threadKey || `${channel}-${replyThreadTs}`;
+    const engine = getThreadEngine(effectiveTk) || 'claude';
+    const killed = engine === 'codex' ? stopCodexQuery(sessionKey) : stopClaudeQuery(sessionKey);
     let queueCleared = 0;
     let queueRemaining = 0;
     if (sessionLocks) {

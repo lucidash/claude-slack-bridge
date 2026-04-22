@@ -29,8 +29,10 @@ import {
   setThreadSilent, isThreadSilent,
   saveProcessing, clearProcessing, getStaleProcessing,
   getSessionPrUrl, getThreadModel, getThreadEffort,
+  getThreadEngine,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
+import { runCodex } from './codex.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
@@ -517,21 +519,35 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       });
     };
 
+    // 엔진 결정 (claude / codex)
+    const engine = getThreadEngine(effectiveThreadKey) || 'claude';
+    const isCodex = engine === 'codex';
+
     // 새 세션이면 세션 ID를 게시 (silent이면 DM에, DM 실패 시 생략)
     const onSessionReady = isNewSession ? (sid) => {
       if (silent && !logChannel) return; // DM 실패 시 원본 채널에 노출하지 않음
       const target = silent ? logChannel : channel;
       const targetTs = silent ? logThreadTs : replyThreadTs;
+      const resumeCmd = isCodex
+        ? `codex --resume ${sid}`
+        : `cd ${workdir || '~'} && claude --resume ${sid}`;
+      const engineLabel = isCodex ? '🟢 Codex' : '🔗';
       slack.chat.postMessage({
         channel: target,
-        text: `🔗 Session: \`${sid}\`\n\`\`\`cd ${workdir || '~'} && claude --resume ${sid}\`\`\``,
+        text: `${engineLabel} Session: \`${sid}\`\n\`\`\`${resumeCmd}\`\`\``,
         thread_ts: targetTs,
       }).catch(err => console.error('[Slack] Failed to post session ID:', err.message));
     } : undefined;
 
     const threadModel = getThreadModel(effectiveThreadKey);
     const threadEffort = getThreadEffort(effectiveThreadKey);
-    const { result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady, model: threadModel || undefined, effort: threadEffort || undefined });
+
+    let result, usage, rateLimit;
+    if (isCodex) {
+      ({ result, usage, rateLimit } = await runCodex(sessionKey, fullPrompt, workdir, { onProgress, onSessionReady, model: threadModel || undefined, effort: threadEffort || undefined }));
+    } else {
+      ({ result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady, model: threadModel || undefined, effort: threadEffort || undefined }));
+    }
     clearTimeout(updateTimer);
     if (rateLimit) lastRateLimit = rateLimit;
 
