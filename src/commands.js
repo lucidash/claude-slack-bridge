@@ -1,7 +1,7 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -68,6 +68,13 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!watch-set <channel_id> <field> <value>\` — watch 설정 개별 수정
 \`!unwatch <channel_id>\` — watching 해제
 \`!watches\` — 전체 watch 목록
+
+*Claude 계정 (OAuth 토큰)*
+\`!account\` / \`!account list\` — 등록된 계정 목록 + 현재 활성 계정
+\`!account current\` — 현재 활성 계정 확인
+\`!account add <name> <token>\` — 계정 등록 (DM에서만, token은 \`claude setup-token\`으로 생성)
+\`!account switch <name>\` — 활성 계정 전환 (다음 요청부터 적용)
+\`!account remove <name>\` — 계정 삭제
 
 *기타*
 \`!silent <메시지>\` — 조용히 실행 (처리 과정 표시 없이 결과만 게시)
@@ -965,6 +972,113 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     }
 
     await slack.chat.postMessage({ channel, text: report.join('\n'), thread_ts: replyThreadTs });
+    return true;
+  }
+
+  // account — Claude OAuth 토큰 계정 전환
+  const accountMatch = userMessage.match(/^[!\/]account(?:\s+(.*))?$/i);
+  if (accountMatch) {
+    const args = (accountMatch[1] || '').trim();
+    const sub = args.split(/\s+/)[0]?.toLowerCase() || 'list';
+    const isDm = typeof channel === 'string' && channel.startsWith('D');
+    const maskToken = (t) => t ? `${t.slice(0, 8)}…${t.slice(-4)}` : '';
+
+    if (sub === 'list' || sub === '' || sub === 'ls') {
+      const data = getAccounts();
+      const names = Object.keys(data.accounts);
+      if (names.length === 0) {
+        await slack.chat.postMessage({
+          channel,
+          text: '📭 등록된 계정이 없습니다.\n1) 터미널에서 `claude setup-token` 실행\n2) DM에서 `!account add <name> <token>`',
+          thread_ts: replyThreadTs,
+        });
+        return true;
+      }
+      const lines = [`👤 Claude 계정 (${names.length}개):`];
+      for (const name of names) {
+        const marker = data.current === name ? '▶' : '  ';
+        const info = data.accounts[name];
+        lines.push(`${marker} \`${name}\` — \`${maskToken(info.token)}\` (added ${info.addedAt?.split('T')[0] || '?'})`);
+      }
+      lines.push(`\n현재 활성: \`${data.current || '(없음 — 머신 기본 로그인 사용)'}\``);
+      await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
+      return true;
+    }
+
+    if (sub === 'current') {
+      const data = getAccounts();
+      const text = data.current
+        ? `👤 현재 활성 계정: \`${data.current}\` (\`${maskToken(data.accounts[data.current]?.token)}\`)`
+        : '👤 활성 계정 없음 — 머신 기본 로그인 사용 중';
+      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      return true;
+    }
+
+    if (sub === 'add') {
+      if (!isDm) {
+        await slack.chat.postMessage({
+          channel,
+          text: '🔒 보안상 `!account add`는 DM에서만 사용할 수 있습니다.',
+          thread_ts: replyThreadTs,
+        });
+        return true;
+      }
+      const addMatch = args.match(/^add\s+(\S+)\s+(\S+)$/i);
+      if (!addMatch) {
+        await slack.chat.postMessage({
+          channel,
+          text: '사용법: `!account add <name> <token>`\ntoken은 터미널에서 `claude setup-token` 으로 생성하세요.',
+          thread_ts: replyThreadTs,
+        });
+        return true;
+      }
+      const [, name, token] = addMatch;
+      addAccount(name, token);
+      await slack.chat.postMessage({
+        channel,
+        text: `✅ 계정 \`${name}\` 등록 완료. 토큰이 DM 메시지에 남아있으므로 **원본 메시지를 삭제**하세요.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    if (sub === 'switch' || sub === 'use') {
+      const name = args.split(/\s+/)[1];
+      if (!name) {
+        await slack.chat.postMessage({ channel, text: '사용법: `!account switch <name>`', thread_ts: replyThreadTs });
+        return true;
+      }
+      const ok = setCurrentAccount(name);
+      await slack.chat.postMessage({
+        channel,
+        text: ok
+          ? `✅ 활성 계정을 \`${name}\`으로 전환했습니다. 다음 요청부터 적용됩니다.`
+          : `❌ \`${name}\` 계정을 찾을 수 없습니다. \`!account list\`로 확인하세요.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+      const name = args.split(/\s+/)[1];
+      if (!name) {
+        await slack.chat.postMessage({ channel, text: '사용법: `!account remove <name>`', thread_ts: replyThreadTs });
+        return true;
+      }
+      const ok = removeAccount(name);
+      await slack.chat.postMessage({
+        channel,
+        text: ok ? `🗑️ 계정 \`${name}\` 삭제 완료.` : `❌ \`${name}\` 계정을 찾을 수 없습니다.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    await slack.chat.postMessage({
+      channel,
+      text: '사용법: `!account` / `!account current` / `!account add <name> <token>` / `!account switch <name>` / `!account remove <name>`',
+      thread_ts: replyThreadTs,
+    });
     return true;
   }
 

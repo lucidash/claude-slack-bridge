@@ -1,6 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { randomUUID } from 'crypto';
-import { getSession, saveSession, clearSession } from './store.js';
+import { getSession, saveSession, clearSession, getActiveToken } from './store.js';
 
 // 실행 중인 SDK query 객체 추적 (세션별)
 const runningQueries = new Map();
@@ -79,6 +79,11 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   // systemPrompt를 생략하면 SDK가 빈 문자열("")을 전달하여 기본 시스템 프롬프트가 무시됨
   // CLAUDECODE 환경변수 제거 (nested session 방지)
   const { CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, ...cleanEnv } = process.env;
+
+  // 활성 계정 토큰이 있으면 CLAUDE_CODE_OAUTH_TOKEN 오버라이드
+  // 없으면 기존 동작(머신 기본 로그인) 유지
+  const activeToken = getActiveToken();
+  if (activeToken) cleanEnv.CLAUDE_CODE_OAUTH_TOKEN = activeToken;
 
   const options = {
     model,
