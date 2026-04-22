@@ -50,6 +50,8 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!stop\` — 현재 작업 중단 (대기열은 이어서 처리)
 \`!stop all\` — 현재 작업 중단 + 대기열 비우기
 \`!queue\` — 대기열 확인
+\`!queue clear\` — 대기열 비우기 (실행 중 작업은 유지)
+\`!queue remove <N>\` — 대기열에서 N번째 항목 제거
 
 *스레드 제어*
 \`!pause\` — 스레드 일시정지 (메시지 무시)
@@ -389,6 +391,60 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       ? `🛑 ${parts.join(', ')}.`
       : '🛑 현재 실행 중인 작업이 없습니다.';
     await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+    return true;
+  }
+
+  // queue remove N (대기열에서 특정 항목 제거)
+  const queueRemoveMatch = userMessage.match(/^[!\/]queue\s+(?:remove|rm|del)\s+(\d+)$/i);
+  if (queueRemoveMatch) {
+    const index = parseInt(queueRemoveMatch[1], 10);
+    const lock = sessionLocks?.get(sessionKey);
+    if (!lock || lock.queue.length === 0) {
+      await slack.chat.postMessage({
+        channel,
+        text: '📭 대기열이 비어있습니다.',
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+    if (index < 1 || index > lock.queue.length) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ 유효하지 않은 번호입니다. 1~${lock.queue.length} 사이의 번호를 입력하세요.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+    const [removed] = lock.queue.splice(index - 1, 1);
+    const preview = removed.userMessage.length > 40
+      ? removed.userMessage.substring(0, 40) + '…'
+      : removed.userMessage;
+    await slack.chat.postMessage({
+      channel,
+      text: `🗑️ 대기열 ${index}번 항목을 제거했습니다: ${preview}${lock.queue.length > 0 ? `\n📥 남은 대기열: ${lock.queue.length}건` : ''}`,
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
+  // queue clear (대기열만 비우기, 실행 중 작업은 유지)
+  if (['!queue clear', '/queue clear'].includes(msg)) {
+    const lock = sessionLocks?.get(sessionKey);
+    if (!lock || lock.queue.length === 0) {
+      await slack.chat.postMessage({
+        channel,
+        text: '📭 대기열이 이미 비어있습니다.',
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+    const cleared = lock.queue.length;
+    lock.queue.length = 0;
+    await slack.chat.postMessage({
+      channel,
+      text: `🗑️ 대기열 ${cleared}건을 비웠습니다.${lock.processing ? ' 실행 중인 작업은 계속 진행됩니다.' : ''}`,
+      thread_ts: replyThreadTs,
+    });
     return true;
   }
 
