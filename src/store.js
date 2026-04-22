@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -12,6 +12,7 @@ const CRONS_FILE = join(BRIDGE_DIR, 'crons.json');
 const SYNC_POINTS_FILE = join(BRIDGE_DIR, 'sync-points.json');
 const WATCHES_FILE = join(BRIDGE_DIR, 'watches.json');
 const PROCESSING_FILE = join(BRIDGE_DIR, 'processing.json');
+const ACCOUNTS_FILE = join(BRIDGE_DIR, 'accounts.json');
 
 // 디렉토리 및 파일 초기화
 if (!existsSync(BRIDGE_DIR)) mkdirSync(BRIDGE_DIR, { recursive: true });
@@ -27,6 +28,10 @@ if (!existsSync(SYNC_POINTS_FILE)) {
 if (!existsSync(INBOX_FILE)) {
   writeFileSync(INBOX_FILE, JSON.stringify({ messages: [], lastChecked: null }, null, 2));
 }
+if (!existsSync(ACCOUNTS_FILE)) {
+  writeFileSync(ACCOUNTS_FILE, JSON.stringify({ current: null, accounts: {} }, null, 2));
+  try { chmodSync(ACCOUNTS_FILE, 0o600); } catch { /* ignore */ }
+}
 
 function readJson(file) {
   return JSON.parse(readFileSync(file, 'utf-8'));
@@ -34,6 +39,11 @@ function readJson(file) {
 
 function writeJson(file, data) {
   writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function writeSecretJson(file, data) {
+  writeFileSync(file, JSON.stringify(data, null, 2));
+  try { chmodSync(file, 0o600); } catch { /* ignore */ }
 }
 
 // 세션 관리 (스레드 단위)
@@ -385,6 +395,41 @@ export function getStaleProcessing() {
   const entries = Object.entries(data);
   if (entries.length > 0) writeJson(PROCESSING_FILE, {});
   return entries;
+}
+
+// Claude 계정 (CLAUDE_CODE_OAUTH_TOKEN) 관리
+export function getAccounts() {
+  return readJson(ACCOUNTS_FILE);
+}
+
+export function addAccount(name, token) {
+  const data = readJson(ACCOUNTS_FILE);
+  data.accounts[name] = { token, addedAt: new Date().toISOString() };
+  if (!data.current) data.current = name;
+  writeSecretJson(ACCOUNTS_FILE, data);
+}
+
+export function removeAccount(name) {
+  const data = readJson(ACCOUNTS_FILE);
+  if (!data.accounts[name]) return false;
+  delete data.accounts[name];
+  if (data.current === name) data.current = Object.keys(data.accounts)[0] || null;
+  writeSecretJson(ACCOUNTS_FILE, data);
+  return true;
+}
+
+export function setCurrentAccount(name) {
+  const data = readJson(ACCOUNTS_FILE);
+  if (!data.accounts[name]) return false;
+  data.current = name;
+  writeSecretJson(ACCOUNTS_FILE, data);
+  return true;
+}
+
+export function getActiveToken() {
+  const data = readJson(ACCOUNTS_FILE);
+  if (!data.current) return null;
+  return data.accounts[data.current]?.token || null;
 }
 
 export { BRIDGE_DIR, SESSIONS_FILE, INBOX_FILE };
