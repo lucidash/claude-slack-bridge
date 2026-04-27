@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import { SocketModeClient } from '@slack/socket-mode';
 
 // Agent SDK가 spawn한 claude CLI 자식 프로세스가 같은 process group에서 실행되므로
 // CLI 종료 시 SIGINT가 부모 프로세스로 전파될 수 있음 → 서버 크래시 방지
@@ -37,6 +38,7 @@ import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
 
 const app = express();
 const PORT = process.env.PORT || 3005;
+const SLACK_MODE = (process.env.SLACK_MODE || 'http').toLowerCase();
 
 // 세션별 lock/queue: 동일 세션에 대한 동시 resume 방지
 const sessionLocks = new Map();
@@ -71,34 +73,43 @@ app.use(express.json({
   },
 }));
 
-// Slack Events API 엔드포인트
-app.post('/slack/events', (req, res) => {
-  if (!verifySlackRequest(req)) {
-    console.warn('[Security] 유효하지 않은 Slack 서명');
-    return res.status(401).send('Unauthorized');
+// 이벤트 dispatch 공통 로직 (HTTP / Socket 양쪽에서 사용)
+function dispatchEventCallback(body) {
+  const event = body.event;
+  if (!event) return;
+  const eventId = body.event_id;
+  // (channel:ts) 기반 dedup — 같은 메시지에 대한 app_mention/message.channels 중복 이벤트 방어
+  const dedupKey = event.ts && event.channel ? `${event.channel}:${event.ts}` : eventId;
+  if (isDuplicateEvent(dedupKey)) {
+    console.log(`[Dedup] Duplicate event ignored: ${dedupKey} (event_id=${eventId})`);
+    return;
   }
+  handleSlackEvent(event);
+}
 
-  const { type, challenge, event } = req.body;
-
-  if (type === 'url_verification') {
-    console.log('[Slack] URL verification received');
-    return res.json({ challenge });
-  }
-
-  if (type === 'event_callback' && event) {
-    const eventId = req.body.event_id;
-    // (channel:ts) 기반 dedup — 같은 메시지에 대한 app_mention/message.channels 중복 이벤트 방어
-    const dedupKey = event.ts && event.channel ? `${event.channel}:${event.ts}` : eventId;
-    if (isDuplicateEvent(dedupKey)) {
-      console.log(`[Dedup] Duplicate event ignored: ${dedupKey} (event_id=${eventId})`);
-      return res.status(200).send('OK');
+// Slack Events API 엔드포인트 (HTTP 모드일 때만 활성)
+if (SLACK_MODE === 'http') {
+  app.post('/slack/events', (req, res) => {
+    if (!verifySlackRequest(req)) {
+      console.warn('[Security] 유효하지 않은 Slack 서명');
+      return res.status(401).send('Unauthorized');
     }
-    handleSlackEvent(event);
-  }
 
-  // Slack에게 즉시 200 응답 (3초 내 응답 필요)
-  res.status(200).send('OK');
-});
+    const { type, challenge } = req.body;
+
+    if (type === 'url_verification') {
+      console.log('[Slack] URL verification received');
+      return res.json({ challenge });
+    }
+
+    if (type === 'event_callback') {
+      dispatchEventCallback(req.body);
+    }
+
+    // Slack에게 즉시 200 응답 (3초 내 응답 필요)
+    res.status(200).send('OK');
+  });
+}
 
 // ── 이벤트 핸들러 ──────────────────────────────────────────────
 
@@ -805,10 +816,40 @@ app.get('/inbox', (_req, res) => res.json(getInbox()));
 app.delete('/inbox', (_req, res) => { clearInbox(); res.json({ status: 'cleared' }); });
 app.get('/sessions', (_req, res) => res.json(getAllSessions()));
 
+// ── Socket Mode 시작 ───────────────────────────────────────────
+
+async function startSocketMode() {
+  if (!process.env.SLACK_APP_TOKEN) {
+    console.error('[Error] SLACK_MODE=socket 인데 SLACK_APP_TOKEN 이 없습니다.');
+    console.error('        Slack App 설정에서 App-Level Token (xapp-, connections:write) 을 발급하세요.');
+    process.exit(1);
+  }
+
+  const socket = new SocketModeClient({ appToken: process.env.SLACK_APP_TOKEN });
+
+  // 모든 Slack 이벤트를 단일 핸들러로 라우팅 — body.type 으로 분기
+  socket.on('slack_event', async ({ ack, body }) => {
+    try {
+      await ack();
+    } catch (err) {
+      console.warn('[Socket] ack failed:', err.message);
+    }
+    if (body?.type === 'event_callback') {
+      dispatchEventCallback(body);
+    }
+  });
+
+  socket.on('connected', () => console.log('[Socket] Connected to Slack'));
+  socket.on('disconnected', () => console.warn('[Socket] Disconnected from Slack'));
+  socket.on('error', (err) => console.error('[Socket] Error:', err.message));
+
+  await socket.start();
+}
+
 // ── 서버 시작 ──────────────────────────────────────────────────
 
 app.listen(PORT, async () => {
-  console.log(`[Server] Claude Slack Bridge running on port ${PORT}`);
+  console.log(`[Server] Claude Slack Bridge running on port ${PORT} (mode: ${SLACK_MODE})`);
 
   // 서버 재시작 시 stale "처리 중" 메시지 정리
   const stale = getStaleProcessing();
@@ -823,8 +864,22 @@ app.listen(PORT, async () => {
   if (stale.length > 0) console.log(`[Cleanup] Cleaned up ${stale.length} stale processing message(s)`);
 
   initCrons(processMessage);
+
+  if (SLACK_MODE === 'socket') {
+    try {
+      await startSocketMode();
+    } catch (err) {
+      console.error('[Socket] Failed to start:', err.message);
+      process.exit(1);
+    }
+  }
+
   console.log(`[Server] Endpoints:`);
-  console.log(`         POST   /slack/events  - Slack webhook`);
+  if (SLACK_MODE === 'http') {
+    console.log(`         POST   /slack/events  - Slack webhook`);
+  } else {
+    console.log(`         (Socket Mode — Slack 이벤트는 WebSocket 으로 수신)`);
+  }
   console.log(`         GET    /health        - Health check`);
   console.log(`         GET    /inbox         - View inbox`);
   console.log(`         DELETE /inbox         - Clear inbox`);
