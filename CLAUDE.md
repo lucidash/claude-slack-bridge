@@ -67,13 +67,15 @@ npm run dev    # 개발 (--watch)
 | 변수 | 설명 |
 |---|---|
 | `SLACK_BOT_TOKEN` | Slack Bot OAuth Token |
-| `SLACK_SIGNING_SECRET` | Slack 서명 검증용 시크릿 |
+| `SLACK_MODE` | `http` (기본, Events API + 공인 URL) 또는 `socket` (Socket Mode, 터널 불필요) |
+| `SLACK_SIGNING_SECRET` | HTTP 모드용. Slack 서명 검증 시크릿 |
+| `SLACK_APP_TOKEN` | Socket 모드용. App-Level Token (`xapp-`, scope: `connections:write`) |
 | `ALLOWED_USERS` | 허용 사용자 ID (콤마 구분) |
 | `CLAUDE_MODEL` | Claude 모델 (기본: sonnet) |
 | `CLAUDE_ALLOWED_DIRS` | Claude CLI 허용 디렉토리 (콤마 구분) |
 | `CLAUDE_SKIP_PERMISSIONS` | 권한 프롬프트 스킵 여부 |
 | `OPENAI_API_KEY` | STT용 OpenAI API 키 (선택) |
-| `PORT` | 서버 포트 (기본: 3005) |
+| `PORT` | 서버 포트 (기본: 3005). Socket 모드에서도 디버그 엔드포인트로 사용 |
 
 ## 주요 명령어
 
