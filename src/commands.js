@@ -59,7 +59,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 
 *Cron*
 \`!cron\` — 등록된 cron 목록
-\`!cron add "schedule" message -- 설명\` — cron 등록
+\`!cron add "schedule" message [--workdir <path>] [-- 설명]\` — cron 등록
 \`!cron remove <id>\` — cron 삭제
 \`!cron pause <id>\` / \`!cron resume <id>\` — 일시정지/재개
 \`!cron run <id>\` — 즉시 실행
@@ -724,30 +724,43 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const args = (cronMatch[1] || '').trim();
     const sub = args.split(/\s+/)[0]?.toLowerCase();
 
-    // !cron add "schedule" message [-- description]
+    // !cron add "schedule" message [--workdir <path>] [-- description]
     if (sub === 'add') {
       const addMatch = args.match(/^add\s+"([^"]+)"\s+(.+)$/i);
       if (!addMatch) {
         await slack.chat.postMessage({
           channel,
-          text: '사용법: `!cron add "0 9 * * 1-5" /scrum -- 매일 아침 스크럼`',
+          text: '사용법: `!cron add "0 9 * * 1-5" /scrum [--workdir ~/projects/likey-backend] [-- 매일 아침 스크럼]`',
           thread_ts: replyThreadTs,
         });
         return true;
       }
       const schedule = addMatch[1];
       let message = addMatch[2];
+
+      // --workdir <path> 추출 (description 의 `--` 보다 먼저 처리)
+      let workdir = null;
+      const wdMatch = message.match(/\s+--workdir\s+(\S+)/);
+      if (wdMatch) {
+        workdir = wdMatch[1];
+        message = message.replace(/\s+--workdir\s+\S+/, '');
+      }
+
+      // -- description split
       let description = null;
       const descSplit = message.match(/^(.+?)\s+--\s+(.+)$/);
       if (descSplit) {
         message = descSplit[1].trim();
         description = descSplit[2].trim();
+      } else {
+        message = message.trim();
       }
       try {
-        const job = addCronJob({ schedule, message, channel, userId, description });
+        const job = addCronJob({ schedule, message, channel, userId, description, workdir });
+        const wdLine = job.workdir ? `\n작업 디렉토리: \`${job.workdir}\`` : '';
         await slack.chat.postMessage({
           channel,
-          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`\n설명: ${job.description}`,
+          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`${wdLine}\n설명: ${job.description}`,
           thread_ts: replyThreadTs,
         });
       } catch (err) {
@@ -888,8 +901,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       for (const j of jobs) {
         const status = j.enabled ? '✅' : '⏸️';
         const lastRun = j.lastRun ? new Date(j.lastRun).toLocaleString('ko-KR') : '-';
+        const wdInfo = j.workdir ? ` | wd: \`${j.workdir}\`` : '';
         lines.push(`${status} \`${j.id}\` | \`${j.schedule}\` | ${j.description}`);
-        lines.push(`    명령: \`${j.message}\` | 마지막 실행: ${lastRun}`);
+        lines.push(`    명령: \`${j.message}\`${wdInfo} | 마지막 실행: ${lastRun}`);
       }
       await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
       return true;
