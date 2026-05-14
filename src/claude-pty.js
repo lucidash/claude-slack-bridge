@@ -17,11 +17,21 @@
 //      - tool_use / thinking → onProgress 활동 알림
 
 import { spawn as ptySpawn } from 'node-pty';
-import { existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
+import { existsSync, readFileSync, statSync, openSync, readSync, closeSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import xtermPkg from '@xterm/headless';
-import { getSession, saveSession } from './store.js';
+import { getSession, saveSession, clearSession } from './store.js';
+
+function findJsonlForSid(sid) {
+  try {
+    for (const dir of readdirSync(PROJECTS_DIR)) {
+      const p = join(PROJECTS_DIR, dir, `${sid}.jsonl`);
+      if (existsSync(p)) return p;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 
 const { Terminal } = xtermPkg;
 
@@ -111,7 +121,15 @@ function truncate(s, len) {
 export async function runClaudeViaPty(sessionKey, prompt, workdir, callbacks = {}) {
   const { onProgress, onSessionReady, model: modelOverride, effort: effortOverride } = callbacks;
 
-  const existingSid = getSession(sessionKey);
+  // SID validity 검증: jsonl 파일이 실제 존재해야만 --resume 사용
+  // (이전 시도가 turn 시작 전 실패해서 orphan SID 가 store 에 남아있을 수 있음)
+  let existingSid = getSession(sessionKey);
+  if (existingSid && !findJsonlForSid(existingSid)) {
+    console.log(`[pty:${sessionKey}] orphan SID ${existingSid} (no jsonl), starting fresh`);
+    clearSession(sessionKey);
+    existingSid = null;
+  }
+
   const args = ['--dangerously-skip-permissions'];
   if (existingSid) args.unshift('--resume', existingSid);
   if (modelOverride) args.push('--model', modelOverride);
@@ -158,25 +176,38 @@ export async function runClaudeViaPty(sessionKey, prompt, workdir, callbacks = {
       await waitFor(() => bufferText(term).includes('trust this folder'),
         { timeoutMs: 4000, label: 'security guide', signal });
       pty.write('\r');
+      console.log(`[pty:${sessionKey}] security guide passed`);
     } catch { /* 없으면 무시 */ }
 
     // 2) INSERT 모드 진입 대기
-    await waitFor(() => bufferText(term).includes('-- INSERT --'),
-      { timeoutMs: 8000, label: 'INSERT mode', signal });
-    await new Promise(r => setTimeout(r, 300));
-
-    // 3) 새 세션이면 "/" + backspace 로 session 활성화 trigger
-    if (!existingSid) {
-      pty.write('/');
-      await new Promise(r => setTimeout(r, 200));
-      pty.write('\x7f'); // backspace
-      await new Promise(r => setTimeout(r, 200));
+    try {
+      await waitFor(() => bufferText(term).includes('-- INSERT --'),
+        { timeoutMs: 12000, label: 'INSERT mode', signal });
+      console.log(`[pty:${sessionKey}] INSERT mode ready`);
+    } catch (e) {
+      console.log(`[pty:${sessionKey}] INSERT timeout, buffer dump:\n${bufferText(term).slice(0, 2000)}`);
+      throw e;
     }
+    await new Promise(r => setTimeout(r, 500));
 
-    // 4) sessions/<pid>.json polling → sessionId 발견
+    // 3) prompt 송신 → 이 시점에 session 활성화 + 첫 turn 시작
+    //    multi-line 은 bracketed paste 로 감싸야 TUI 가 한 입력으로 인식
+    const isMultiline = /\r|\n/.test(prompt);
+    if (isMultiline) {
+      pty.write('\x1b[200~' + prompt.replace(/\r\n?/g, '\n') + '\x1b[201~');
+      await new Promise(r => setTimeout(r, 400));
+      pty.write('\r');
+    } else {
+      pty.write(prompt + '\r');
+    }
+    pushActivity('💬 prompt sent');
+    console.log(`[pty:${sessionKey}] prompt sent (${prompt.length} chars, multiline=${isMultiline})`);
+
+    // 4) sessions/<pid>.json polling → sessionId 발견 (첫 turn 시작 시점에 만들어짐)
     const meta = await waitFor(() => readSessionMeta(pty.pid),
-      { timeoutMs: 8000, label: 'session meta', signal });
+      { timeoutMs: 10000, label: 'session meta', signal });
     const sid = meta.sessionId;
+    console.log(`[pty:${sessionKey}] session meta: sid=${sid} cwd=${meta.cwd}`);
 
     if (!existingSid) {
       saveSession(sessionKey, sid);
@@ -188,11 +219,15 @@ export async function runClaudeViaPty(sessionKey, prompt, workdir, callbacks = {
 
     // 5) jsonl tail 시작점 기록
     const jsonlPath = join(PROJECTS_DIR, encodeCwd(meta.cwd), `${sid}.jsonl`);
-    let offset = existsSync(jsonlPath) ? statSync(jsonlPath).size : 0;
-
-    // 6) prompt 송신
-    pty.write(prompt + '\r');
-    pushActivity('💬 prompt sent');
+    let offset = 0; // 새 세션은 처음부터, resume 은 prompt 송신 이전 위치 (직전 size)
+    if (existingSid && existsSync(jsonlPath)) {
+      // resume: 이전 turn 들은 skip 하기 위해 우리 prompt 송신 이후 부분만 읽으면 되지만,
+      // user 라인이 먼저 들어오고 그 다음 assistant 가 오므로, 새로 user 라인 보일 때까지 skip
+      offset = statSync(jsonlPath).size;
+      // 우리 prompt 가 이미 user 라인으로 들어가 있을 수 있으니, 약간 거슬러 올라가서 user 부터 잡음
+      offset = Math.max(0, offset - 8192);
+    }
+    console.log(`[pty:${sessionKey}] jsonl=${jsonlPath} offset=${offset}`);
 
     // 7) jsonl tail → end_turn 까지
     const result = await tailUntilEndTurn({
@@ -266,8 +301,14 @@ async function tailUntilEndTurn({ jsonlPath, getOffset, setOffset, pid, signal, 
         lastAssistant = j.message;
         if (j.message.usage) lastUsage = j.message.usage;
         if (onAssistantChunk) onAssistantChunk(j.message);
+        // TUI 는 한 turn 응답을 thinking 라인 + text 라인 두 개로 split (각 line 의 stop_reason=end_turn).
+        // text 블록이 있는 end_turn 만 진짜 응답 완료로 인식.
         if (j.message.stop_reason === 'end_turn') {
-          return { text: extractText(j.message), usage: lastUsage ? normalizeUsage(lastUsage) : null };
+          const text = extractText(j.message);
+          if (text) {
+            return { text, usage: lastUsage ? normalizeUsage(lastUsage) : null };
+          }
+          // thinking-only end_turn 은 skip — 후속 text 라인 대기
         }
       } else if (j.type === 'thinking' && onThinking) {
         onThinking();
