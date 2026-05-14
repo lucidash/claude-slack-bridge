@@ -217,16 +217,12 @@ export async function runClaudeViaPty(sessionKey, prompt, workdir, callbacks = {
       }
     }
 
-    // 5) jsonl tail 시작점 기록
+    // 5) jsonl tail 시작점 — 새 세션은 0, resume 은 prompt 송신 직전 size
+    //    이전 시도들에서 size - 8192 로 거슬러 올라가던 코드가 이전 turn 의 assistant 라인을
+    //    재처리해서 같은 응답을 반복하는 버그를 일으켰음. 송신 후 시점의 size 부터 읽으면
+    //    user 라인은 지나갈 수 있지만 assistant 만 보므로 OK.
     const jsonlPath = join(PROJECTS_DIR, encodeCwd(meta.cwd), `${sid}.jsonl`);
-    let offset = 0; // 새 세션은 처음부터, resume 은 prompt 송신 이전 위치 (직전 size)
-    if (existingSid && existsSync(jsonlPath)) {
-      // resume: 이전 turn 들은 skip 하기 위해 우리 prompt 송신 이후 부분만 읽으면 되지만,
-      // user 라인이 먼저 들어오고 그 다음 assistant 가 오므로, 새로 user 라인 보일 때까지 skip
-      offset = statSync(jsonlPath).size;
-      // 우리 prompt 가 이미 user 라인으로 들어가 있을 수 있으니, 약간 거슬러 올라가서 user 부터 잡음
-      offset = Math.max(0, offset - 8192);
-    }
+    let offset = existsSync(jsonlPath) ? statSync(jsonlPath).size : 0;
     console.log(`[pty:${sessionKey}] jsonl=${jsonlPath} offset=${offset}`);
 
     // 7) jsonl tail → end_turn 까지
