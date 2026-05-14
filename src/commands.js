@@ -1,8 +1,9 @@
 import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
-import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
+import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getThreadEngine, setThreadEngine, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
 import { stopClaudeQuery } from './claude.js';
+import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
 function formatElapsed(ms) {
@@ -34,6 +35,11 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 *작업 디렉토리*
 \`!wd <path>\` — 이 스레드의 작업 디렉토리 지정
 \`!pwd\` — 현재 작업 디렉토리 확인
+
+*엔진*
+\`!engine\` — 현재 엔진 확인 (claude / pty-claude)
+\`!engine <claude|pty-claude>\` — 이 스레드의 엔진 변경 (세션 초기화됨)
+\`!engine reset\` — 기본값(claude SDK)으로 초기화
 
 *모델*
 \`!model\` — 현재 사용 중인 모델 확인
@@ -229,6 +235,65 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     return true;
   }
 
+  // engine — 이 스레드에서 사용할 AI 엔진 지정 (claude SDK / pty-claude TUI)
+  const engineMatch = userMessage.match(/^[!\/]engine(?:\s+(.+))?$/i);
+  if (engineMatch) {
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    const VALID_ENGINES = ['claude', 'pty-claude'];
+    const arg = engineMatch[1]?.trim().toLowerCase();
+
+    if (!arg || arg === 'current') {
+      const current = getThreadEngine(effectiveThreadKey) || 'claude';
+      const text = `🛠 현재 엔진: \`${current}\`${current === 'claude' ? ' (SDK 기본값)' : ''}\n변경: \`!engine <claude|pty-claude>\``;
+      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      return true;
+    }
+
+    if (arg === 'reset' || arg === 'default') {
+      setThreadEngine(effectiveThreadKey, null);
+      clearSession(sessionKey);
+      const lock = sessionLocks?.get(sessionKey);
+      if (lock) lock.queue = [];
+      await slack.chat.postMessage({
+        channel,
+        text: `🔄 엔진을 기본값(\`claude\` SDK)으로 초기화하고 세션을 비웠습니다.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    if (!VALID_ENGINES.includes(arg)) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ 알 수 없는 엔진: \`${arg}\`\n사용 가능: \`claude\`, \`pty-claude\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    const prev = getThreadEngine(effectiveThreadKey) || 'claude';
+    if (prev === arg) {
+      await slack.chat.postMessage({
+        channel,
+        text: `🛠 엔진은 이미 \`${arg}\` 입니다.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    setThreadEngine(effectiveThreadKey, arg);
+    // 엔진이 바뀌면 세션/큐 초기화 (두 엔진 간 세션 ID 호환 X — 일단 같은 형식이지만 안전을 위해)
+    clearSession(sessionKey);
+    const lock = sessionLocks?.get(sessionKey);
+    if (lock) lock.queue = [];
+    await slack.chat.postMessage({
+      channel,
+      text: `🛠 엔진을 \`${prev}\` → \`${arg}\`로 변경했습니다. 세션이 초기화됩니다.`,
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
   // effort — 이 스레드에서 사용할 thinking effort 수준 지정
   const effortMatch = userMessage.match(/^[!\/]effort(?:\s+(.+))?$/i);
   if (effortMatch) {
@@ -368,7 +433,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   // !stop all — 작업 중단 + 큐 비우기
   if (['!stop', '/stop', '!kill', '/kill', '!stop all', '/stop all'].includes(msg)) {
     const clearQueue = msg.endsWith(' all');
-    const killed = stopClaudeQuery(sessionKey);
+    const killed = stopClaudeQuery(sessionKey) || stopClaudePtyQuery(sessionKey);
     let queueCleared = 0;
     let queueRemaining = 0;
     if (sessionLocks) {

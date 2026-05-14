@@ -141,6 +141,21 @@ export function getThreadEffort(threadKey) {
   return readJson(THREADS_FILE)[threadKey]?.effort || null;
 }
 
+export function setThreadEngine(threadKey, engine) {
+  const threads = readJson(THREADS_FILE);
+  if (!threads[threadKey]) threads[threadKey] = {};
+  if (engine) {
+    threads[threadKey].engine = engine;
+  } else {
+    delete threads[threadKey].engine;
+  }
+  writeJson(THREADS_FILE, threads);
+}
+
+export function getThreadEngine(threadKey) {
+  return readJson(THREADS_FILE)[threadKey]?.engine || null;
+}
+
 export function archiveThread(threadKey, splitTo) {
   const threads = readJson(THREADS_FILE);
   if (threads[threadKey]) {
