@@ -74,8 +74,21 @@ npm run dev    # 개발 (--watch)
 | `CLAUDE_MODEL` | Claude 모델 (기본: sonnet) |
 | `CLAUDE_ALLOWED_DIRS` | Claude CLI 허용 디렉토리 (콤마 구분) |
 | `CLAUDE_SKIP_PERMISSIONS` | 권한 프롬프트 스킵 여부 |
+| `CLAUDE_BIN` | `pty-claude` 엔진용 claude CLI 절대경로 (기본: `/Users/muzi/.local/bin/claude`) |
+| `CLAUDE_PTY_HOME` | `pty-claude` 엔진의 자식 프로세스에 다른 `HOME` 을 주고 싶을 때 (선택). 본 머신 인증과 분리하고 별도 계정으로 운영할 때 사용 |
 | `OPENAI_API_KEY` | STT용 OpenAI API 키 (선택) |
 | `PORT` | 서버 포트 (기본: 3005). Socket 모드에서도 디버그 엔드포인트로 사용 |
+
+## AI 엔진
+
+스레드 단위로 백엔드를 선택할 수 있다.
+
+| 엔진 | 구현 | 한도 풀 | 특징 |
+|---|---|---|---|
+| `claude` (기본) | Agent SDK `query()` API | **Agent SDK 풀** (6/15부터 Max 20x 월 $200 한도) | AskUserQuestion, rate-limit 헤더 지원 |
+| `pty-claude` | Claude Code TUI 를 `node-pty` 로 spawn → `~/.claude/sessions/<pid>.json` + jsonl tail | **인터랙티브 구독 풀** (별도 한도) | AskUserQuestion / rate-limit 헤더 미지원 (TUI 한계). 자동화/무거운 작업을 SDK 한도와 분리해 돌릴 때 사용 |
+
+전환: `!engine <claude\|pty-claude>` (세션 초기화됨). `!engine reset` 으로 기본값 복귀.
 
 ## 주요 명령어
 
@@ -92,3 +105,4 @@ npm run dev    # 개발 (--watch)
 | `!queue` | 대기열 확인 |
 | `!sync-all` | 최근 24h 내 변경된 모든 세션 일괄 동기화 |
 | `!sync-all <duration>` | 지정 기간 내 변경 세션 일괄 동기화 (예: `6h`, `30m`) |
+| `!engine` / `!engine <claude\|pty-claude>` | 스레드 AI 엔진 확인/변경 |

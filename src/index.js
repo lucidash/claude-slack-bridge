@@ -29,9 +29,10 @@ import {
   getWatches,
   setThreadSilent, isThreadSilent,
   saveProcessing, clearProcessing, getStaleProcessing,
-  getSessionPrUrl, getThreadModel, getThreadEffort,
+  getSessionPrUrl, getThreadModel, getThreadEffort, getThreadEngine,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
+import { runClaudeViaPty } from './claude-pty.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
@@ -542,7 +543,21 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
 
     const threadModel = getThreadModel(effectiveThreadKey);
     const threadEffort = getThreadEffort(effectiveThreadKey);
-    const { result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, { onProgress, onAskUser, onSessionReady, model: threadModel || undefined, effort: threadEffort || undefined });
+    const engine = getThreadEngine(effectiveThreadKey) || 'claude';
+
+    let result, usage, rateLimit;
+    if (engine === 'pty-claude') {
+      // pty 엔진은 AskUserQuestion / rate-limit 헤더 미지원 (Claude Code TUI 한계)
+      ({ result, usage, rateLimit } = await runClaudeViaPty(sessionKey, fullPrompt, workdir, {
+        onProgress, onSessionReady,
+        model: threadModel || undefined, effort: threadEffort || undefined,
+      }));
+    } else {
+      ({ result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, {
+        onProgress, onAskUser, onSessionReady,
+        model: threadModel || undefined, effort: threadEffort || undefined,
+      }));
+    }
     clearTimeout(updateTimer);
     if (rateLimit) lastRateLimit = rateLimit;
 
