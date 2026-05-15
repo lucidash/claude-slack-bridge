@@ -90,6 +90,12 @@ npm run dev    # 개발 (--watch)
 
 전환: `!engine <claude\|pty-claude>` (세션 초기화됨). `!engine reset` 으로 기본값 복귀.
 
+cron / watch 도 작업 단위로 엔진 지정 가능:
+- `!cron add "<schedule>" <msg> --engine pty-claude -- <설명>` — 해당 cron 실행 시 스레드에 자동 적용
+- `!watch-set <channel_id> engine pty-claude` — watch 가 만든 스레드에 자동 적용 (reset 으로 해제)
+
+지정 안 하면 기본값 `claude` (SDK). 자동화는 SDK 한도와 분리해 운영하고 싶을 때 `pty-claude` 추천.
+
 ## 주요 명령어
 
 | 명령어 | 설명 |

@@ -21,7 +21,7 @@ import { existsSync, readFileSync, statSync, openSync, readSync, closeSync, read
 import { join } from 'path';
 import { homedir } from 'os';
 import xtermPkg from '@xterm/headless';
-import { getSession, saveSession, clearSession } from './store.js';
+import { getSession, saveSession, clearSession, getActiveToken } from './store.js';
 
 function findJsonlForSid(sid) {
   try {
@@ -136,6 +136,10 @@ export async function runClaudeViaPty(sessionKey, prompt, workdir, callbacks = {
   if (effortOverride) args.push('--effort', effortOverride);
 
   const env = { ...process.env, TERM: 'xterm-256color' };
+  // !account 로 선택된 OAuth 토큰을 SDK 분기와 동일하게 pty 분기에도 주입.
+  // claude TUI binary 가 이 env 를 인식하면 ~/.claude/ 의 기본 credentials 대신 이걸 사용함.
+  const activeToken = getActiveToken();
+  if (activeToken) env.CLAUDE_CODE_OAUTH_TOKEN = activeToken;
   // bridge 의 인증과 분리하고 싶을 때 사용자가 CLAUDE_PTY_HOME 으로 별도 home 지정 가능
   if (process.env.CLAUDE_PTY_HOME) env.HOME = process.env.CLAUDE_PTY_HOME;
 
