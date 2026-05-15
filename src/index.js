@@ -29,7 +29,7 @@ import {
   getWatches,
   setThreadSilent, isThreadSilent,
   saveProcessing, clearProcessing, getStaleProcessing,
-  getSessionPrUrl, getThreadModel, getThreadEffort, getThreadEngine,
+  getSessionPrUrl, getThreadModel, getThreadEffort, getThreadEngine, setThreadEngine,
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { runClaudeViaPty } from './claude-pty.js';
@@ -806,6 +806,8 @@ ${watch.action}
   // 필요 시 @멘션으로 명시적 호출 가능
   const watchThreadKey = `${channel}-${messageTs}`;
   setThreadSilent(watchThreadKey, true);
+  // watch 에 engine 이 지정되어 있으면 이 스레드에 적용 (executeClaudeRequest 가 읽음)
+  if (watch.engine) setThreadEngine(watchThreadKey, watch.engine);
 
   // processMessage를 통해 Claude 실행 (silent 모드 — 결과 텍스트만 게시)
   const userId = watch.addedBy;
