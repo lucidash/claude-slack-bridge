@@ -24,6 +24,7 @@ ${messageText || '(빈 메시지)'}
         model: 'haiku',
         maxTurns: 1,
         systemPrompt: '당신은 Slack 채널 메시지 분류기입니다. 도구를 사용하지 말고 JSON으로만 응답하세요.',
+        cwd: process.env.CLAUDE_WATCH_TRIAGE_CWD || '/Users/muzi/projects/likey-cs',
         env: cleanEnv,
       },
     });
