@@ -1,51 +1,111 @@
 import { spawn } from 'child_process';
 import readline from 'readline';
-import { getSession, saveSession, clearSession } from './store.js';
-import { randomUUID } from 'crypto';
+import { homedir } from 'os';
+import { isAbsolute, resolve } from 'path';
+import { clearSession, getSession, saveSession } from './store.js';
 
-// 실행 중인 Codex 프로세스 추적 (세션별)
+const REQUEST_TIMEOUT_MS = Number(process.env.CODEX_REQUEST_TIMEOUT_MS) || 30_000;
+const CLIENT_INFO = { name: 'claude-slack-bridge', title: 'Claude Slack Bridge', version: '1.0.0' };
+const VALID_SANDBOXES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+const VALID_APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
+
 const runningQueries = new Map();
-
-/**
- * 실행 중인 Codex query를 중단
- */
-export function stopCodexQuery(sessionKey) {
-  const entry = runningQueries.get(sessionKey);
-  if (entry) {
-    entry.abort();
-    return true;
-  }
-  return false;
-}
+let sharedServer = null;
+let sharedStarting = null;
 
 const ITEM_EMOJI = {
-  command_execution: '💻',
-  file_change: '✏️',
-  web_search: '🔎',
-  mcp_tool_call: '⚙️',
+  commandExecution: '💻',
+  fileChange: '✏️',
+  webSearch: '🔎',
+  mcpToolCall: '⚙️',
+  dynamicToolCall: '⚙️',
+  collabAgentToolCall: '🤝',
+  subAgentActivity: '🤖',
   reasoning: '🧠',
-  todo_list: '📋',
-  error: '❌',
-  agent_message: '💬',
+  plan: '📋',
+  imageView: '🖼️',
+  imageGeneration: '🎨',
+  contextCompaction: '🗜️',
 };
 
-function truncate(s, len = 50) {
-  return s && s.length > len ? s.substring(0, len) + '…' : s;
+function getCodexPath() {
+  return process.env.CODEX_PATH || 'codex';
+}
+
+function truncate(value, len = 70) {
+  const text = value == null ? '' : String(value);
+  return text.length > len ? `${text.substring(0, len)}…` : text;
+}
+
+function expandPath(value) {
+  const expanded = value.replace(/^~(?=\/|$)/, homedir());
+  return isAbsolute(expanded) ? expanded : resolve(expanded);
+}
+
+function runtimeRoots(workdir) {
+  const configured = (process.env.CODEX_ALLOWED_DIRS || process.env.CLAUDE_ALLOWED_DIRS || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+    .map(expandPath);
+  const roots = workdir ? [expandPath(workdir), ...configured] : configured;
+  return [...new Set(roots)];
+}
+
+function codexSettings(workdir, modelOverride, effortOverride) {
+  const requestedSandbox = (process.env.CODEX_SANDBOX || 'danger-full-access').toLowerCase();
+  const sandbox = VALID_SANDBOXES.has(requestedSandbox) ? requestedSandbox : 'danger-full-access';
+  const requestedApproval = (process.env.CODEX_APPROVAL_POLICY || 'never').toLowerCase();
+  const approvalPolicy = VALID_APPROVAL_POLICIES.has(requestedApproval) ? requestedApproval : 'never';
+  const cwd = workdir ? expandPath(workdir) : process.cwd();
+  const roots = runtimeRoots(cwd);
+  const model = modelOverride || process.env.CODEX_MODEL || null;
+  const requestedEffort = effortOverride || process.env.CODEX_EFFORT || null;
+  const effort = requestedEffort === 'max' ? 'xhigh' : requestedEffort;
+
+  let sandboxPolicy;
+  if (sandbox === 'read-only') {
+    sandboxPolicy = { type: 'readOnly', networkAccess: process.env.CODEX_NETWORK_ACCESS !== 'false' };
+  } else if (sandbox === 'workspace-write') {
+    sandboxPolicy = {
+      type: 'workspaceWrite',
+      writableRoots: roots.length > 0 ? roots : [cwd],
+      networkAccess: process.env.CODEX_NETWORK_ACCESS !== 'false',
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+  } else {
+    sandboxPolicy = { type: 'dangerFullAccess' };
+  }
+
+  return { cwd, roots, model, effort, sandbox, sandboxPolicy, approvalPolicy };
 }
 
 function extractItemDetail(item) {
   try {
-    switch (item.type) {
-      case 'command_execution':
-        return truncate(item.command, 60);
-      case 'file_change':
-        return item.changes?.map(c => `${c.kind} ${c.path.replace(/^.*\//, '')}`).join(', ');
-      case 'web_search':
-        return truncate(item.query, 50);
-      case 'mcp_tool_call':
-        return truncate(`${item.server}/${item.tool}`, 50);
+    switch (item?.type) {
+      case 'commandExecution':
+        return truncate(item.command, 80);
+      case 'fileChange':
+        return (item.changes || [])
+          .map(change => `${change.kind || '수정'} ${(change.path || '').replace(/^.*\//, '')}`)
+          .join(', ');
+      case 'webSearch':
+        return truncate(item.query, 60);
+      case 'mcpToolCall':
+        return truncate(`${item.server || 'mcp'}/${item.tool || 'tool'}`, 60);
+      case 'dynamicToolCall':
+        return truncate(`${item.namespace ? `${item.namespace}/` : ''}${item.tool || 'tool'}`, 60);
+      case 'collabAgentToolCall':
+        return truncate(item.tool || item.prompt, 60);
+      case 'subAgentActivity':
+        return truncate(`${item.kind || 'activity'} ${item.agentPath || item.agentThreadId || ''}`, 60);
       case 'reasoning':
-        return truncate(item.text, 40);
+        return '추론 중';
+      case 'plan':
+        return '계획 작성 중';
+      case 'imageView':
+        return truncate(item.path, 60);
       default:
         return null;
     }
@@ -54,214 +114,576 @@ function extractItemDetail(item) {
   }
 }
 
-/**
- * Codex CLI 바이너리 경로 결정
- */
-function getCodexPath() {
-  return process.env.CODEX_PATH || 'codex';
+function activityMarker(item) {
+  const emoji = ITEM_EMOJI[item?.type] || '⚙️';
+  const detail = extractItemDetail(item);
+  return detail ? `${emoji} ${item.type}: ${detail}` : `${emoji} ${item?.type || '작업'}`;
+}
+
+function updateActivity(context, item) {
+  if (!item?.id || item.type === 'agentMessage' || item.type === 'userMessage') return;
+  const marker = activityMarker(item);
+  if (!context.activityIndexes.has(item.id)) {
+    context.activityIndexes.set(item.id, context.activities.length);
+    context.activities.push(marker);
+  } else {
+    context.activities[context.activityIndexes.get(item.id)] = marker;
+  }
+  context.onProgress?.(context.activities, context.lastUsage, context.lastRateLimit);
+}
+
+function normalizeUsage(tokenUsage) {
+  const total = tokenUsage?.total;
+  if (!total) return null;
+  return {
+    inputTokens: total.inputTokens || 0,
+    outputTokens: total.outputTokens || 0,
+    cachedInputTokens: total.cachedInputTokens || 0,
+    reasoningOutputTokens: total.reasoningOutputTokens || 0,
+    contextWindow: tokenUsage.modelContextWindow || 0,
+  };
+}
+
+function normalizeRateLimit(snapshot) {
+  const window = snapshot?.primary;
+  if (!window || window.usedPercent == null) return null;
+  return {
+    pct: Math.round(window.usedPercent),
+    resetsAt: window.resetsAt || null,
+    type: snapshot.limitName || snapshot.limitId || null,
+  };
+}
+
+function resultText(context) {
+  return [...context.messages.values()]
+    .map(message => message.text)
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function setAgentDelta(context, params) {
+  if (!params.itemId || !params.delta) return;
+  const current = context.messages.get(params.itemId) || { text: '', streamed: true };
+  current.text += params.delta;
+  current.streamed = true;
+  context.messages.set(params.itemId, current);
+}
+
+function setCompletedAgentMessage(context, item) {
+  if (!item?.id || !item.text) return;
+  const current = context.messages.get(item.id);
+  if (!current || !current.streamed) {
+    context.messages.set(item.id, { text: item.text, streamed: false });
+  } else if (item.text !== current.text && item.text.startsWith(current.text)) {
+    current.text = item.text;
+  }
+}
+
+function contextForMessage(server, params) {
+  const threadId = params?.threadId || params?.conversationId;
+  return threadId ? server.contextsByThread.get(threadId) : null;
+}
+
+function sendServerResponse(server, id, payload) {
+  server.write({ jsonrpc: '2.0', id, ...payload });
+}
+
+function approvalResponse(method, approve) {
+  if (method === 'execCommandApproval' || method === 'applyPatchApproval') {
+    return { result: { decision: approve ? 'approved' : 'denied' } };
+  }
+  if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+    return { result: { decision: approve ? 'accept' : 'decline' } };
+  }
+  return null;
+}
+
+function normalizeQuestions(questions) {
+  return (questions || []).map(question => ({
+    question: question.question,
+    header: question.header,
+    options: question.options || [],
+    multiSelect: false,
+    isSecret: Boolean(question.isSecret),
+    provider: 'Codex',
+    codexId: question.id,
+  }));
+}
+
+async function handleUserInputRequest(server, msg, context) {
+  const original = msg.params?.questions || [];
+  if (!context?.onAskUser) {
+    const answers = Object.fromEntries(original.map(question => [question.id, { answers: [] }]));
+    sendServerResponse(server, msg.id, { result: { answers } });
+    return;
+  }
+
+  try {
+    const questions = normalizeQuestions(original);
+    const answerMap = await context.onAskUser(
+      questions,
+      context.abortController.signal,
+      resultText(context),
+    );
+    // 질문 전에 Slack으로 내보낸 텍스트가 최종 응답에 중복되지 않도록 비운다.
+    context.messages.clear();
+    const answers = {};
+    for (const question of questions) {
+      const answer = answerMap?.[question.question];
+      answers[question.codexId] = {
+        answers: answer == null || answer === ''
+          ? []
+          : String(answer).split(/[,，]/).map(value => value.trim()).filter(Boolean),
+      };
+    }
+    sendServerResponse(server, msg.id, { result: { answers } });
+  } catch (error) {
+    sendServerResponse(server, msg.id, {
+      error: { code: -32000, message: error?.message || '사용자 응답을 받지 못했습니다.' },
+    });
+  }
+}
+
+function handleServerRequest(server, msg) {
+  const context = contextForMessage(server, msg.params);
+  if (msg.method === 'item/tool/requestUserInput') {
+    handleUserInputRequest(server, msg, context);
+    return;
+  }
+
+  const approve = context?.approvalPolicy === 'never';
+  const approval = approvalResponse(msg.method, approve);
+  if (approval) {
+    sendServerResponse(server, msg.id, approval);
+    if (!approve && context) {
+      context.activities.push(`🚫 승인 거절: ${truncate(msg.params?.command || msg.method, 100)}`);
+      context.onProgress?.(context.activities, context.lastUsage, context.lastRateLimit);
+    }
+    return;
+  }
+
+  sendServerResponse(server, msg.id, {
+    error: { code: -32601, message: `${msg.method} 요청은 Slack 브리지에서 지원하지 않습니다.` },
+  });
+}
+
+function finishContext(context, turn) {
+  if (context.settled) return;
+  const status = turn?.status || 'completed';
+  if (status === 'failed') {
+    context.reject(new Error(turn?.error?.message || 'Codex turn 실패'));
+  } else if (status === 'interrupted' || context.aborted) {
+    context.reject(new Error('중단됨 (사용자 요청)'));
+  } else {
+    context.resolve();
+  }
+}
+
+function handleNotification(server, msg) {
+  const params = msg.params || {};
+
+  if (msg.method === 'account/rateLimits/updated') {
+    server.lastRateLimit = normalizeRateLimit(params.rateLimits);
+    for (const context of server.contextsByThread.values()) {
+      context.lastRateLimit = server.lastRateLimit;
+      context.onProgress?.(context.activities, context.lastUsage, context.lastRateLimit);
+    }
+    return;
+  }
+
+  const context = contextForMessage(server, params);
+  if (!context) return;
+
+  switch (msg.method) {
+    case 'turn/started':
+      context.turnId = params.turn?.id || context.turnId;
+      break;
+    case 'item/agentMessage/delta':
+      setAgentDelta(context, params);
+      break;
+    case 'item/started':
+      updateActivity(context, params.item);
+      break;
+    case 'item/completed':
+      if (params.item?.type === 'agentMessage') setCompletedAgentMessage(context, params.item);
+      else updateActivity(context, params.item);
+      break;
+    case 'item/reasoning/delta':
+    case 'item/reasoningSummary/delta':
+    case 'item/reasoning/textDelta':
+    case 'item/reasoning/summaryTextDelta':
+      updateActivity(context, { id: '__reasoning__', type: 'reasoning' });
+      break;
+    case 'item/plan/delta':
+      updateActivity(context, { id: '__plan__', type: 'plan' });
+      break;
+    case 'thread/tokenUsage/updated':
+      context.lastUsage = normalizeUsage(params.tokenUsage);
+      context.onProgress?.(context.activities, context.lastUsage, context.lastRateLimit);
+      break;
+    case 'error':
+      if (!params.willRetry) context.reject(new Error(params.error?.message || 'Codex 오류'));
+      break;
+    case 'turn/failed':
+      context.reject(new Error(params.error?.message || params.turn?.error?.message || 'Codex turn 실패'));
+      break;
+    case 'turn/completed':
+      finishContext(context, params.turn);
+      break;
+  }
+}
+
+function createDeferredContext(callbacks, approvalPolicy) {
+  let resolvePromise;
+  let rejectPromise;
+  const completion = new Promise((resolveCompletion, rejectCompletion) => {
+    resolvePromise = resolveCompletion;
+    rejectPromise = rejectCompletion;
+  });
+  completion.catch(() => {});
+
+  const context = {
+    ...callbacks,
+    approvalPolicy,
+    activities: [],
+    activityIndexes: new Map(),
+    messages: new Map(),
+    lastUsage: null,
+    lastRateLimit: null,
+    abortController: new AbortController(),
+    threadId: null,
+    turnId: null,
+    aborted: false,
+    settled: false,
+    completion,
+    resolve() {
+      if (context.settled) return;
+      context.settled = true;
+      resolvePromise();
+    },
+    reject(error) {
+      if (context.settled) return;
+      context.settled = true;
+      rejectPromise(error);
+    },
+  };
+  return context;
+}
+
+async function startAppServer() {
+  const child = spawn(getCodexPath(), ['app-server'], {
+    env: { ...process.env },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const pending = new Map();
+  const contextsByThread = new Map();
+  let nextId = 1;
+  let stderr = '';
+  let exited = false;
+  let spawnError = null;
+
+  const server = {
+    child,
+    pending,
+    contextsByThread,
+    lastRateLimit: null,
+    write(message) {
+      if (exited || !child.stdin?.writable) throw new Error('Codex app-server가 종료되었습니다.');
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    },
+    request(method, params = {}) {
+      return new Promise((resolveRequest, rejectRequest) => {
+        const id = nextId++;
+        const timeoutId = setTimeout(() => {
+          pending.delete(id);
+          rejectRequest(new Error(`Codex ${method} 요청 시간 초과`));
+        }, REQUEST_TIMEOUT_MS);
+        pending.set(id, {
+          resolve(value) {
+            clearTimeout(timeoutId);
+            resolveRequest(value);
+          },
+          reject(error) {
+            clearTimeout(timeoutId);
+            rejectRequest(error);
+          },
+        });
+        try {
+          server.write({ jsonrpc: '2.0', id, method, params });
+        } catch (error) {
+          pending.delete(id);
+          clearTimeout(timeoutId);
+          rejectRequest(error);
+        }
+      });
+    },
+    close() {
+      if (!child.killed) child.kill();
+    },
+  };
+
+  child.stderr?.on('data', chunk => {
+    stderr = `${stderr}${chunk.toString('utf8')}`.slice(-4_000);
+  });
+  child.once('error', error => {
+    spawnError = error;
+  });
+
+  const lineReader = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+  lineReader.on('line', line => {
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (msg.jsonrpc != null && msg.jsonrpc !== '2.0') return;
+
+    if (msg.id != null && pending.has(msg.id)) {
+      const request = pending.get(msg.id);
+      pending.delete(msg.id);
+      if (Object.hasOwn(msg, 'error')) {
+        const error = new Error(msg.error?.message || 'Codex App Server 요청 실패');
+        error.code = msg.error?.code;
+        request.reject(error);
+      } else {
+        request.resolve(msg.result);
+      }
+      return;
+    }
+    if (msg.id != null && msg.method) {
+      handleServerRequest(server, msg);
+      return;
+    }
+    if (msg.method) handleNotification(server, msg);
+  });
+
+  const exitPromise = new Promise(resolveExit => {
+    child.once('close', (code, signal) => {
+      exited = true;
+      lineReader.close();
+      const detail = spawnError?.code === 'ENOENT'
+        ? `Codex CLI를 찾을 수 없습니다 (\`${getCodexPath()}\`).`
+        : `Codex app-server가 종료되었습니다 (${signal ? `signal ${signal}` : `code ${code ?? 1}`}).${stderr ? ` ${truncate(stderr.trim(), 300)}` : ''}`;
+      const error = new Error(detail);
+      for (const request of pending.values()) request.reject(error);
+      pending.clear();
+      for (const context of contextsByThread.values()) context.reject(error);
+      contextsByThread.clear();
+      if (sharedServer === server) sharedServer = null;
+      resolveExit(error);
+    });
+  });
+
+  try {
+    await Promise.race([
+      server.request('initialize', {
+        clientInfo: CLIENT_INFO,
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      }),
+      exitPromise.then(error => Promise.reject(error)),
+    ]);
+    server.write({ jsonrpc: '2.0', method: 'initialized' });
+    return server;
+  } catch (error) {
+    server.close();
+    if (spawnError?.code === 'ENOENT') {
+      throw new Error(`Codex CLI를 찾을 수 없습니다 (\`${getCodexPath()}\`). 설치 후 로그인하거나 \`CODEX_PATH\`를 지정해주세요.`);
+    }
+    throw error;
+  }
+}
+
+async function ensureAppServer() {
+  if (sharedServer && sharedServer.child.exitCode == null && !sharedServer.child.killed) return sharedServer;
+  if (sharedStarting) return sharedStarting;
+  sharedStarting = startAppServer()
+    .then(server => {
+      sharedServer = server;
+      return server;
+    })
+    .finally(() => {
+      sharedStarting = null;
+    });
+  return sharedStarting;
+}
+
+export function stopCodexQuery(sessionKey) {
+  const entry = runningQueries.get(sessionKey);
+  if (!entry) return false;
+  entry.context.aborted = true;
+  entry.context.abortController.abort();
+  if (entry.context.threadId && entry.context.turnId) {
+    entry.server.request('turn/interrupt', {
+      threadId: entry.context.threadId,
+      turnId: entry.context.turnId,
+    }).catch(() => {});
+  }
+  entry.context.reject(new Error('중단됨 (사용자 요청)'));
+  return true;
 }
 
 /**
- * Codex를 실행하고 스트리밍 결과를 반환
- * runClaudeCode()와 동일한 인터페이스
- *
- * @param {string} sessionKey - 스레드 기반 세션 키
- * @param {string} prompt - 사용자 프롬프트
- * @param {string|null} workdir - 작업 디렉토리
- * @param {object} callbacks - 콜백 함수들
- * @returns {Promise<{result: string, usage: object|null, rateLimit: null}>}
+ * Codex App Server에서 한 turn을 실행합니다.
+ * Slack 스레드별 Codex thread ID를 저장하고 이후 요청에서 재개합니다.
  */
-export async function runCodex(sessionKey, prompt, workdir, { onProgress, onSessionReady, model: modelOverride, effort: effortOverride } = {}) {
-  let threadId = getSession(sessionKey);
-  const isResume = !!threadId;
-
-  const model = modelOverride || process.env.CODEX_MODEL || 'o3';
-  const codexPath = getCodexPath();
-
-  // CLI args 구성
-  const args = ['exec', '--experimental-json'];
-
-  // 모델
-  args.push('--model', model);
-
-  // YOLO 모드: 모든 승인 스킵 + 샌드박스 해제
-  args.push('--sandbox', 'danger-full-access');
-  args.push('--config', 'approval_policy="never"');
-
-  // 작업 디렉토리
-  if (workdir) {
-    args.push('--cd', workdir);
-  }
-
-  // reasoning effort
-  if (effortOverride) {
-    const effortMap = { low: 'low', medium: 'medium', high: 'high', max: 'xhigh' };
-    const codexEffort = effortMap[effortOverride] || effortOverride;
-    args.push('--config', `model_reasoning_effort="${codexEffort}"`);
-  }
-
-  // 추가 디렉토리
-  const allowedDirs = process.env.CODEX_ALLOWED_DIRS || process.env.CLAUDE_ALLOWED_DIRS || '';
-  if (allowedDirs) {
-    for (const dir of allowedDirs.split(',').map(d => d.trim()).filter(Boolean)) {
-      args.push('--add-dir', dir);
-    }
-  }
-
-  // git repo 체크 스킵
-  args.push('--skip-git-repo-check');
-
-  // 세션 재개
-  if (isResume) {
-    args.push('resume', threadId);
-    console.log(`[Codex] Resuming thread ${threadId} for ${sessionKey}`);
-  } else {
-    console.log(`[Codex] New thread for ${sessionKey}`);
-  }
-
-  // 프로세스 spawn
-  const abortController = new AbortController();
-  const child = spawn(codexPath, args, {
-    env: { ...process.env },
-    signal: abortController.signal,
-  });
-
-  let spawnError = null;
-  child.once('error', (err) => { spawnError = err; });
-
-  // stdin에 프롬프트 전송
-  child.stdin.write(prompt);
-  child.stdin.end();
-
-  const stderrChunks = [];
-  if (child.stderr) {
-    child.stderr.on('data', (data) => stderrChunks.push(data));
-  }
-
-  // abort 래퍼 저장
-  runningQueries.set(sessionKey, {
-    abort: () => {
-      abortController.abort();
-      try { if (!child.killed) child.kill(); } catch { /* ignore */ }
-    },
-  });
-
-  let finalResult = '';
-  const activities = [];
-  let lastUsage = null;
-
-  const exitPromise = new Promise((resolve) => {
-    child.once('exit', (code, signal) => resolve({ code, signal }));
-  });
-
-  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+export async function runCodex(sessionKey, prompt, workdir, {
+  onProgress,
+  onAskUser,
+  onSessionReady,
+  model: modelOverride,
+  effort: effortOverride,
+} = {}) {
+  const previousThreadId = getSession(sessionKey);
+  const isResume = Boolean(previousThreadId);
+  const settings = codexSettings(workdir, modelOverride, effortOverride);
+  const server = await ensureAppServer();
+  const context = createDeferredContext({ onProgress, onAskUser }, settings.approvalPolicy);
+  context.lastRateLimit = server.lastRateLimit;
+  runningQueries.set(sessionKey, { server, context });
 
   try {
-    for await (const line of rl) {
-      let event;
+    let threadResponse;
+    const threadParams = {
+      cwd: settings.cwd,
+      runtimeWorkspaceRoots: settings.roots.length > 0 ? settings.roots : null,
+      approvalPolicy: settings.approvalPolicy,
+      sandbox: settings.sandbox,
+      model: settings.model,
+    };
+
+    if (isResume) {
+      console.log(`[Codex] Resuming thread ${previousThreadId} for ${sessionKey}`);
       try {
-        event = JSON.parse(line);
-      } catch {
-        continue; // malformed line 스킵
-      }
-
-      // thread.started → 세션(스레드) ID 저장
-      if (event.type === 'thread.started') {
-        threadId = event.thread_id;
-        if (!isResume) {
-          saveSession(sessionKey, threadId);
-          console.log(`[Codex] Thread started: ${threadId}`);
-          if (onSessionReady) onSessionReady(threadId);
-        }
-      }
-
-      // item.started / item.updated → 진행 상태 추적
-      if (event.type === 'item.started' || event.type === 'item.updated') {
-        const item = event.item;
-        if (item && item.type !== 'agent_message') {
-          const emoji = ITEM_EMOJI[item.type] || '⚙️';
-          const detail = extractItemDetail(item);
-          const marker = detail ? `${emoji} ${item.type}: ${detail}` : `${emoji} ${item.type}`;
-          // 중복 방지: 같은 id의 마커가 이미 있으면 업데이트
-          const existingIdx = activities.findIndex(a => a.startsWith(`${emoji} ${item.type}:`) && a === marker);
-          if (existingIdx === -1) {
-            activities.push(marker);
-          }
-          if (onProgress) onProgress(activities, lastUsage, null);
-        }
-      }
-
-      // item.completed → 텍스트 수집 + 도구 마커
-      if (event.type === 'item.completed') {
-        const item = event.item;
-        if (item.type === 'agent_message') {
-          finalResult += (finalResult ? '\n' : '') + item.text;
-        } else {
-          const emoji = ITEM_EMOJI[item.type] || '⚙️';
-          const detail = extractItemDetail(item);
-          const marker = detail ? `${emoji} ${item.type}: ${detail}` : `${emoji} ${item.type}`;
-          finalResult += `\n${marker}\n`;
-        }
-      }
-
-      // turn.completed → usage 정보
-      if (event.type === 'turn.completed') {
-        if (event.usage) {
-          lastUsage = {
-            inputTokens: (event.usage.input_tokens || 0) + (event.usage.cached_input_tokens || 0),
-            outputTokens: event.usage.output_tokens || 0,
-            contextWindow: 0, // Codex는 context window 정보 미제공
-          };
-          console.log(`[Codex] Usage: in=${lastUsage.inputTokens} out=${lastUsage.outputTokens}`);
-        }
-        if (onProgress) onProgress(activities, lastUsage, null);
-      }
-
-      // turn.failed → 에러
-      if (event.type === 'turn.failed') {
-        const errMsg = event.error?.message || 'Turn failed';
-        if (isResume) {
-          clearSession(sessionKey);
-          console.log(`[Codex] Resume failed for thread ${threadId}, cleared. Error: ${errMsg}`);
-          throw new Error(`세션 resume 실패 (${threadId}): ${errMsg}\n새 세션으로 다시 시도해주세요.`);
-        }
-        throw new Error(errMsg);
-      }
-
-      // error event → 치명적 에러
-      if (event.type === 'error') {
-        throw new Error(event.message || 'Codex stream error');
-      }
-    }
-
-    if (spawnError) {
-      if (spawnError.code === 'ENOENT') {
-        throw new Error(`Codex CLI를 찾을 수 없습니다 (\`${codexPath}\`).\n설치: https://github.com/openai/codex\n또는 \`CODEX_PATH\` 환경변수로 바이너리 경로를 지정하세요.`);
-      }
-      throw spawnError;
-    }
-    const { code, signal } = await exitPromise;
-    if (code !== 0 || signal) {
-      const stderr = Buffer.concat(stderrChunks).toString('utf8');
-      const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`;
-      // resume 실패 시 세션 정리
-      if (isResume) {
+        threadResponse = await server.request('thread/resume', {
+          threadId: previousThreadId,
+          ...threadParams,
+          excludeTurns: true,
+        });
+      } catch (error) {
         clearSession(sessionKey);
-        throw new Error(`세션 resume 실패 (${threadId}): Codex exited with ${detail}\n새 세션으로 다시 시도해주세요.`);
+        throw new Error(`Codex 세션 재개 실패 (${previousThreadId}): ${error.message}\n새 세션으로 다시 시도해주세요.`);
       }
-      throw new Error(`Codex exited with ${detail}: ${stderr.substring(0, 200)}`);
+    } else {
+      console.log(`[Codex] New thread for ${sessionKey}`);
+      threadResponse = await server.request('thread/start', threadParams);
     }
-  } catch (err) {
-    if (abortController.signal.aborted) {
+
+    if (context.aborted) throw new Error('중단됨 (사용자 요청)');
+    const threadId = threadResponse?.thread?.id || threadResponse?.threadId || previousThreadId;
+    if (!threadId) throw new Error('Codex thread 응답에 ID가 없습니다.');
+    context.threadId = threadId;
+    server.contextsByThread.set(threadId, context);
+
+    if (!isResume || threadId !== previousThreadId) {
+      saveSession(sessionKey, threadId);
+      onSessionReady?.(threadId);
+    }
+
+    server.request('account/rateLimits/read')
+      .then(response => {
+        const snapshot = response?.rateLimits;
+        context.lastRateLimit = normalizeRateLimit(snapshot);
+        if (context.lastRateLimit) server.lastRateLimit = context.lastRateLimit;
+        context.onProgress?.(context.activities, context.lastUsage, context.lastRateLimit);
+      })
+      .catch(() => {});
+
+    const turnResponse = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: prompt }],
+      cwd: settings.cwd,
+      runtimeWorkspaceRoots: settings.roots.length > 0 ? settings.roots : null,
+      approvalPolicy: settings.approvalPolicy,
+      sandboxPolicy: settings.sandboxPolicy,
+      model: settings.model,
+      effort: settings.effort,
+    });
+    context.turnId = turnResponse?.turn?.id || context.turnId;
+
+    if (context.aborted) {
+      if (context.turnId) {
+        server.request('turn/interrupt', { threadId, turnId: context.turnId }).catch(() => {});
+      }
       throw new Error('중단됨 (사용자 요청)');
     }
-    throw err;
-  } finally {
-    rl.close();
-    child.removeAllListeners();
-    try { if (!child.killed) child.kill(); } catch { /* ignore */ }
-    runningQueries.delete(sessionKey);
-  }
 
-  return { result: finalResult.trim(), usage: lastUsage, rateLimit: null };
+    await context.completion;
+    return {
+      result: resultText(context),
+      usage: context.lastUsage,
+      rateLimit: context.lastRateLimit,
+    };
+  } finally {
+    if (context.threadId && server.contextsByThread.get(context.threadId) === context) {
+      server.contextsByThread.delete(context.threadId);
+    }
+    if (runningQueries.get(sessionKey)?.context === context) runningQueries.delete(sessionKey);
+  }
+}
+
+function toolName(item) {
+  switch (item?.type) {
+    case 'commandExecution': return 'Bash';
+    case 'fileChange': return 'Edit';
+    case 'webSearch': return 'WebSearch';
+    case 'mcpToolCall': return `mcp_${item.server || 'server'}_${item.tool || 'tool'}`;
+    case 'dynamicToolCall': return item.tool || 'DynamicTool';
+    case 'collabAgentToolCall': return 'Agent';
+    default: return null;
+  }
+}
+
+function textFromUserContent(content) {
+  return (content || [])
+    .filter(item => item.type === 'text')
+    .map(item => item.text)
+    .filter(Boolean)
+    .join('\n');
+}
+
+function summarizeThread(thread) {
+  const turns = [];
+  for (const turn of thread?.turns || []) {
+    const userTexts = [];
+    const assistantTexts = [];
+    const tools = [];
+    for (const item of turn.items || []) {
+      if (item.type === 'userMessage') {
+        const text = textFromUserContent(item.content);
+        if (text) userTexts.push(text);
+      } else if (item.type === 'agentMessage' && item.text) {
+        assistantTexts.push(item.text);
+      } else {
+        const name = toolName(item);
+        if (name) tools.push(name);
+      }
+    }
+    if (userTexts.length) turns.push({ role: 'user', text: userTexts.join('\n') });
+    if (assistantTexts.length || tools.length) {
+      turns.push({ role: 'assistant', text: assistantTexts.join('\n'), tools: [...new Set(tools)] });
+    }
+  }
+  return {
+    cwd: thread?.cwd || null,
+    turns,
+    updatedAt: thread?.updatedAt ? thread.updatedAt * 1000 : null,
+  };
+}
+
+/** Codex thread의 저장된 대화를 App Server를 통해 읽습니다. */
+export async function readCodexSessionSummary(threadId) {
+  const server = await ensureAppServer();
+  const response = await server.request('thread/read', { threadId, includeTurns: true });
+  if (!response?.thread) return null;
+  return summarizeThread(response.thread);
+}
+
+/** 테스트 및 정상 종료 시 공유 App Server를 정리합니다. */
+export async function shutdownCodexAppServer() {
+  const server = sharedServer;
+  sharedServer = null;
+  if (!server) return;
+  server.close();
 }

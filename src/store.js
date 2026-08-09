@@ -1,8 +1,10 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, chmodSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { homedir } from 'os';
 
-const BRIDGE_DIR = join(homedir(), '.claude', 'slack-bridge');
+const BRIDGE_DIR = process.env.BRIDGE_DATA_DIR
+  ? resolve(process.env.BRIDGE_DATA_DIR)
+  : join(homedir(), '.claude', 'slack-bridge');
 const SESSIONS_FILE = join(BRIDGE_DIR, 'sessions.json');
 const THREADS_FILE = join(BRIDGE_DIR, 'threads.json');
 const WORKDIRS_FILE = join(BRIDGE_DIR, 'workdirs.json');
@@ -81,7 +83,12 @@ export function saveWorkdir(userId, dir) {
 // 스레드 관리
 export function saveThread(threadKey, userId, workdir = null) {
   const threads = readJson(THREADS_FILE);
-  const data = { userId, createdAt: new Date().toISOString() };
+  const existing = threads[threadKey] || {};
+  const data = {
+    ...existing,
+    userId: userId || existing.userId,
+    createdAt: existing.createdAt || new Date().toISOString(),
+  };
   if (workdir) data.workdir = workdir;
   threads[threadKey] = data;
   writeJson(THREADS_FILE, threads);

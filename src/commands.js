@@ -3,7 +3,7 @@ import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
 import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getAccounts, addAccount, removeAccount, setCurrentAccount, getThreadEngine, setThreadEngine } from './store.js';
 import { stopClaudeQuery } from './claude.js';
-import { stopCodexQuery } from './codex.js';
+import { readCodexSessionSummary, stopCodexQuery } from './codex.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -49,7 +49,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 
 *Effort*
 \`!effort\` — 현재 effort 수준 확인
-\`!effort <low|medium|high|max>\` — 이 스레드의 effort 변경
+\`!effort <level>\` — 이 스레드의 effort 변경 (Codex: \`low|medium|high|max|xhigh|ultra\`)
 \`!effort reset\` — 기본값으로 초기화
 
 *실행 제어*
@@ -113,16 +113,33 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   const sessionMatch = userMessage.match(/^[!\/]session\s+(.+)$/i);
   if (sessionMatch) {
     const newSessionId = sessionMatch[1].trim().replace(/`/g, '');
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    let currentEngine = getThreadEngine(effectiveThreadKey) || 'claude';
+    let detectedDir = currentEngine === 'codex' ? null : findSessionWorkdir(newSessionId);
+    if (currentEngine === 'codex' || !detectedDir) {
+      const codexSummary = await readCodexSessionSummary(newSessionId).catch(() => null);
+      if (codexSummary) {
+        if (currentEngine !== 'codex') {
+          setThreadModel(effectiveThreadKey, null);
+          setThreadEffort(effectiveThreadKey, null);
+        }
+        currentEngine = 'codex';
+        detectedDir = codexSummary.cwd;
+        setThreadEngine(effectiveThreadKey, 'codex');
+      }
+    }
     saveSession(sessionKey, newSessionId);
 
-    // 세션 파일에서 원래 작업 디렉토리 자동 감지 → 스레드에 바인딩
-    const detectedDir = findSessionWorkdir(newSessionId);
+    // 세션 원본에서 작업 디렉토리 자동 감지 → 스레드에 바인딩
     const lines = [`🔗 세션이 전환되었습니다: \`${newSessionId}\``];
     if (detectedDir) {
-      const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
       saveThread(effectiveThreadKey, userId, detectedDir);
       lines.push(`📂 작업 디렉토리 자동 설정: \`${detectedDir}\``);
-      lines.push(`\`\`\`cd ${detectedDir} && claude --resume ${newSessionId}\`\`\``);
+      const resumeCommand = currentEngine === 'codex'
+        ? `cd ${detectedDir} && codex resume ${newSessionId}`
+        : `cd ${detectedDir} && claude --resume ${newSessionId}`;
+      lines.push(`🛠 엔진: \`${currentEngine}\``);
+      lines.push(`\`\`\`${resumeCommand}\`\`\``);
     } else {
       lines.push(`⚠️ 세션 파일을 찾을 수 없습니다. resume 실패 시 \`!wd\`로 디렉토리를 맞춰주세요.`);
     }
@@ -201,10 +218,10 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     if (!arg || arg === 'current') {
       const threadModel = getThreadModel(effectiveThreadKey);
       const defaultModel = currentEngine === 'codex'
-        ? (process.env.CODEX_MODEL || 'o3')
+        ? (process.env.CODEX_MODEL || 'Codex CLI 기본값')
         : (process.env.CLAUDE_MODEL || 'sonnet');
       const hint = currentEngine === 'codex'
-        ? '\n변경: `!model <codex_model>` (예: `o3`, `gpt-5-codex`)'
+        ? '\n변경: `!model <codex_model>`'
         : '\n변경: `!model <sonnet|opus|haiku>`';
       const text = threadModel
         ? `🤖 현재 모델: \`${threadModel}\` (스레드 지정, 엔진: \`${currentEngine}\`)\n기본값: \`${defaultModel}\``
@@ -216,7 +233,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     if (arg === 'reset' || arg === 'default') {
       setThreadModel(effectiveThreadKey, null);
       const defaultModel = currentEngine === 'codex'
-        ? (process.env.CODEX_MODEL || 'o3')
+        ? (process.env.CODEX_MODEL || 'Codex CLI 기본값')
         : (process.env.CLAUDE_MODEL || 'sonnet');
       await slack.chat.postMessage({
         channel,
@@ -262,12 +279,14 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
     if (arg === 'reset' || arg === 'default') {
       setThreadEngine(effectiveThreadKey, null);
+      setThreadModel(effectiveThreadKey, null);
+      setThreadEffort(effectiveThreadKey, null);
       clearSession(sessionKey);
       const lock = sessionLocks?.get(sessionKey);
       if (lock?.queue) lock.queue.length = 0;
       await slack.chat.postMessage({
         channel,
-        text: `🔄 엔진을 기본값(\`claude\` SDK)으로 초기화했습니다.\n세션 및 대기 큐가 초기화되었습니다.`,
+        text: `🔄 엔진을 기본값(\`claude\` SDK)으로 초기화했습니다.\n세션, 모델, effort 및 대기 큐가 초기화되었습니다.`,
         thread_ts: replyThreadTs,
       });
       return true;
@@ -294,15 +313,17 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
     setThreadEngine(effectiveThreadKey, arg);
     // 엔진별 세션 ID가 호환되지 않으므로 세션과 이전 엔진 대상 대기 요청을 함께 비운다.
+    setThreadModel(effectiveThreadKey, null);
+    setThreadEffort(effectiveThreadKey, null);
     clearSession(sessionKey);
     const lock = sessionLocks?.get(sessionKey);
     if (lock?.queue) lock.queue.length = 0;
     const modelHint = arg === 'codex'
-      ? `\n모델 기본값: \`${process.env.CODEX_MODEL || 'o3'}\` (변경: \`!model <model>\`)`
+      ? `\n모델 기본값: \`${process.env.CODEX_MODEL || 'Codex CLI 기본값'}\` (변경: \`!model <model>\`)`
       : '';
     await slack.chat.postMessage({
       channel,
-      text: `🛠 엔진을 \`${prev}\` → \`${arg}\`로 변경했습니다.\n세션 및 대기 큐가 초기화되었습니다.${modelHint}`,
+      text: `🛠 엔진을 \`${prev}\` → \`${arg}\`로 변경했습니다.\n세션, 모델, effort 및 대기 큐가 초기화되었습니다.${modelHint}`,
       thread_ts: replyThreadTs,
     });
     return true;
@@ -312,15 +333,20 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   const effortMatch = userMessage.match(/^[!\/]effort(?:\s+(.+))?$/i);
   if (effortMatch) {
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
-    const VALID_EFFORTS = ['low', 'medium', 'high', 'max'];
+    const currentEngine = getThreadEngine(effectiveThreadKey) || 'claude';
+    const validEfforts = currentEngine === 'codex'
+      ? ['low', 'medium', 'high', 'max', 'xhigh', 'ultra']
+      : ['low', 'medium', 'high', 'max'];
     const arg = effortMatch[1]?.trim().toLowerCase();
 
     if (!arg || arg === 'current') {
       const threadEffort = getThreadEffort(effectiveThreadKey);
-      const defaultEffort = 'max';
+      const defaultEffort = currentEngine === 'codex'
+        ? (process.env.CODEX_EFFORT || 'Codex 모델 기본값')
+        : 'max';
       const text = threadEffort
         ? `⚡ 현재 effort: \`${threadEffort}\` (스레드 지정)\n기본값: \`${defaultEffort}\``
-        : `⚡ 현재 effort: \`${defaultEffort}\` (기본값)\n변경: \`!effort <low|medium|high|max>\``;
+        : `⚡ 현재 effort: \`${defaultEffort}\` (기본값)\n변경: \`!effort <${validEfforts.join('|')}>\``;
       await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
       return true;
     }
@@ -329,16 +355,16 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       setThreadEffort(effectiveThreadKey, null);
       await slack.chat.postMessage({
         channel,
-        text: `🔄 effort를 기본값으로 초기화했습니다: \`max\``,
+        text: `🔄 effort를 기본값으로 초기화했습니다: \`${currentEngine === 'codex' ? (process.env.CODEX_EFFORT || 'Codex 모델 기본값') : 'max'}\``,
         thread_ts: replyThreadTs,
       });
       return true;
     }
 
-    if (!VALID_EFFORTS.includes(arg)) {
+    if (!validEfforts.includes(arg)) {
       await slack.chat.postMessage({
         channel,
-        text: `❌ 알 수 없는 effort: \`${arg}\`\n사용 가능: \`low\`, \`medium\`, \`high\`, \`max\``,
+        text: `❌ 알 수 없는 effort: \`${arg}\`\n사용 가능: ${validEfforts.map(value => `\`${value}\``).join(', ')}`,
         thread_ts: replyThreadTs,
       });
       return true;
@@ -562,6 +588,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const currentSession = getSession(sessionKey);
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
     const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
+    const currentEngine = getThreadEngine(effectiveThreadKey);
+    const currentModel = getThreadModel(effectiveThreadKey);
+    const currentEffort = getThreadEffort(effectiveThreadKey);
 
     if (!currentSession) {
       await slack.chat.postMessage({
@@ -598,6 +627,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
       // Thread B에 세션/스레드 데이터 복사
       saveThread(newThreadKey, userId, workdir);
+      if (currentEngine) setThreadEngine(newThreadKey, currentEngine);
+      if (currentModel) setThreadModel(newThreadKey, currentModel);
+      if (currentEffort) setThreadEffort(newThreadKey, currentEffort);
       saveSession(newSessionKey, currentSession);
 
       // Thread A 세션 해제 + 아카이브
@@ -652,14 +684,17 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       const sessionId = allSessions[sessionKey];
       if (!sessionId) continue;
 
-      const file = findSessionFile(sessionId);
-      if (!file) continue;
-
-      const mtime = statSync(file).mtimeMs;
-      if (mtime < cutoff) continue;
-
       const syncPoint = getSyncPoint(sessionId);
-      const summary = readSessionSummary(sessionId);
+      let summary;
+      if (threadData.engine === 'codex') {
+        summary = await readCodexSessionSummary(sessionId).catch(() => null);
+        if (summary?.updatedAt && summary.updatedAt < cutoff) continue;
+      } else {
+        const file = findSessionFile(sessionId);
+        if (!file) continue;
+        if (statSync(file).mtimeMs < cutoff) continue;
+        summary = readSessionSummary(sessionId);
+      }
       if (!summary) continue;
 
       const newTurnCount = summary.turns.length - syncPoint;
@@ -714,7 +749,20 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   const syncMatch = userMessage.match(/^[!\/]sync\s+`?([a-f0-9-]+)`?$/i);
   if (syncMatch) {
     const sessionId = syncMatch[1];
-    const summary = readSessionSummary(sessionId);
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    let syncEngine = getThreadEngine(effectiveThreadKey) || 'claude';
+    let summary = syncEngine === 'codex' ? null : readSessionSummary(sessionId);
+    if (!summary) {
+      summary = await readCodexSessionSummary(sessionId).catch(() => null);
+      if (summary) {
+        if (syncEngine !== 'codex') {
+          setThreadModel(effectiveThreadKey, null);
+          setThreadEffort(effectiveThreadKey, null);
+        }
+        syncEngine = 'codex';
+        setThreadEngine(effectiveThreadKey, 'codex');
+      }
+    }
     if (!summary) {
       await slack.chat.postMessage({
         channel,
@@ -727,8 +775,8 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     // 세션 설정 + 작업 디렉토리 자동 감지 → 스레드에 바인딩
     saveSession(sessionKey, sessionId);
     const lines = [`🔗 세션 동기화: \`${sessionId}\``];
+    lines.push(`🛠 엔진: \`${syncEngine}\``);
     if (summary.cwd) {
-      const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
       saveThread(effectiveThreadKey, userId, summary.cwd);
       lines.push(`📂 작업 디렉토리: \`${summary.cwd}\``);
     }

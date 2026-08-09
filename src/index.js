@@ -33,7 +33,7 @@ import {
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { runClaudeViaPty } from './claude-pty.js';
-import { runCodex } from './codex.js';
+import { readCodexSessionSummary, runCodex } from './codex.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
@@ -540,7 +540,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       const target = silent ? logChannel : channel;
       const targetTs = silent ? logThreadTs : replyThreadTs;
       const resumeCmd = isCodex
-        ? `codex --resume ${sid}`
+        ? `cd ${workdir || '~'} && codex resume ${sid}`
         : `cd ${workdir || '~'} && claude --resume ${sid}`;
       const engineLabel = isCodex ? '🟢 Codex' : '🔗';
       slack.chat.postMessage({
@@ -556,7 +556,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     let result, usage, rateLimit;
     if (isCodex) {
       ({ result, usage, rateLimit } = await runCodex(sessionKey, fullPrompt, workdir, {
-        onProgress, onSessionReady,
+        onProgress, onAskUser, onSessionReady,
         model: threadModel || undefined, effort: threadEffort || undefined,
       }));
     } else if (engine === 'pty-claude') {
@@ -619,13 +619,15 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     try {
       const sid = getSession(sessionKey);
       if (sid) {
-        const summary = readSessionSummary(sid);
+        const summary = isCodex
+          ? await readCodexSessionSummary(sid).catch(() => null)
+          : readSessionSummary(sid);
         if (summary) saveSyncPoint(sid, summary.turns.length);
       }
     } catch { /* ignore */ }
 
   } catch (err) {
-    console.error('[Claude] Error:', err.message);
+    console.error('[Engine] Error:', err.message);
     clearTimeout(updateTimer);
 
     // 대기 중인 AskUserQuestion 정리
@@ -668,8 +670,10 @@ function formatAskUserQuestion(questions) {
   const parts = [];
   for (const q of questions) {
     const multiLabel = q.multiSelect ? ' (복수 선택 가능)' : '';
-    parts.push(`🔔 Claude가 질문합니다${multiLabel}:\n\n*${q.question}*`);
-    q.options.forEach((opt, i) => {
+    const provider = q.provider || 'Claude';
+    const secretLabel = q.isSecret ? '\n🔒 민감한 응답일 수 있으니 Slack 채널 공개 범위를 확인해주세요.' : '';
+    parts.push(`🔔 ${provider}가 질문합니다${multiLabel}:\n\n*${q.question}*${secretLabel}`);
+    (q.options || []).forEach((opt, i) => {
       const emoji = NUMBER_EMOJI[i] || `${i + 1}.`;
       parts.push(`${emoji} ${opt.label} — ${opt.description}`);
       // markdown 프리뷰 (코멘트 내용 등)를 표시
@@ -677,7 +681,9 @@ function formatAskUserQuestion(questions) {
         parts.push(`\`\`\`\n${opt.markdown}\n\`\`\``);
       }
     });
-    if (q.multiSelect) {
+    if (!q.options?.length) {
+      parts.push('\n답변을 자유롭게 입력해주세요.');
+    } else if (q.multiSelect) {
       parts.push('\n콤마로 구분하여 답해주세요 (예: 1,3)');
     } else {
       parts.push('\n숫자 또는 옵션명으로 답해주세요.');
@@ -698,19 +704,19 @@ function parseUserAnswer(userMessage, questions) {
       const selections = answer.split(/[,，]/).map(s => s.trim());
       const labels = selections.map(s => {
         const num = parseInt(s);
-        if (!isNaN(num) && num >= 1 && num <= q.options.length) {
+        if (!isNaN(num) && num >= 1 && num <= (q.options || []).length) {
           return q.options[num - 1].label;
         }
-        const match = q.options.find(o => o.label.toLowerCase() === s.toLowerCase());
+        const match = (q.options || []).find(o => o.label.toLowerCase() === s.toLowerCase());
         return match ? match.label : s;
       });
       answers[q.question] = labels.join(', ');
     } else {
       const num = parseInt(answer);
-      if (!isNaN(num) && num >= 1 && num <= q.options.length) {
+      if (!isNaN(num) && num >= 1 && num <= (q.options || []).length) {
         answers[q.question] = q.options[num - 1].label;
       } else {
-        const match = q.options.find(o => o.label.toLowerCase() === answer.toLowerCase());
+        const match = (q.options || []).find(o => o.label.toLowerCase() === answer.toLowerCase());
         answers[q.question] = match ? match.label : answer;
       }
     }

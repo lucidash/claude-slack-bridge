@@ -1,8 +1,8 @@
-# Claude Slack Bridge
+# Claude & Codex Slack Bridge
 
-A bridge service that lets you remotely control Claude Code sessions through Slack threads.
+Slack 스레드에서 Claude Code와 Codex CLI 세션을 원격으로 실행하는 브리지 서비스입니다.
 
-Send a DM or mention the bot, and Claude Code runs on your local machine with results streamed back to the Slack thread. Built on the [Anthropic Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk).
+DM이나 봇 멘션을 보내면 로컬 머신의 선택된 엔진이 작업을 실행하고 결과와 진행 상황을 Slack 스레드로 전달합니다. Claude 엔진은 [Anthropic Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk), Codex 엔진은 최신 `codex app-server` JSON-RPC 프로토콜을 사용합니다.
 
 ## Features
 
@@ -18,6 +18,8 @@ Send a DM or mention the bot, and Claude Code runs on your local machine with re
 - **Channel Watch** — Triage messages in any channel with Haiku and auto-respond to matching ones (`!watch`)
 - **Account Switching** — Register multiple Claude OAuth tokens and hot-swap between them (`!account switch`)
 - **Question Relay** — Claude's `AskUserQuestion` presented as numbered choices in Slack, with answers forwarded back
+- **Codex App Server** — Codex thread 생성/재개, 실시간 tool 활동, 토큰·rate limit, 사용자 질문, turn 중단을 Slack 기능과 연결
+- **Per-thread Engine** — `claude`, `pty-claude`, `codex` 중 스레드별 선택; cron과 channel watch에도 엔진 지정 가능
 - **Voice Input** — Auto STT transcription on audio/video file upload (OpenAI with Google fallback)
 - **Security** — Slack request signature verification + user whitelist
 
@@ -25,6 +27,7 @@ Send a DM or mention the bot, and Claude Code runs on your local machine with re
 
 - Node.js >= 18
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- Codex 엔진 사용 시 [Codex CLI](https://developers.openai.com/codex/cli/) 설치 및 로그인
 - Slack Bot Token (Bot User OAuth Token)
 - For HTTP mode only: tunneling for external access (ngrok, Cloudflare Tunnel, etc.)
 
@@ -51,6 +54,15 @@ cp .env.example .env
 | `CLAUDE_MODEL` | — | `sonnet` | Default Claude model (`opus`, `sonnet`, `haiku`) |
 | `CLAUDE_ALLOWED_DIRS` | — | — | Directories Claude Code can access (comma-separated) |
 | `CLAUDE_SKIP_PERMISSIONS` | — | `false` | Skip permission prompts when `true` |
+| `CODEX_PATH` | — | `codex` | Codex CLI 실행 파일 경로 |
+| `CODEX_MODEL` | — | CLI 기본값 | 기본 Codex 모델 ID |
+| `CODEX_EFFORT` | — | 모델 기본값 | 기본 reasoning effort |
+| `CODEX_ALLOWED_DIRS` | — | `CLAUDE_ALLOWED_DIRS` | Codex runtime workspace root 목록(쉼표 구분) |
+| `CODEX_SANDBOX` | — | `danger-full-access` | `read-only`, `workspace-write`, `danger-full-access` |
+| `CODEX_APPROVAL_POLICY` | — | `never` | `untrusted`, `on-request`, `never` |
+| `CODEX_NETWORK_ACCESS` | — | `true` | read/workspace sandbox의 네트워크 접근 여부 |
+| `CODEX_REQUEST_TIMEOUT_MS` | — | `30000` | App Server JSON-RPC 요청 제한 시간(ms) |
+| `BRIDGE_DATA_DIR` | — | `~/.claude/slack-bridge` | 브리지 상태 파일 저장 경로 |
 | `OPENAI_API_KEY` | — | — | OpenAI API key for STT (falls back to Google if unset) |
 
 ## Usage
@@ -101,6 +113,16 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!sync-all [<duration>]` | Sync all sessions changed within window (default 24h, e.g. `6h`, `30m`) |
 | `!split` | Archive current thread and continue in a fresh thread (long-context relief) |
 
+`!session`, `!sync`, `!sync-all`, `!split`은 Claude와 Codex 세션을 모두 지원합니다. `!session <id>`와 `!sync <id>`는 저장된 세션 형식을 확인해 Codex 엔진과 작업 디렉토리를 자동 복원합니다.
+
+### Engine
+
+| Command | Description |
+|---------|-------------|
+| `!engine` | 현재 스레드 엔진 확인 |
+| `!engine <claude\|pty-claude\|codex>` | 엔진 변경(호환되지 않는 세션·모델·effort 초기화) |
+| `!engine reset` | 기본 Claude SDK 엔진으로 복원 |
+
 ### Working Directory / Model / Effort
 
 | Command | Description |
@@ -108,7 +130,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!wd <path>` | Set thread working directory (resets session) |
 | `!pwd` | Show current working directory |
 | `!model [<opus\|sonnet\|haiku>]` | Show or override Claude model for this thread (`!model reset` to clear) |
-| `!effort [<low\|medium\|high\|max>]` | Show or override reasoning effort for this thread (`!effort reset` to clear) |
+| `!effort [<level>]` | reasoning effort 변경. Codex는 `xhigh`, `ultra`도 지원 (`!effort reset`으로 해제) |
 
 ### Execution Control
 
@@ -160,6 +182,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 src/
 ├── index.js       # Express server + Socket Mode client, event handler, orchestration
 ├── claude.js      # Agent SDK query() wrapper, stream parsing, tool callbacks
+├── codex.js       # Codex App Server JSON-RPC client, stream/question/session handling
 ├── commands.js    # Command handlers (!new, !session, !wd, !cron, !watch, etc.)
 ├── cron.js        # Cron job management and scheduled execution
 ├── watch.js       # Channel watch — Haiku triage and auto-response
@@ -197,6 +220,14 @@ Session and state data are stored as JSON files in `~/.claude/slack-bridge/`:
 | DELETE | `/inbox` | both | Clear inbox |
 
 In Socket mode, `/slack/events` is not registered; events arrive over the Slack WebSocket.
+
+## Tests
+
+```bash
+npm test
+```
+
+테스트는 가짜 Codex App Server를 사용해 신규 thread, resume, 사용자 질문, turn interrupt, thread history 변환을 검증하므로 Codex 로그인이나 API 사용량이 필요하지 않습니다.
 
 ## License
 
