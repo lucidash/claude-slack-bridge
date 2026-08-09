@@ -264,6 +264,7 @@ async function handleUserInputRequest(server, msg, context) {
   context.pendingServerRequests.set(requestId, requestController);
 
   try {
+    if (requestController.signal.aborted) return;
     const questions = normalizeQuestions(original);
     const answerMap = await context.onAskUser(
       questions,

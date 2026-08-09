@@ -37,6 +37,7 @@ import { readCodexSessionSummary, runCodex } from './codex.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
+import { assertQuestionActive, waitForUserAnswer } from './user-question.js';
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -500,34 +501,22 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
 
     // AskUserQuestion 콜백 (silent 모드에서는 비활성 — DM으로 질문받을 수 없으므로)
     const onAskUser = silent ? undefined : async (questions, signal, pendingText) => {
+      assertQuestionActive(signal);
       if (pendingText) {
         const maxLen = 3900;
         const contextText = pendingText.length > maxLen
           ? pendingText.substring(0, maxLen) + '\n\n... (truncated)'
           : pendingText;
         await slack.chat.postMessage({ channel, text: contextText, thread_ts: replyThreadTs });
+        assertQuestionActive(signal);
         console.log(`[AskUser] Flushed ${pendingText.length} chars of pending text`);
       }
       const text = formatAskUserQuestion(questions);
       await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      assertQuestionActive(signal);
       console.log(`[AskUser] Question posted to ${channel}, waiting for answer...`);
 
-      return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          pendingQuestions.delete(sessionKey);
-          reject(new Error('AskUserQuestion 응답 시간 초과 (5분)'));
-        }, 5 * 60 * 1000);
-
-        if (signal) {
-          signal.addEventListener('abort', () => {
-            clearTimeout(timeoutId);
-            pendingQuestions.delete(sessionKey);
-            reject(new Error('중단됨'));
-          }, { once: true });
-        }
-
-        pendingQuestions.set(sessionKey, { resolve, reject, questions, timeoutId });
-      });
+      return waitForUserAnswer({ pendingQuestions, sessionKey, questions, signal });
     };
 
     // 엔진 결정 (claude / pty-claude / codex)
