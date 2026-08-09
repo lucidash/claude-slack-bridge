@@ -2,7 +2,12 @@ import { spawn } from 'child_process';
 import readline from 'readline';
 import { homedir } from 'os';
 import { isAbsolute, resolve } from 'path';
-import { clearSession, getSession, saveSession } from './store.js';
+import {
+  clearSession,
+  getSession,
+  getSessionRevision,
+  saveSessionIfRevision,
+} from './store.js';
 
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEX_REQUEST_TIMEOUT_MS) || 30_000;
 const CLIENT_INFO = { name: 'claude-slack-bridge', title: 'Claude Slack Bridge', version: '1.0.0' };
@@ -62,9 +67,20 @@ function validatedChoice(name, fallback, validValues) {
   return value;
 }
 
+function validatedBoolean(name, fallback) {
+  const configured = process.env[name];
+  if (configured == null) return fallback;
+  const value = configured.trim().toLowerCase();
+  if (value !== 'true' && value !== 'false') {
+    throw new Error(`${name} 값이 올바르지 않습니다: ${configured}. 허용값: true, false`);
+  }
+  return value === 'true';
+}
+
 function codexSettings(workdir, modelOverride, effortOverride) {
   const sandbox = validatedChoice('CODEX_SANDBOX', 'danger-full-access', VALID_SANDBOXES);
   const approvalPolicy = validatedChoice('CODEX_APPROVAL_POLICY', 'never', VALID_APPROVAL_POLICIES);
+  const networkAccess = validatedBoolean('CODEX_NETWORK_ACCESS', true);
   const cwd = workdir ? expandPath(workdir) : process.cwd();
   const roots = runtimeRoots(cwd);
   const model = modelOverride || process.env.CODEX_MODEL || null;
@@ -73,12 +89,12 @@ function codexSettings(workdir, modelOverride, effortOverride) {
 
   let sandboxPolicy;
   if (sandbox === 'read-only') {
-    sandboxPolicy = { type: 'readOnly', networkAccess: process.env.CODEX_NETWORK_ACCESS !== 'false' };
+    sandboxPolicy = { type: 'readOnly', networkAccess };
   } else if (sandbox === 'workspace-write') {
     sandboxPolicy = {
       type: 'workspaceWrite',
       writableRoots: roots.length > 0 ? roots : [cwd],
-      networkAccess: process.env.CODEX_NETWORK_ACCESS !== 'false',
+      networkAccess,
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
     };
@@ -409,20 +425,8 @@ async function acquireThreadExecution(server, threadId, context) {
   let releaseTail;
   const tail = new Promise(resolveTail => { releaseTail = resolveTail; });
   server.threadExecutionTails.set(threadId, tail);
-
-  try {
-    await Promise.race([previous, context.completion]);
-    if (context.aborted) throw abortError();
-  } catch (error) {
-    releaseTail();
-    if (server.threadExecutionTails.get(threadId) === tail) {
-      server.threadExecutionTails.delete(threadId);
-    }
-    throw error;
-  }
-
   let released = false;
-  return () => {
+  const release = () => {
     if (released) return;
     released = true;
     releaseTail();
@@ -430,6 +434,16 @@ async function acquireThreadExecution(server, threadId, context) {
       server.threadExecutionTails.delete(threadId);
     }
   };
+
+  try {
+    await Promise.race([previous, context.completion]);
+    if (context.aborted) throw abortError();
+  } catch (error) {
+    previous.then(release, release);
+    throw error;
+  }
+
+  return release;
 }
 
 async function startAppServer() {
@@ -503,6 +517,10 @@ async function startAppServer() {
     }
     if (msg.jsonrpc != null && msg.jsonrpc !== '2.0') return;
 
+    if (msg.id != null && msg.method) {
+      handleServerRequest(server, msg);
+      return;
+    }
     if (msg.id != null && pending.has(msg.id)) {
       const request = pending.get(msg.id);
       pending.delete(msg.id);
@@ -513,10 +531,6 @@ async function startAppServer() {
       } else {
         request.resolve(msg.result);
       }
-      return;
-    }
-    if (msg.id != null && msg.method) {
-      handleServerRequest(server, msg);
       return;
     }
     if (msg.method) handleNotification(server, msg);
@@ -599,6 +613,7 @@ export async function runCodex(sessionKey, prompt, workdir, {
   model: modelOverride,
   effort: effortOverride,
 } = {}) {
+  const sessionRevision = getSessionRevision(sessionKey);
   const previousThreadId = getSession(sessionKey);
   const isResume = Boolean(previousThreadId);
   const settings = codexSettings(workdir, modelOverride, effortOverride);
@@ -656,8 +671,8 @@ export async function runCodex(sessionKey, prompt, workdir, {
     server.contextsByThread.set(threadId, context);
 
     if (!isResume || threadId !== previousThreadId) {
-      saveSession(sessionKey, threadId);
-      onSessionReady?.(threadId);
+      const saved = saveSessionIfRevision(sessionKey, threadId, sessionRevision);
+      if (saved) onSessionReady?.(threadId);
     }
 
     server.request('account/rateLimits/read')

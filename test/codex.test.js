@@ -21,6 +21,19 @@ let pendingQuestionTurnId = null;
 const activeTurns = new Map();
 const initializeDelayMs = Number(process.env.FAKE_CODEX_INIT_DELAY_MS) || 0;
 const interruptDelayMs = Number(process.env.FAKE_CODEX_INTERRUPT_DELAY_MS) || 0;
+const threadStartDelayMs = Number(process.env.FAKE_CODEX_THREAD_START_DELAY_MS) || 0;
+let collisionThreadRead = null;
+
+function sendThreadRead(id, threadId) {
+  send({ jsonrpc: '2.0', id, result: { thread: {
+    id: threadId, cwd: '/workspace/project', updatedAt: 1700000000,
+    turns: [{ items: [
+      { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: '요청' }] },
+      { type: 'commandExecution', id: 'c1', command: 'pwd' },
+      { type: 'agentMessage', id: 'a1', text: '응답' },
+    ] }],
+  } } });
+}
 
 function complete(turnId, prefix) {
   const active = activeTurns.get(turnId);
@@ -60,6 +73,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
   record(message);
 
+  if (collisionThreadRead && message.id === collisionThreadRead.id && message.method == null) {
+    const pendingRead = collisionThreadRead;
+    collisionThreadRead = null;
+    sendThreadRead(pendingRead.id, pendingRead.threadId);
+    return;
+  }
   if (message.id === 900 && Object.hasOwn(message, 'result')) {
     const answer = message.result?.answers?.choice?.answers?.[0];
     complete(pendingQuestionTurnId, answer === '두 번째' ? 'ASK_OK' : 'ASK_BAD');
@@ -74,7 +93,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       break;
     case 'thread/start':
       resumed = false;
-      send({ jsonrpc: '2.0', id: message.id, result: { thread: { id: 'thread-test', cwd: message.params.cwd } } });
+      setTimeout(() => {
+        send({ jsonrpc: '2.0', id: message.id, result: { thread: { id: 'thread-test', cwd: message.params.cwd } } });
+      }, threadStartDelayMs);
       break;
     case 'thread/resume':
       resumed = true;
@@ -123,14 +144,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       }
       break;
     case 'thread/read':
-      send({ jsonrpc: '2.0', id: message.id, result: { thread: {
-        id: message.params.threadId, cwd: '/workspace/project', updatedAt: 1700000000,
-        turns: [{ items: [
-          { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: '요청' }] },
-          { type: 'commandExecution', id: 'c1', command: 'pwd' },
-          { type: 'agentMessage', id: 'a1', text: '응답' },
-        ] }],
-      } } });
+      if (message.params.threadId === 'thread-collision') {
+        collisionThreadRead = { id: message.id, threadId: message.params.threadId };
+        send({ jsonrpc: '2.0', id: message.id, method: 'item/tool/requestUserInput', params: {
+          threadId: message.params.threadId, turnId: 'turn-collision', itemId: 'question-collision', isBlocking: true,
+          questions: [{ id: 'collision', header: '충돌', question: '계속할까요?', isOther: false, isSecret: false, options: [] }],
+        } });
+      } else {
+        sendThreadRead(message.id, message.params.threadId);
+      }
       break;
     default:
       send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown' } });
@@ -150,7 +172,15 @@ const {
   shutdownCodexAppServer,
   stopCodexQuery,
 } = await import('../src/codex.js');
-const { getThread, saveSession, saveThread, setThreadEngine, setThreadModel } = await import('../src/store.js');
+const {
+  clearSession,
+  getSession,
+  getThread,
+  saveSession,
+  saveThread,
+  setThreadEngine,
+  setThreadModel,
+} = await import('../src/store.js');
 
 function traceMessages() {
   try {
@@ -161,10 +191,10 @@ function traceMessages() {
   }
 }
 
-async function waitForTrace(predicate, timeoutMs = 1_000) {
+async function waitForTrace(predicate, timeoutMs = 1_000, startIndex = 0) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const match = traceMessages().find(predicate);
+    const match = traceMessages().slice(startIndex).find(predicate);
     if (match) return match;
     await new Promise(resolve => setTimeout(resolve, 10));
   }
@@ -254,6 +284,22 @@ test('잘못된 Codex 보안 설정을 고권한 기본값으로 대체하지 �
   assert.match(approvalError?.message || '', /CODEX_APPROVAL_POLICY/);
 });
 
+test('잘못된 Codex 네트워크 설정을 허용으로 승격하지 않는다', async () => {
+  const originalNetworkAccess = process.env.CODEX_NETWORK_ACCESS;
+  let networkError = null;
+
+  try {
+    process.env.CODEX_NETWORK_ACCESS = 'flase';
+    networkError = await runCodex('session-invalid-network', 'INVALID_NETWORK', testDir)
+      .then(() => null, error => error);
+  } finally {
+    if (originalNetworkAccess == null) delete process.env.CODEX_NETWORK_ACCESS;
+    else process.env.CODEX_NETWORK_ACCESS = originalNetworkAccess;
+  }
+
+  assert.match(networkError?.message || '', /CODEX_NETWORK_ACCESS/);
+});
+
 test('App Server 초기화 중인 실행도 중단할 수 있다', async () => {
   await shutdownCodexAppServer();
   process.env.FAKE_CODEX_INIT_DELAY_MS = '120';
@@ -333,6 +379,86 @@ test('같은 Codex thread의 turn을 Slack 세션 사이에서도 직렬화한�
   assert.equal(firstOutcome.status, 'rejected');
   assert.equal(secondOutcome.status, 'fulfilled');
   assert.equal(secondOutcome.value.result, 'RESUMED_OK');
+});
+
+test('취소된 대기자 뒤의 turn도 기존 실행이 끝날 때까지 기다린다', async () => {
+  await shutdownCodexAppServer();
+  saveSession('session-tail-a', 'thread-tail');
+  saveSession('session-tail-b', 'thread-tail');
+  saveSession('session-tail-c', 'thread-tail');
+  const traceStart = traceMessages().length;
+  let firstObserved;
+  let secondObserved;
+  let thirdObserved;
+  let thirdStartedEarly = false;
+
+  try {
+    firstObserved = runCodex('session-tail-a', 'SLOW_TAIL_FIRST', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await waitForTrace(message => turnPrompt(message) === 'SLOW_TAIL_FIRST', 1_000, traceStart);
+    secondObserved = runCodex('session-tail-b', 'TAIL_CANCELLED_WAITER', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    thirdObserved = runCodex('session-tail-c', 'TAIL_THIRD', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.equal(stopCodexQuery('session-tail-b'), true);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    thirdStartedEarly = traceMessages().slice(traceStart)
+      .some(message => turnPrompt(message) === 'TAIL_THIRD');
+  } finally {
+    await shutdownCodexAppServer();
+    await Promise.all([firstObserved, secondObserved, thirdObserved].filter(Boolean));
+  }
+
+  assert.equal(thirdStartedEarly, false);
+});
+
+test('서버 request ID가 pending client request와 같아도 방향을 구분한다', async () => {
+  await shutdownCodexAppServer();
+  const traceStart = traceMessages().length;
+  let summary;
+
+  try {
+    summary = await readCodexSessionSummary('thread-collision');
+  } finally {
+    await shutdownCodexAppServer();
+  }
+
+  const newTrace = traceMessages().slice(traceStart);
+  const threadRead = newTrace.find(message => message.method === 'thread/read');
+  assert.equal(summary?.cwd, '/workspace/project');
+  assert.ok(newTrace.some(message => (
+    message.id === threadRead?.id
+    && message.method == null
+    && message.result?.answers?.collision
+  )));
+});
+
+test('세션 초기화 뒤 늦은 Codex thread 응답이 세션을 되살리지 않는다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_THREAD_START_DELAY_MS = '120';
+  const sessionKey = 'session-engine-switch';
+  const traceStart = traceMessages().length;
+  let readyCount = 0;
+  let output;
+
+  try {
+    const running = runCodex(sessionKey, 'ENGINE_SWITCH', testDir, {
+      onSessionReady: () => { readyCount += 1; },
+    });
+    await waitForTrace(message => message.method === 'thread/start', 3_000, traceStart);
+    clearSession(sessionKey);
+    output = await running;
+  } finally {
+    delete process.env.FAKE_CODEX_THREAD_START_DELAY_MS;
+    await shutdownCodexAppServer();
+  }
+
+  assert.equal(output.result, 'FAKE_OK');
+  assert.equal(getSession(sessionKey), undefined);
+  assert.equal(readyCount, 0);
 });
 
 test('thread/read 결과를 기존 sync 요약 형식으로 변환한다', async () => {

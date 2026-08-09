@@ -15,6 +15,7 @@ const SYNC_POINTS_FILE = join(BRIDGE_DIR, 'sync-points.json');
 const WATCHES_FILE = join(BRIDGE_DIR, 'watches.json');
 const PROCESSING_FILE = join(BRIDGE_DIR, 'processing.json');
 const ACCOUNTS_FILE = join(BRIDGE_DIR, 'accounts.json');
+const sessionRevisions = new Map();
 
 // 디렉토리 및 파일 초기화
 if (!existsSync(BRIDGE_DIR)) mkdirSync(BRIDGE_DIR, { recursive: true });
@@ -49,6 +50,14 @@ function writeSecretJson(file, data) {
 }
 
 // 세션 관리 (스레드 단위)
+export function getSessionRevision(sessionKey) {
+  return sessionRevisions.get(sessionKey) || 0;
+}
+
+function bumpSessionRevision(sessionKey) {
+  sessionRevisions.set(sessionKey, getSessionRevision(sessionKey) + 1);
+}
+
 export function getSession(sessionKey) {
   return readJson(SESSIONS_FILE)[sessionKey];
 }
@@ -57,12 +66,20 @@ export function saveSession(sessionKey, sessionId) {
   const sessions = readJson(SESSIONS_FILE);
   sessions[sessionKey] = sessionId;
   writeJson(SESSIONS_FILE, sessions);
+  bumpSessionRevision(sessionKey);
+}
+
+export function saveSessionIfRevision(sessionKey, sessionId, expectedRevision) {
+  if (getSessionRevision(sessionKey) !== expectedRevision) return false;
+  saveSession(sessionKey, sessionId);
+  return true;
 }
 
 export function clearSession(sessionKey) {
   const sessions = readJson(SESSIONS_FILE);
   delete sessions[sessionKey];
   writeJson(SESSIONS_FILE, sessions);
+  bumpSessionRevision(sessionKey);
 }
 
 export function getAllSessions() {
