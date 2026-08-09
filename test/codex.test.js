@@ -16,25 +16,31 @@ const trace = process.env.FAKE_CODEX_TRACE;
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 const record = value => fs.appendFileSync(trace, JSON.stringify(value) + '\\n');
 let resumed = false;
-let active = null;
+let turnSequence = 0;
+let pendingQuestionTurnId = null;
+const activeTurns = new Map();
+const initializeDelayMs = Number(process.env.FAKE_CODEX_INIT_DELAY_MS) || 0;
+const interruptDelayMs = Number(process.env.FAKE_CODEX_INTERRUPT_DELAY_MS) || 0;
 
-function complete(prefix = resumed ? 'RESUMED_OK' : 'FAKE_OK') {
+function complete(turnId, prefix) {
+  const active = activeTurns.get(turnId);
   if (!active) return;
-  const { threadId, turnId } = active;
+  const { threadId } = active;
+  const resultPrefix = prefix || active.prefix;
   send({ jsonrpc: '2.0', method: 'item/started', params: {
     threadId, turnId, startedAtMs: Date.now(),
-    item: { type: 'commandExecution', id: 'tool-1', command: 'pwd', cwd: '/tmp', status: 'inProgress' },
+    item: { type: 'commandExecution', id: 'tool-' + turnId, command: 'pwd', cwd: '/tmp', status: 'inProgress' },
   } });
   send({ jsonrpc: '2.0', method: 'item/completed', params: {
     threadId, turnId, completedAtMs: Date.now(),
-    item: { type: 'commandExecution', id: 'tool-1', command: 'pwd', cwd: '/tmp', status: 'completed', exitCode: 0 },
+    item: { type: 'commandExecution', id: 'tool-' + turnId, command: 'pwd', cwd: '/tmp', status: 'completed', exitCode: 0 },
   } });
   send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {
-    threadId, turnId, itemId: 'message-1', delta: prefix,
+    threadId, turnId, itemId: 'message-' + turnId, delta: resultPrefix,
   } });
   send({ jsonrpc: '2.0', method: 'item/completed', params: {
     threadId, turnId, completedAtMs: Date.now(),
-    item: { type: 'agentMessage', id: 'message-1', text: prefix },
+    item: { type: 'agentMessage', id: 'message-' + turnId, text: resultPrefix },
   } });
   send({ jsonrpc: '2.0', method: 'thread/tokenUsage/updated', params: {
     threadId, turnId,
@@ -47,7 +53,7 @@ function complete(prefix = resumed ? 'RESUMED_OK' : 'FAKE_OK') {
   send({ jsonrpc: '2.0', method: 'turn/completed', params: {
     threadId, turn: { id: turnId, status: 'completed', items: [], error: null },
   } });
-  active = null;
+  activeTurns.delete(turnId);
 }
 
 readline.createInterface({ input: process.stdin }).on('line', line => {
@@ -56,14 +62,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 
   if (message.id === 900 && Object.hasOwn(message, 'result')) {
     const answer = message.result?.answers?.choice?.answers?.[0];
-    complete(answer === '두 번째' ? 'ASK_OK' : 'ASK_BAD');
+    complete(pendingQuestionTurnId, answer === '두 번째' ? 'ASK_OK' : 'ASK_BAD');
+    pendingQuestionTurnId = null;
     return;
   }
   if (message.id == null) return;
 
   switch (message.method) {
     case 'initialize':
-      send({ jsonrpc: '2.0', id: message.id, result: { userAgent: 'fake' } });
+      setTimeout(() => send({ jsonrpc: '2.0', id: message.id, result: { userAgent: 'fake' } }), initializeDelayMs);
       break;
     case 'thread/start':
       resumed = false;
@@ -81,27 +88,38 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       break;
     case 'turn/start': {
       const prompt = message.params.input?.[0]?.text || '';
-      active = { threadId: message.params.threadId, turnId: 'turn-test' };
-      send({ jsonrpc: '2.0', id: message.id, result: { turn: { id: 'turn-test', status: 'inProgress', items: [], error: null } } });
+      const turnId = 'turn-' + (++turnSequence);
+      activeTurns.set(turnId, {
+        threadId: message.params.threadId,
+        prefix: resumed ? 'RESUMED_OK' : 'FAKE_OK',
+      });
+      send({ jsonrpc: '2.0', id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [], error: null } } });
       if (prompt.includes('ASK')) {
+        pendingQuestionTurnId = turnId;
         send({ jsonrpc: '2.0', id: 900, method: 'item/tool/requestUserInput', params: {
-          threadId: active.threadId, turnId: active.turnId, itemId: 'question-1', isBlocking: true,
+          threadId: message.params.threadId, turnId, itemId: 'question-1', isBlocking: true,
           questions: [{ id: 'choice', header: '선택', question: '어느 것?', isOther: false, isSecret: false,
             options: [{ label: '첫 번째', description: '1' }, { label: '두 번째', description: '2' }] }],
         } });
+      } else if (prompt.startsWith('DELAY:')) {
+        const delayMs = Number(prompt.split(':')[1].split(/\s/)[0]);
+        setTimeout(() => complete(turnId), delayMs);
       } else if (!prompt.includes('SLOW')) {
-        setImmediate(() => complete());
+        setImmediate(() => complete(turnId));
       }
       break;
     }
     case 'turn/interrupt':
       send({ jsonrpc: '2.0', id: message.id, result: {} });
-      if (active) {
-        send({ jsonrpc: '2.0', method: 'turn/completed', params: {
-          threadId: active.threadId,
-          turn: { id: active.turnId, status: 'interrupted', items: [], error: null },
-        } });
-        active = null;
+      if (activeTurns.has(message.params.turnId)) {
+        const interrupted = activeTurns.get(message.params.turnId);
+        setTimeout(() => {
+          send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+            threadId: interrupted.threadId,
+            turn: { id: message.params.turnId, status: 'interrupted', items: [], error: null },
+          } });
+          activeTurns.delete(message.params.turnId);
+        }, interruptDelayMs);
       }
       break;
     case 'thread/read':
@@ -132,7 +150,30 @@ const {
   shutdownCodexAppServer,
   stopCodexQuery,
 } = await import('../src/codex.js');
-const { getThread, saveThread, setThreadEngine, setThreadModel } = await import('../src/store.js');
+const { getThread, saveSession, saveThread, setThreadEngine, setThreadModel } = await import('../src/store.js');
+
+function traceMessages() {
+  try {
+    const content = readFileSync(tracePath, 'utf8').trim();
+    return content ? content.split('\n').map(JSON.parse) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function waitForTrace(predicate, timeoutMs = 1_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const match = traceMessages().find(predicate);
+    if (match) return match;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error('fake Codex trace 대기 시간 초과');
+}
+
+function turnPrompt(message) {
+  return message.method === 'turn/start' ? message.params.input?.[0]?.text : null;
+}
 
 after(async () => {
   await shutdownCodexAppServer();
@@ -181,9 +222,117 @@ test('실행 중인 turn을 turn/interrupt로 중단한다', async () => {
   await assert.rejects(running, /중단됨/);
   await new Promise(resolve => setTimeout(resolve, 20));
 
-  const trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(JSON.parse);
+  const trace = traceMessages();
   const interrupt = trace.find(message => message.method === 'turn/interrupt');
-  assert.deepEqual(interrupt.params, { threadId: 'thread-test', turnId: 'turn-test' });
+  assert.equal(interrupt.params.threadId, 'thread-test');
+  assert.match(interrupt.params.turnId, /^turn-/);
+});
+
+test('잘못된 Codex 보안 설정을 고권한 기본값으로 대체하지 않는다', async () => {
+  const originalSandbox = process.env.CODEX_SANDBOX;
+  const originalApproval = process.env.CODEX_APPROVAL_POLICY;
+  let sandboxError = null;
+  let approvalError = null;
+
+  try {
+    process.env.CODEX_SANDBOX = 'workspace_write';
+    process.env.CODEX_APPROVAL_POLICY = 'never';
+    sandboxError = await runCodex('session-invalid-sandbox', 'INVALID_SANDBOX', testDir)
+      .then(() => null, error => error);
+
+    process.env.CODEX_SANDBOX = 'read-only';
+    process.env.CODEX_APPROVAL_POLICY = 'on_request';
+    approvalError = await runCodex('session-invalid-approval', 'INVALID_APPROVAL', testDir)
+      .then(() => null, error => error);
+  } finally {
+    process.env.CODEX_SANDBOX = originalSandbox;
+    if (originalApproval == null) delete process.env.CODEX_APPROVAL_POLICY;
+    else process.env.CODEX_APPROVAL_POLICY = originalApproval;
+  }
+
+  assert.match(sandboxError?.message || '', /CODEX_SANDBOX/);
+  assert.match(approvalError?.message || '', /CODEX_APPROVAL_POLICY/);
+});
+
+test('App Server 초기화 중인 실행도 중단할 수 있다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_INIT_DELAY_MS = '120';
+  const traceStart = traceMessages().length;
+  let stopped;
+  let outcome;
+
+  try {
+    const running = runCodex('session-init-stop', 'INIT_STOP', testDir);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    stopped = stopCodexQuery('session-init-stop');
+    outcome = await running.then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+  } finally {
+    delete process.env.FAKE_CODEX_INIT_DELAY_MS;
+    await shutdownCodexAppServer();
+  }
+
+  const newTrace = traceMessages().slice(traceStart);
+  assert.equal(stopped, true);
+  assert.equal(outcome.status, 'rejected');
+  assert.match(outcome.error.message, /중단됨/);
+  assert.equal(newTrace.some(message => turnPrompt(message) === 'INIT_STOP'), false);
+});
+
+test('interrupt terminal 알림 전에는 실행 Promise를 해제하지 않는다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_INTERRUPT_DELAY_MS = '120';
+  let stopped;
+  let settledEarly;
+  let outcome;
+
+  try {
+    const running = runCodex('session-interrupt-terminal', 'SLOW_INTERRUPT', testDir);
+    await waitForTrace(message => turnPrompt(message) === 'SLOW_INTERRUPT');
+    const observed = running.then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+    let settled = false;
+    observed.finally(() => { settled = true; });
+    stopped = stopCodexQuery('session-interrupt-terminal');
+    await new Promise(resolve => setTimeout(resolve, 30));
+    settledEarly = settled;
+    outcome = await observed;
+  } finally {
+    delete process.env.FAKE_CODEX_INTERRUPT_DELAY_MS;
+    await shutdownCodexAppServer();
+  }
+
+  assert.equal(stopped, true);
+  assert.equal(settledEarly, false);
+  assert.equal(outcome.status, 'rejected');
+  assert.match(outcome.error.message, /중단됨/);
+});
+
+test('같은 Codex thread의 turn을 Slack 세션 사이에서도 직렬화한다', async () => {
+  await shutdownCodexAppServer();
+  saveSession('session-shared-a', 'thread-shared');
+  saveSession('session-shared-b', 'thread-shared');
+
+  const first = runCodex('session-shared-a', 'SLOW_SHARED_FIRST', testDir);
+  await waitForTrace(message => turnPrompt(message) === 'SLOW_SHARED_FIRST');
+  const second = runCodex('session-shared-b', 'SHARED_SECOND', testDir);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const secondStartedEarly = traceMessages().some(message => turnPrompt(message) === 'SHARED_SECOND');
+
+  assert.equal(stopCodexQuery('session-shared-a'), true);
+  const [firstOutcome, secondOutcome] = await Promise.all([
+    first.then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error })),
+    second.then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error })),
+  ]);
+
+  assert.equal(secondStartedEarly, false);
+  assert.equal(firstOutcome.status, 'rejected');
+  assert.equal(secondOutcome.status, 'fulfilled');
+  assert.equal(secondOutcome.value.result, 'RESUMED_OK');
 });
 
 test('thread/read 결과를 기존 sync 요약 형식으로 변환한다', async () => {

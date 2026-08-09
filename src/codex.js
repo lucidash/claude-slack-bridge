@@ -52,11 +52,19 @@ function runtimeRoots(workdir) {
   return [...new Set(roots)];
 }
 
+function validatedChoice(name, fallback, validValues) {
+  const configured = process.env[name];
+  if (configured == null) return fallback;
+  const value = configured.trim().toLowerCase();
+  if (!validValues.has(value)) {
+    throw new Error(`${name} 값이 올바르지 않습니다: ${configured}. 허용값: ${[...validValues].join(', ')}`);
+  }
+  return value;
+}
+
 function codexSettings(workdir, modelOverride, effortOverride) {
-  const requestedSandbox = (process.env.CODEX_SANDBOX || 'danger-full-access').toLowerCase();
-  const sandbox = VALID_SANDBOXES.has(requestedSandbox) ? requestedSandbox : 'danger-full-access';
-  const requestedApproval = (process.env.CODEX_APPROVAL_POLICY || 'never').toLowerCase();
-  const approvalPolicy = VALID_APPROVAL_POLICIES.has(requestedApproval) ? requestedApproval : 'never';
+  const sandbox = validatedChoice('CODEX_SANDBOX', 'danger-full-access', VALID_SANDBOXES);
+  const approvalPolicy = validatedChoice('CODEX_APPROVAL_POLICY', 'never', VALID_APPROVAL_POLICIES);
   const cwd = workdir ? expandPath(workdir) : process.cwd();
   const roots = runtimeRoots(cwd);
   const model = modelOverride || process.env.CODEX_MODEL || null;
@@ -182,7 +190,10 @@ function setCompletedAgentMessage(context, item) {
 
 function contextForMessage(server, params) {
   const threadId = params?.threadId || params?.conversationId;
-  return threadId ? server.contextsByThread.get(threadId) : null;
+  const context = threadId ? server.contextsByThread.get(threadId) : null;
+  const turnId = params?.turnId || params?.turn?.id;
+  if (context?.turnId && turnId && context.turnId !== turnId) return null;
+  return context;
 }
 
 function sendServerResponse(server, id, payload) {
@@ -354,21 +365,71 @@ function createDeferredContext(callbacks, approvalPolicy) {
     abortController: new AbortController(),
     threadId: null,
     turnId: null,
+    startingTurn: false,
+    interruptRequested: false,
+    interruptTimeoutId: null,
     aborted: false,
     settled: false,
     completion,
     resolve() {
       if (context.settled) return;
       context.settled = true;
+      if (context.interruptTimeoutId) clearTimeout(context.interruptTimeoutId);
       resolvePromise();
     },
     reject(error) {
       if (context.settled) return;
       context.settled = true;
+      if (context.interruptTimeoutId) clearTimeout(context.interruptTimeoutId);
       rejectPromise(error);
     },
   };
   return context;
+}
+
+function abortError() {
+  return new Error('중단됨 (사용자 요청)');
+}
+
+function requestInterrupt(server, context) {
+  if (context.interruptRequested || !context.threadId || !context.turnId) return;
+  context.interruptRequested = true;
+  server.request('turn/interrupt', {
+    threadId: context.threadId,
+    turnId: context.turnId,
+  }).then(() => {
+    if (!context.settled) {
+      context.interruptTimeoutId = setTimeout(() => context.reject(abortError()), REQUEST_TIMEOUT_MS);
+    }
+  }).catch(() => context.reject(abortError()));
+}
+
+async function acquireThreadExecution(server, threadId, context) {
+  const previous = server.threadExecutionTails.get(threadId) || Promise.resolve();
+  let releaseTail;
+  const tail = new Promise(resolveTail => { releaseTail = resolveTail; });
+  server.threadExecutionTails.set(threadId, tail);
+
+  try {
+    await Promise.race([previous, context.completion]);
+    if (context.aborted) throw abortError();
+  } catch (error) {
+    releaseTail();
+    if (server.threadExecutionTails.get(threadId) === tail) {
+      server.threadExecutionTails.delete(threadId);
+    }
+    throw error;
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseTail();
+    if (server.threadExecutionTails.get(threadId) === tail) {
+      server.threadExecutionTails.delete(threadId);
+    }
+  };
 }
 
 async function startAppServer() {
@@ -378,6 +439,7 @@ async function startAppServer() {
   });
   const pending = new Map();
   const contextsByThread = new Map();
+  const threadExecutionTails = new Map();
   let nextId = 1;
   let stderr = '';
   let exited = false;
@@ -387,6 +449,7 @@ async function startAppServer() {
     child,
     pending,
     contextsByThread,
+    threadExecutionTails,
     lastRateLimit: null,
     write(message) {
       if (exited || !child.stdin?.writable) throw new Error('Codex app-server가 종료되었습니다.');
@@ -471,6 +534,9 @@ async function startAppServer() {
       pending.clear();
       for (const context of contextsByThread.values()) context.reject(error);
       contextsByThread.clear();
+      for (const entry of runningQueries.values()) {
+        if (entry.server === server) entry.context.reject(error);
+      }
       if (sharedServer === server) sharedServer = null;
       resolveExit(error);
     });
@@ -514,13 +580,11 @@ export function stopCodexQuery(sessionKey) {
   if (!entry) return false;
   entry.context.aborted = true;
   entry.context.abortController.abort();
-  if (entry.context.threadId && entry.context.turnId) {
-    entry.server.request('turn/interrupt', {
-      threadId: entry.context.threadId,
-      turnId: entry.context.turnId,
-    }).catch(() => {});
+  if (entry.server && entry.context.threadId && entry.context.turnId) {
+    requestInterrupt(entry.server, entry.context);
+  } else if (!entry.context.startingTurn) {
+    entry.context.reject(abortError());
   }
-  entry.context.reject(new Error('중단됨 (사용자 요청)'));
   return true;
 }
 
@@ -538,12 +602,19 @@ export async function runCodex(sessionKey, prompt, workdir, {
   const previousThreadId = getSession(sessionKey);
   const isResume = Boolean(previousThreadId);
   const settings = codexSettings(workdir, modelOverride, effortOverride);
-  const server = await ensureAppServer();
   const context = createDeferredContext({ onProgress, onAskUser }, settings.approvalPolicy);
-  context.lastRateLimit = server.lastRateLimit;
-  runningQueries.set(sessionKey, { server, context });
+  const entry = { server: null, context };
+  runningQueries.set(sessionKey, entry);
+  let server = null;
+  let releaseThreadExecution = null;
+  let lockedThreadId = null;
 
   try {
+    server = await ensureAppServer();
+    entry.server = server;
+    context.lastRateLimit = server.lastRateLimit;
+    if (context.aborted) throw abortError();
+
     let threadResponse;
     const threadParams = {
       cwd: settings.cwd,
@@ -554,6 +625,8 @@ export async function runCodex(sessionKey, prompt, workdir, {
     };
 
     if (isResume) {
+      releaseThreadExecution = await acquireThreadExecution(server, previousThreadId, context);
+      lockedThreadId = previousThreadId;
       console.log(`[Codex] Resuming thread ${previousThreadId} for ${sessionKey}`);
       try {
         threadResponse = await server.request('thread/resume', {
@@ -562,6 +635,7 @@ export async function runCodex(sessionKey, prompt, workdir, {
           excludeTurns: true,
         });
       } catch (error) {
+        if (context.aborted) throw abortError();
         clearSession(sessionKey);
         throw new Error(`Codex 세션 재개 실패 (${previousThreadId}): ${error.message}\n새 세션으로 다시 시도해주세요.`);
       }
@@ -570,9 +644,14 @@ export async function runCodex(sessionKey, prompt, workdir, {
       threadResponse = await server.request('thread/start', threadParams);
     }
 
-    if (context.aborted) throw new Error('중단됨 (사용자 요청)');
+    if (context.aborted) throw abortError();
     const threadId = threadResponse?.thread?.id || threadResponse?.threadId || previousThreadId;
     if (!threadId) throw new Error('Codex thread 응답에 ID가 없습니다.');
+    if (lockedThreadId !== threadId) {
+      releaseThreadExecution?.();
+      releaseThreadExecution = await acquireThreadExecution(server, threadId, context);
+      lockedThreadId = threadId;
+    }
     context.threadId = threadId;
     server.contextsByThread.set(threadId, context);
 
@@ -590,23 +669,28 @@ export async function runCodex(sessionKey, prompt, workdir, {
       })
       .catch(() => {});
 
-    const turnResponse = await server.request('turn/start', {
-      threadId,
-      input: [{ type: 'text', text: prompt }],
-      cwd: settings.cwd,
-      runtimeWorkspaceRoots: settings.roots.length > 0 ? settings.roots : null,
-      approvalPolicy: settings.approvalPolicy,
-      sandboxPolicy: settings.sandboxPolicy,
-      model: settings.model,
-      effort: settings.effort,
-    });
+    context.startingTurn = true;
+    let turnResponse;
+    try {
+      turnResponse = await server.request('turn/start', {
+        threadId,
+        input: [{ type: 'text', text: prompt }],
+        cwd: settings.cwd,
+        runtimeWorkspaceRoots: settings.roots.length > 0 ? settings.roots : null,
+        approvalPolicy: settings.approvalPolicy,
+        sandboxPolicy: settings.sandboxPolicy,
+        model: settings.model,
+        effort: settings.effort,
+      });
+    } finally {
+      context.startingTurn = false;
+    }
     context.turnId = turnResponse?.turn?.id || context.turnId;
 
     if (context.aborted) {
-      if (context.turnId) {
-        server.request('turn/interrupt', { threadId, turnId: context.turnId }).catch(() => {});
-      }
-      throw new Error('중단됨 (사용자 요청)');
+      if (!context.settled) requestInterrupt(server, context);
+      await context.completion;
+      throw abortError();
     }
 
     await context.completion;
@@ -616,9 +700,10 @@ export async function runCodex(sessionKey, prompt, workdir, {
       rateLimit: context.lastRateLimit,
     };
   } finally {
-    if (context.threadId && server.contextsByThread.get(context.threadId) === context) {
+    if (context.threadId && server?.contextsByThread.get(context.threadId) === context) {
       server.contextsByThread.delete(context.threadId);
     }
+    releaseThreadExecution?.();
     if (runningQueries.get(sessionKey)?.context === context) runningQueries.delete(sessionKey);
   }
 }

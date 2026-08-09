@@ -6,6 +6,7 @@ import { stopClaudeQuery } from './claude.js';
 import { readCodexSessionSummary, stopCodexQuery } from './codex.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
+import { resolveSessionSource } from './session-source.js';
 
 function formatElapsed(ms) {
   const sec = Math.floor(ms / 1000);
@@ -115,18 +116,24 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const newSessionId = sessionMatch[1].trim().replace(/`/g, '');
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
     let currentEngine = getThreadEngine(effectiveThreadKey) || 'claude';
-    let detectedDir = currentEngine === 'codex' ? null : findSessionWorkdir(newSessionId);
-    if (currentEngine === 'codex' || !detectedDir) {
-      const codexSummary = await readCodexSessionSummary(newSessionId).catch(() => null);
-      if (codexSummary) {
-        if (currentEngine !== 'codex') {
-          setThreadModel(effectiveThreadKey, null);
-          setThreadEffort(effectiveThreadKey, null);
-        }
-        currentEngine = 'codex';
-        detectedDir = codexSummary.cwd;
-        setThreadEngine(effectiveThreadKey, 'codex');
+    const detected = await resolveSessionSource(currentEngine, {
+      readClaude: async () => {
+        const cwd = findSessionWorkdir(newSessionId);
+        return cwd ? { cwd } : null;
+      },
+      readCodex: () => readCodexSessionSummary(newSessionId).catch(() => null),
+    });
+    let detectedDir = detected?.summary.cwd || null;
+    if (detected) {
+      const detectedEngine = detected.engine === 'codex'
+        ? 'codex'
+        : (currentEngine === 'pty-claude' ? 'pty-claude' : 'claude');
+      if (currentEngine !== detectedEngine) {
+        setThreadModel(effectiveThreadKey, null);
+        setThreadEffort(effectiveThreadKey, null);
       }
+      currentEngine = detectedEngine;
+      setThreadEngine(effectiveThreadKey, detectedEngine);
     }
     saveSession(sessionKey, newSessionId);
 
@@ -751,17 +758,21 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const sessionId = syncMatch[1];
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
     let syncEngine = getThreadEngine(effectiveThreadKey) || 'claude';
-    let summary = syncEngine === 'codex' ? null : readSessionSummary(sessionId);
-    if (!summary) {
-      summary = await readCodexSessionSummary(sessionId).catch(() => null);
-      if (summary) {
-        if (syncEngine !== 'codex') {
-          setThreadModel(effectiveThreadKey, null);
-          setThreadEffort(effectiveThreadKey, null);
-        }
-        syncEngine = 'codex';
-        setThreadEngine(effectiveThreadKey, 'codex');
+    const detected = await resolveSessionSource(syncEngine, {
+      readClaude: async () => readSessionSummary(sessionId),
+      readCodex: () => readCodexSessionSummary(sessionId).catch(() => null),
+    });
+    const summary = detected?.summary || null;
+    if (detected) {
+      const detectedEngine = detected.engine === 'codex'
+        ? 'codex'
+        : (syncEngine === 'pty-claude' ? 'pty-claude' : 'claude');
+      if (syncEngine !== detectedEngine) {
+        setThreadModel(effectiveThreadKey, null);
+        setThreadEffort(effectiveThreadKey, null);
       }
+      syncEngine = detectedEngine;
+      setThreadEngine(effectiveThreadKey, detectedEngine);
     }
     if (!summary) {
       await slack.chat.postMessage({
