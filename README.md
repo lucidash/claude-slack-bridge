@@ -59,7 +59,7 @@ cp .env.example .env
 | `CODEX_EFFORT` | — | 모델 기본값 | 기본 reasoning effort |
 | `CODEX_ALLOWED_DIRS` | — | `CLAUDE_ALLOWED_DIRS` | Codex runtime workspace root 목록(쉼표 구분) |
 | `CODEX_SANDBOX` | — | `danger-full-access` | `read-only`, `workspace-write`, `danger-full-access` |
-| `CODEX_APPROVAL_POLICY` | — | `never` | `untrusted`, `on-request`, `never` |
+| `CODEX_APPROVAL_POLICY` | — | `never` | `never`만 지원 (Slack 승인 중계 미지원) |
 | `CODEX_NETWORK_ACCESS` | — | `true` | read/workspace sandbox의 네트워크 접근 여부 |
 | `CODEX_REQUEST_TIMEOUT_MS` | — | `30000` | App Server JSON-RPC 요청 제한 시간(ms) |
 | `BRIDGE_DATA_DIR` | — | `~/.claude/slack-bridge` | 브리지 상태 파일 저장 경로 |

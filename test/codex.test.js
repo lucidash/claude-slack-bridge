@@ -26,6 +26,8 @@ const threadResumeDelayMs = Number(process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS
 const turnStartDelayMs = Number(process.env.FAKE_CODEX_TURN_START_DELAY_MS) || 0;
 const fatalTerminalDelayMs = Number(process.env.FAKE_CODEX_FATAL_TERMINAL_DELAY_MS) || 0;
 const failThreadResume = process.env.FAKE_CODEX_THREAD_RESUME_FAIL === 'true';
+const failInterrupt = process.env.FAKE_CODEX_INTERRUPT_FAIL === 'true';
+const rateLimitWindowMins = Number(process.env.FAKE_CODEX_RATE_WINDOW_MINS) || 300;
 let collisionThreadRead = null;
 
 function sendThreadRead(id, threadId) {
@@ -89,6 +91,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     pendingQuestionTurnId = null;
     return;
   }
+  if (message.id === 902 && Object.hasOwn(message, 'result')) {
+    const answers = message.result?.answers?.free?.answers;
+    complete(
+      pendingQuestionTurnId,
+      answers?.length === 1 && answers[0] === '네, 진행해주세요' ? 'FREE_TEXT_OK' : 'FREE_TEXT_BAD',
+    );
+    pendingQuestionTurnId = null;
+    return;
+  }
   if (message.id == null) return;
 
   switch (message.method) {
@@ -114,7 +125,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     case 'account/rateLimits/read':
       send({ jsonrpc: '2.0', id: message.id, result: { rateLimits: {
         limitId: 'codex', limitName: 'Codex',
-        primary: { usedPercent: 23.4, windowDurationMins: 300, resetsAt: 2000000000 },
+        primary: { usedPercent: 23.4, windowDurationMins: rateLimitWindowMins, resetsAt: 2000000000 },
       } } });
       break;
     case 'turn/start': {
@@ -137,6 +148,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           threadId: message.params.threadId, turnId, itemId: 'question-1', isBlocking: true,
           questions: [{ id: 'choice', header: '선택', question: '어느 것?', isOther: false, isSecret: false,
             options: [{ label: '첫 번째', description: '1' }, { label: '두 번째', description: '2' }] }],
+        } });
+      } else if (prompt === 'FREE_TEXT') {
+        pendingQuestionTurnId = turnId;
+        send({ jsonrpc: '2.0', id: 902, method: 'item/tool/requestUserInput', params: {
+          threadId: message.params.threadId, turnId, itemId: 'question-free', isBlocking: true,
+          questions: [{ id: 'free', header: '입력', question: '자유 입력', isOther: false, isSecret: false,
+            options: null }],
         } });
       } else if (prompt === 'AUTO_RESOLVE_QUESTION') {
         const requestId = 901;
@@ -177,6 +195,20 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       break;
     }
     case 'turn/interrupt':
+      if (failInterrupt) {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'interrupt failed' } });
+        if (activeTurns.has(message.params.turnId)) {
+          const interrupted = activeTurns.get(message.params.turnId);
+          setTimeout(() => {
+            send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+              threadId: interrupted.threadId,
+              turn: { id: message.params.turnId, status: 'interrupted', items: [], error: null },
+            } });
+            activeTurns.delete(message.params.turnId);
+          }, interruptDelayMs || 20);
+        }
+        break;
+      }
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       if (activeTurns.has(message.params.turnId)) {
         const interrupted = activeTurns.get(message.params.turnId);
@@ -291,6 +323,13 @@ test('Codex 사용자 질문을 Slack 질문 콜백으로 중계한다', async (
   assert.equal(output.result, 'ASK_OK');
 });
 
+test('옵션 없는 Codex 질문의 자유 입력을 하나의 답변으로 전달한다', async () => {
+  const output = await runCodex('session-free-question', 'FREE_TEXT', testDir, {
+    onAskUser: async () => ({ '자유 입력': '네, 진행해주세요' }),
+  });
+  assert.equal(output.result, 'FREE_TEXT_OK');
+});
+
 test('서버가 해제한 사용자 질문 waiter를 함께 취소한다', async () => {
   await shutdownCodexAppServer();
   let questionAborted = false;
@@ -314,6 +353,21 @@ test('sparse rate-limit 알림이 기존 primary 상태를 지우지 않는다',
   const output = await runCodex('session-sparse-rate-limit', 'SPARSE_RATE_LIMIT', testDir);
   assert.equal(output.rateLimit?.pct, 23);
   assert.equal(output.rateLimit?.resetsAt, 2000000000);
+});
+
+test('rate-limit 창 길이를 상태 표시에 전달하도록 보존한다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_RATE_WINDOW_MINS = '10080';
+  let output;
+
+  try {
+    output = await runCodex('session-weekly-rate-limit', 'WEEKLY_RATE_LIMIT', testDir);
+  } finally {
+    delete process.env.FAKE_CODEX_RATE_WINDOW_MINS;
+    await shutdownCodexAppServer();
+  }
+
+  assert.equal(output.rateLimit?.windowDurationMins, 10080);
 });
 
 test('실행 중인 turn을 turn/interrupt로 중단한다', async () => {
@@ -352,6 +406,22 @@ test('잘못된 Codex 보안 설정을 고권한 기본값으로 대체하지 �
   }
 
   assert.match(sandboxError?.message || '', /CODEX_SANDBOX/);
+  assert.match(approvalError?.message || '', /CODEX_APPROVAL_POLICY/);
+});
+
+test('Slack에서 처리하지 않는 Codex 승인 정책은 설정 오류로 거부한다', async () => {
+  const originalApproval = process.env.CODEX_APPROVAL_POLICY;
+  let approvalError;
+
+  try {
+    process.env.CODEX_APPROVAL_POLICY = 'on-request';
+    approvalError = await runCodex('session-unsupported-approval', 'UNSUPPORTED_APPROVAL', testDir)
+      .then(() => null, error => error);
+  } finally {
+    if (originalApproval == null) delete process.env.CODEX_APPROVAL_POLICY;
+    else process.env.CODEX_APPROVAL_POLICY = originalApproval;
+  }
+
   assert.match(approvalError?.message || '', /CODEX_APPROVAL_POLICY/);
 });
 
@@ -427,6 +497,48 @@ test('interrupt terminal 알림 전에는 실행 Promise를 해제하지 않는�
   assert.equal(settledEarly, false);
   assert.equal(outcome.status, 'rejected');
   assert.match(outcome.error.message, /중단됨/);
+});
+
+test('한 thread의 interrupt 실패가 공유 App Server의 다른 실행을 종료하지 않는다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_INTERRUPT_FAIL = 'true';
+  process.env.FAKE_CODEX_INTERRUPT_DELAY_MS = '80';
+  saveSession('session-interrupt-fail-a', 'thread-interrupt-fail-a');
+  saveSession('session-interrupt-fail-b', 'thread-interrupt-fail-b');
+  saveSession('session-interrupt-fail-c', 'thread-interrupt-fail-a');
+  const traceStart = traceMessages().length;
+  let firstObserved;
+  let secondObserved;
+  let thirdObserved;
+  let thirdStartedBeforeTerminal;
+
+  try {
+    secondObserved = runCodex('session-interrupt-fail-b', 'DELAY:120', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await waitForTrace(message => turnPrompt(message) === 'DELAY:120', 1_000, traceStart);
+    firstObserved = runCodex('session-interrupt-fail-a', 'SLOW_INTERRUPT_FAILURE', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await waitForTrace(message => turnPrompt(message) === 'SLOW_INTERRUPT_FAILURE', 1_000, traceStart);
+    assert.equal(stopCodexQuery('session-interrupt-fail-a'), true);
+    const firstOutcome = await firstObserved;
+    assert.equal(firstOutcome.status, 'rejected');
+    assert.match(firstOutcome.error.message, /중단됨/);
+
+    thirdObserved = runCodex('session-interrupt-fail-c', 'AFTER_INTERRUPT_FAILURE', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    thirdStartedBeforeTerminal = traceMessages().slice(traceStart)
+      .some(message => turnPrompt(message) === 'AFTER_INTERRUPT_FAILURE');
+  } finally {
+    delete process.env.FAKE_CODEX_INTERRUPT_FAIL;
+    delete process.env.FAKE_CODEX_INTERRUPT_DELAY_MS;
+  }
+
+  const [secondOutcome, thirdOutcome] = await Promise.all([secondObserved, thirdObserved]);
+  assert.equal(thirdStartedBeforeTerminal, false);
+  assert.equal(secondOutcome.status, 'fulfilled');
+  assert.equal(secondOutcome.value.result, 'RESUMED_OK');
+  assert.equal(thirdOutcome.status, 'fulfilled');
 });
 
 test('같은 Codex thread의 turn을 Slack 세션 사이에서도 직렬화한다', async () => {

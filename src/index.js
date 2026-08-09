@@ -38,6 +38,7 @@ import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
 import { assertQuestionActive, waitForUserAnswer } from './user-question.js';
+import { formatRateLimitWindow } from './rate-limit.js';
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -372,7 +373,7 @@ function formatRateLimit(rl) {
       reset = h > 0 ? ` ${h}h${m}m` : ` ${m}m`;
     }
   }
-  return ` | 5h: ${rl.pct}%${reset}`;
+  return ` | ${formatRateLimitWindow(rl.windowDurationMins)}: ${rl.pct}%${reset}`;
 }
 
 async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false, anchorChannel = null }) {

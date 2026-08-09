@@ -7,6 +7,7 @@ import { readCodexSessionSummary, stopCodexQuery } from './codex.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 import { resolveSessionSource } from './session-source.js';
+import { formatRateLimitWindow } from './rate-limit.js';
 
 function formatElapsed(ms) {
   const sec = Math.floor(ms / 1000);
@@ -456,7 +457,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const elapsed = lock.startTime ? formatElapsed(Date.now() - lock.startTime) : '?';
     const ctxInfo = lock.lastUsage ? formatCtx(lock.lastUsage) : '';
     const rl = lock.lastRateLimit;
-    const rlInfo = rl?.pct != null ? ` | 5h: ${rl.pct}%` : '';
+    const rlInfo = rl?.pct != null
+      ? ` | ${formatRateLimitWindow(rl.windowDurationMins)}: ${rl.pct}%`
+      : '';
     const sid = getSession(sessionKey);
     const prUrl = sid ? getSessionPrUrl(sid) : null;
     const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';

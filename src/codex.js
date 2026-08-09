@@ -12,7 +12,7 @@ import {
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEX_REQUEST_TIMEOUT_MS) || 30_000;
 const CLIENT_INFO = { name: 'claude-slack-bridge', title: 'Claude Slack Bridge', version: '1.0.0' };
 const VALID_SANDBOXES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
-const VALID_APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
+const VALID_APPROVAL_POLICIES = new Set(['never']);
 
 const runningQueries = new Map();
 let sharedServer = null;
@@ -174,6 +174,7 @@ function normalizeRateLimit(snapshot) {
   return {
     pct: Math.round(window.usedPercent),
     resetsAt: window.resetsAt || null,
+    windowDurationMins: window.windowDurationMins || null,
     type: snapshot.limitName || snapshot.limitId || null,
   };
 }
@@ -184,6 +185,7 @@ function mergeRateLimit(current, snapshot) {
   return {
     pct: next.pct,
     resetsAt: next.resetsAt ?? current?.resetsAt ?? null,
+    windowDurationMins: next.windowDurationMins ?? current?.windowDurationMins ?? null,
     type: next.type ?? current?.type ?? null,
   };
 }
@@ -280,7 +282,9 @@ async function handleUserInputRequest(server, msg, context) {
       answers[question.codexId] = {
         answers: answer == null || answer === ''
           ? []
-          : String(answer).split(/[,，]/).map(value => value.trim()).filter(Boolean),
+          : question.options.length > 0
+            ? String(answer).split(/[,，]/).map(value => value.trim()).filter(Boolean)
+            : [String(answer).trim()],
       };
     }
     sendServerResponse(server, msg.id, { result: { answers } });
@@ -321,6 +325,7 @@ function handleServerRequest(server, msg) {
 }
 
 function finishContext(context, turn) {
+  context.markTerminal();
   if (context.settled) return;
   const status = turn?.status || 'completed';
   if (status === 'failed') {
@@ -384,6 +389,7 @@ function handleNotification(server, msg) {
       if (!params.willRetry) context.lastError = new Error(params.error?.message || 'Codex 오류');
       break;
     case 'turn/failed':
+      context.markTerminal();
       context.reject(new Error(params.error?.message || params.turn?.error?.message || 'Codex turn 실패'));
       break;
     case 'turn/completed':
@@ -419,7 +425,21 @@ function createDeferredContext(callbacks, approvalPolicy) {
     interruptTimeoutId: null,
     aborted: false,
     settled: false,
+    terminalObserved: false,
+    deferCleanupUntilTerminal: false,
+    terminalCleanup: null,
     completion,
+    markTerminal() {
+      if (context.terminalObserved) return;
+      context.terminalObserved = true;
+      const cleanup = context.terminalCleanup;
+      context.terminalCleanup = null;
+      cleanup?.();
+    },
+    cleanupAfterTerminal(cleanup) {
+      if (context.terminalObserved) cleanup();
+      else context.terminalCleanup = cleanup;
+    },
     resolve() {
       if (context.settled) return;
       context.settled = true;
@@ -444,6 +464,26 @@ function abortError() {
   return new Error('중단됨 (사용자 요청)');
 }
 
+function hasOtherServerWork(server, context) {
+  for (const candidate of server.contextsByThread.values()) {
+    if (candidate !== context && !candidate.settled) return true;
+  }
+  for (const entry of runningQueries.values()) {
+    if (entry.server === server && entry.context !== context && !entry.context.settled) return true;
+  }
+  return server.pending.size > 0;
+}
+
+function rejectWithoutStoppingOtherRuns(server, context, error) {
+  if (hasOtherServerWork(server, context)) {
+    context.deferCleanupUntilTerminal = Boolean(context.threadId);
+    context.reject(error);
+    return;
+  }
+  server.close();
+  context.reject(error);
+}
+
 function requestInterrupt(server, context) {
   if (context.interruptRequested || !context.threadId || !context.turnId) return;
   context.interruptRequested = true;
@@ -453,13 +493,11 @@ function requestInterrupt(server, context) {
   }).then(() => {
     if (!context.settled) {
       context.interruptTimeoutId = setTimeout(() => {
-        server.close();
-        context.reject(abortError());
+        rejectWithoutStoppingOtherRuns(server, context, abortError());
       }, REQUEST_TIMEOUT_MS);
     }
   }).catch(() => {
-    server.close();
-    context.reject(abortError());
+    rejectWithoutStoppingOtherRuns(server, context, abortError());
   });
 }
 
@@ -469,8 +507,13 @@ async function cleanupTurnStartFailure(server, context, error) {
     await context.completion.catch(() => {});
     if (server.child.killed && server.exitPromise) await server.exitPromise;
   } else if (error?.name === 'CodexRequestTimeoutError') {
-    server.close();
-    if (server.exitPromise) await server.exitPromise;
+    if (hasOtherServerWork(server, context)) {
+      context.deferCleanupUntilTerminal = Boolean(context.threadId);
+      context.reject(error);
+    } else {
+      server.close();
+      if (server.exitPromise) await server.exitPromise;
+    }
   }
 }
 
@@ -603,7 +646,10 @@ async function startAppServer() {
       const error = new Error(detail);
       for (const request of pending.values()) request.reject(error);
       pending.clear();
-      for (const context of contextsByThread.values()) context.reject(error);
+      for (const context of contextsByThread.values()) {
+        context.markTerminal();
+        context.reject(error);
+      }
       contextsByThread.clear();
       for (const entry of runningQueries.values()) {
         if (entry.server === server) entry.context.reject(error);
@@ -776,11 +822,15 @@ export async function runCodex(sessionKey, prompt, workdir, {
       rateLimit: context.lastRateLimit,
     };
   } finally {
-    if (context.threadId && server?.contextsByThread.get(context.threadId) === context) {
-      server.contextsByThread.delete(context.threadId);
-    }
-    releaseThreadExecution?.();
     if (runningQueries.get(sessionKey)?.context === context) runningQueries.delete(sessionKey);
+    const cleanupThreadExecution = () => {
+      if (context.threadId && server?.contextsByThread.get(context.threadId) === context) {
+        server.contextsByThread.delete(context.threadId);
+      }
+      releaseThreadExecution?.();
+    };
+    if (context.deferCleanupUntilTerminal) context.cleanupAfterTerminal(cleanupThreadExecution);
+    else cleanupThreadExecution();
   }
 }
 

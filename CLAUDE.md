@@ -82,7 +82,7 @@ npm test       # Codex App Server 통합 테스트
 | `CODEX_ALLOWED_DIRS` | Codex CLI 허용 디렉토리 (미지정 시 `CLAUDE_ALLOWED_DIRS` 사용) |
 | `CODEX_EFFORT` | Codex 기본 reasoning effort (미지정 시 모델 기본값) |
 | `CODEX_SANDBOX` | `read-only`, `workspace-write`, `danger-full-access` (기본) |
-| `CODEX_APPROVAL_POLICY` | `untrusted`, `on-request`, `never` (기본) |
+| `CODEX_APPROVAL_POLICY` | `never`만 지원 (기본, Slack 승인 중계 미지원) |
 | `CODEX_NETWORK_ACCESS` | read/workspace sandbox 네트워크 접근 여부 (기본: true) |
 | `BRIDGE_DATA_DIR` | 브리지 상태 파일 경로 (기본: `~/.claude/slack-bridge`) |
 | `CLAUDE_BIN` | `pty-claude` 엔진용 claude CLI 절대경로 (기본: `/Users/muzi/.local/bin/claude`) |

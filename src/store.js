@@ -3,7 +3,7 @@ import { join, resolve } from 'path';
 import { homedir } from 'os';
 
 const BRIDGE_DIR = process.env.BRIDGE_DATA_DIR
-  ? resolve(process.env.BRIDGE_DATA_DIR)
+  ? resolve(process.env.BRIDGE_DATA_DIR.replace(/^~(?=\/|$)/, homedir()))
   : join(homedir(), '.claude', 'slack-bridge');
 const SESSIONS_FILE = join(BRIDGE_DIR, 'sessions.json');
 const THREADS_FILE = join(BRIDGE_DIR, 'threads.json');
