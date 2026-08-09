@@ -3,7 +3,7 @@ import readline from 'readline';
 import { homedir } from 'os';
 import { isAbsolute, resolve } from 'path';
 import {
-  clearSession,
+  clearSessionIfRevision,
   getSession,
   getSessionRevision,
   saveSessionIfRevision,
@@ -157,13 +157,13 @@ function updateActivity(context, item) {
 }
 
 function normalizeUsage(tokenUsage) {
-  const total = tokenUsage?.total;
-  if (!total) return null;
+  const current = tokenUsage?.last;
+  if (!current) return null;
   return {
-    inputTokens: total.inputTokens || 0,
-    outputTokens: total.outputTokens || 0,
-    cachedInputTokens: total.cachedInputTokens || 0,
-    reasoningOutputTokens: total.reasoningOutputTokens || 0,
+    inputTokens: current.inputTokens || 0,
+    outputTokens: current.outputTokens || 0,
+    cachedInputTokens: current.cachedInputTokens || 0,
+    reasoningOutputTokens: current.reasoningOutputTokens || 0,
     contextWindow: tokenUsage.modelContextWindow || 0,
   };
 }
@@ -175,6 +175,16 @@ function normalizeRateLimit(snapshot) {
     pct: Math.round(window.usedPercent),
     resetsAt: window.resetsAt || null,
     type: snapshot.limitName || snapshot.limitId || null,
+  };
+}
+
+function mergeRateLimit(current, snapshot) {
+  const next = normalizeRateLimit(snapshot);
+  if (!next) return current;
+  return {
+    pct: next.pct,
+    resetsAt: next.resetsAt ?? current?.resetsAt ?? null,
+    type: next.type ?? current?.type ?? null,
   };
 }
 
@@ -246,13 +256,21 @@ async function handleUserInputRequest(server, msg, context) {
     return;
   }
 
+  const requestId = String(msg.id);
+  const requestController = new AbortController();
+  const abortRequest = () => requestController.abort(context.abortController.signal.reason);
+  if (context.abortController.signal.aborted) abortRequest();
+  else context.abortController.signal.addEventListener('abort', abortRequest, { once: true });
+  context.pendingServerRequests.set(requestId, requestController);
+
   try {
     const questions = normalizeQuestions(original);
     const answerMap = await context.onAskUser(
       questions,
-      context.abortController.signal,
+      requestController.signal,
       resultText(context),
     );
+    if (requestController.signal.aborted) return;
     // 질문 전에 Slack으로 내보낸 텍스트가 최종 응답에 중복되지 않도록 비운다.
     context.messages.clear();
     const answers = {};
@@ -266,9 +284,15 @@ async function handleUserInputRequest(server, msg, context) {
     }
     sendServerResponse(server, msg.id, { result: { answers } });
   } catch (error) {
+    if (requestController.signal.aborted) return;
     sendServerResponse(server, msg.id, {
       error: { code: -32000, message: error?.message || '사용자 응답을 받지 못했습니다.' },
     });
+  } finally {
+    context.abortController.signal.removeEventListener('abort', abortRequest);
+    if (context.pendingServerRequests.get(requestId) === requestController) {
+      context.pendingServerRequests.delete(requestId);
+    }
   }
 }
 
@@ -311,9 +335,9 @@ function handleNotification(server, msg) {
   const params = msg.params || {};
 
   if (msg.method === 'account/rateLimits/updated') {
-    server.lastRateLimit = normalizeRateLimit(params.rateLimits);
+    server.lastRateLimit = mergeRateLimit(server.lastRateLimit, params.rateLimits);
     for (const context of server.contextsByThread.values()) {
-      context.lastRateLimit = server.lastRateLimit;
+      context.lastRateLimit = mergeRateLimit(context.lastRateLimit, params.rateLimits);
       context.onProgress?.(context.activities, context.lastUsage, context.lastRateLimit);
     }
     return;
@@ -323,6 +347,12 @@ function handleNotification(server, msg) {
   if (!context) return;
 
   switch (msg.method) {
+    case 'serverRequest/resolved': {
+      const requestId = String(params.requestId);
+      context.pendingServerRequests.get(requestId)?.abort();
+      context.pendingServerRequests.delete(requestId);
+      break;
+    }
     case 'turn/started':
       context.turnId = params.turn?.id || context.turnId;
       break;
@@ -376,6 +406,7 @@ function createDeferredContext(callbacks, approvalPolicy) {
     activities: [],
     activityIndexes: new Map(),
     messages: new Map(),
+    pendingServerRequests: new Map(),
     lastUsage: null,
     lastRateLimit: null,
     abortController: new AbortController(),
@@ -391,12 +422,16 @@ function createDeferredContext(callbacks, approvalPolicy) {
       if (context.settled) return;
       context.settled = true;
       if (context.interruptTimeoutId) clearTimeout(context.interruptTimeoutId);
+      context.abortController.abort();
+      context.pendingServerRequests.clear();
       resolvePromise();
     },
     reject(error) {
       if (context.settled) return;
       context.settled = true;
       if (context.interruptTimeoutId) clearTimeout(context.interruptTimeoutId);
+      context.abortController.abort();
+      context.pendingServerRequests.clear();
       rejectPromise(error);
     },
   };
@@ -415,9 +450,26 @@ function requestInterrupt(server, context) {
     turnId: context.turnId,
   }).then(() => {
     if (!context.settled) {
-      context.interruptTimeoutId = setTimeout(() => context.reject(abortError()), REQUEST_TIMEOUT_MS);
+      context.interruptTimeoutId = setTimeout(() => {
+        server.close();
+        context.reject(abortError());
+      }, REQUEST_TIMEOUT_MS);
     }
-  }).catch(() => context.reject(abortError()));
+  }).catch(() => {
+    server.close();
+    context.reject(abortError());
+  });
+}
+
+async function cleanupTurnStartFailure(server, context, error) {
+  if (context.turnId) {
+    requestInterrupt(server, context);
+    await context.completion.catch(() => {});
+    if (server.child.killed && server.exitPromise) await server.exitPromise;
+  } else if (error?.name === 'CodexRequestTimeoutError') {
+    server.close();
+    if (server.exitPromise) await server.exitPromise;
+  }
 }
 
 async function acquireThreadExecution(server, threadId, context) {
@@ -474,7 +526,10 @@ async function startAppServer() {
         const id = nextId++;
         const timeoutId = setTimeout(() => {
           pending.delete(id);
-          rejectRequest(new Error(`Codex ${method} 요청 시간 초과`));
+          const error = new Error(`Codex ${method} 요청 시간 초과`);
+          error.name = 'CodexRequestTimeoutError';
+          error.requestMethod = method;
+          rejectRequest(error);
         }, REQUEST_TIMEOUT_MS);
         pending.set(id, {
           resolve(value) {
@@ -555,6 +610,7 @@ async function startAppServer() {
       resolveExit(error);
     });
   });
+  server.exitPromise = exitPromise;
 
   try {
     await Promise.race([
@@ -651,7 +707,7 @@ export async function runCodex(sessionKey, prompt, workdir, {
         });
       } catch (error) {
         if (context.aborted) throw abortError();
-        clearSession(sessionKey);
+        clearSessionIfRevision(sessionKey, previousThreadId, sessionRevision);
         throw new Error(`Codex 세션 재개 실패 (${previousThreadId}): ${error.message}\n새 세션으로 다시 시도해주세요.`);
       }
     } else {
@@ -697,6 +753,9 @@ export async function runCodex(sessionKey, prompt, workdir, {
         model: settings.model,
         effort: settings.effort,
       });
+    } catch (error) {
+      await cleanupTurnStartFailure(server, context, error);
+      throw error;
     } finally {
       context.startingTurn = false;
     }

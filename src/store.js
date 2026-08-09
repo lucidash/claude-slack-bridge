@@ -82,6 +82,16 @@ export function clearSession(sessionKey) {
   bumpSessionRevision(sessionKey);
 }
 
+export function clearSessionIfRevision(sessionKey, sessionId, expectedRevision) {
+  if (getSessionRevision(sessionKey) !== expectedRevision) return false;
+  const sessions = readJson(SESSIONS_FILE);
+  if (sessions[sessionKey] !== sessionId) return false;
+  delete sessions[sessionKey];
+  writeJson(SESSIONS_FILE, sessions);
+  bumpSessionRevision(sessionKey);
+  return true;
+}
+
 export function getAllSessions() {
   return readJson(SESSIONS_FILE);
 }

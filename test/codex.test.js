@@ -22,6 +22,9 @@ const activeTurns = new Map();
 const initializeDelayMs = Number(process.env.FAKE_CODEX_INIT_DELAY_MS) || 0;
 const interruptDelayMs = Number(process.env.FAKE_CODEX_INTERRUPT_DELAY_MS) || 0;
 const threadStartDelayMs = Number(process.env.FAKE_CODEX_THREAD_START_DELAY_MS) || 0;
+const threadResumeDelayMs = Number(process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS) || 0;
+const turnStartDelayMs = Number(process.env.FAKE_CODEX_TURN_START_DELAY_MS) || 0;
+const failThreadResume = process.env.FAKE_CODEX_THREAD_RESUME_FAIL === 'true';
 let collisionThreadRead = null;
 
 function sendThreadRead(id, threadId) {
@@ -58,7 +61,7 @@ function complete(turnId, prefix) {
   send({ jsonrpc: '2.0', method: 'thread/tokenUsage/updated', params: {
     threadId, turnId,
     tokenUsage: {
-      total: { totalTokens: 15, inputTokens: 10, cachedInputTokens: 2, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 1 },
+      total: { totalTokens: 115, inputTokens: 110, cachedInputTokens: 12, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 1 },
       last: { totalTokens: 15, inputTokens: 10, cachedInputTokens: 2, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 1 },
       modelContextWindow: 200000,
     },
@@ -99,7 +102,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       break;
     case 'thread/resume':
       resumed = true;
-      send({ jsonrpc: '2.0', id: message.id, result: { thread: { id: message.params.threadId, cwd: message.params.cwd } } });
+      setTimeout(() => {
+        if (failThreadResume) {
+          send({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'resume failed' } });
+        } else {
+          send({ jsonrpc: '2.0', id: message.id, result: { thread: { id: message.params.threadId, cwd: message.params.cwd } } });
+        }
+      }, threadResumeDelayMs);
       break;
     case 'account/rateLimits/read':
       send({ jsonrpc: '2.0', id: message.id, result: { rateLimits: {
@@ -114,7 +123,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         threadId: message.params.threadId,
         prefix: resumed ? 'RESUMED_OK' : 'FAKE_OK',
       });
-      send({ jsonrpc: '2.0', id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [], error: null } } });
+      send({ jsonrpc: '2.0', method: 'turn/started', params: {
+        threadId: message.params.threadId,
+        turn: { id: turnId, status: 'inProgress', items: [], error: null },
+      } });
+      setTimeout(() => {
+        send({ jsonrpc: '2.0', id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [], error: null } } });
+      }, turnStartDelayMs);
       if (prompt.includes('ASK')) {
         pendingQuestionTurnId = turnId;
         send({ jsonrpc: '2.0', id: 900, method: 'item/tool/requestUserInput', params: {
@@ -122,6 +137,24 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           questions: [{ id: 'choice', header: '선택', question: '어느 것?', isOther: false, isSecret: false,
             options: [{ label: '첫 번째', description: '1' }, { label: '두 번째', description: '2' }] }],
         } });
+      } else if (prompt === 'AUTO_RESOLVE_QUESTION') {
+        const requestId = 901;
+        send({ jsonrpc: '2.0', id: requestId, method: 'item/tool/requestUserInput', params: {
+          threadId: message.params.threadId, turnId, itemId: 'question-auto', isBlocking: true,
+          questions: [{ id: 'auto', header: '자동', question: '계속할까요?', isOther: false, isSecret: false,
+            options: [{ label: '계속', description: '계속 진행' }, { label: '중단', description: '중단' }] }],
+        } });
+        setImmediate(() => {
+          send({ jsonrpc: '2.0', method: 'serverRequest/resolved', params: {
+            threadId: message.params.threadId, requestId,
+          } });
+          complete(turnId, 'AUTO_RESOLVED');
+        });
+      } else if (prompt === 'SPARSE_RATE_LIMIT') {
+        send({ jsonrpc: '2.0', method: 'account/rateLimits/updated', params: {
+          rateLimits: { credits: { hasCredits: true, unlimited: false, balance: '10' } },
+        } });
+        setImmediate(() => complete(turnId));
       } else if (prompt.startsWith('DELAY:')) {
         const delayMs = Number(prompt.split(':')[1].split(/\s/)[0]);
         setTimeout(() => complete(turnId), delayMs);
@@ -243,6 +276,31 @@ test('Codex 사용자 질문을 Slack 질문 콜백으로 중계한다', async (
     },
   });
   assert.equal(output.result, 'ASK_OK');
+});
+
+test('서버가 해제한 사용자 질문 waiter를 함께 취소한다', async () => {
+  await shutdownCodexAppServer();
+  let questionAborted = false;
+
+  const output = await runCodex('session-auto-question', 'AUTO_RESOLVE_QUESTION', testDir, {
+    onAskUser: (_questions, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        questionAborted = true;
+        reject(new Error('질문 해제됨'));
+      }, { once: true });
+    }),
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(output.result, 'AUTO_RESOLVED');
+  assert.equal(questionAborted, true);
+});
+
+test('sparse rate-limit 알림이 기존 primary 상태를 지우지 않는다', async () => {
+  await shutdownCodexAppServer();
+  const output = await runCodex('session-sparse-rate-limit', 'SPARSE_RATE_LIMIT', testDir);
+  assert.equal(output.rateLimit?.pct, 23);
+  assert.equal(output.rateLimit?.resetsAt, 2000000000);
 });
 
 test('실행 중인 turn을 turn/interrupt로 중단한다', async () => {
@@ -459,6 +517,69 @@ test('세션 초기화 뒤 늦은 Codex thread 응답이 세션을 되살리지 
   assert.equal(output.result, 'FAKE_OK');
   assert.equal(getSession(sessionKey), undefined);
   assert.equal(readyCount, 0);
+});
+
+test('늦은 resume 실패가 이후 선택한 세션을 삭제하지 않는다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS = '80';
+  process.env.FAKE_CODEX_THREAD_RESUME_FAIL = 'true';
+  const sessionKey = 'session-stale-resume-clear';
+  const traceStart = traceMessages().length;
+  let outcome;
+
+  try {
+    saveSession(sessionKey, 'thread-old');
+    const running = runCodex(sessionKey, 'STALE_RESUME', testDir);
+    await waitForTrace(message => (
+      message.method === 'thread/resume' && message.params.threadId === 'thread-old'
+    ), 1_000, traceStart);
+    saveSession(sessionKey, 'thread-new');
+    outcome = await running.then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+  } finally {
+    delete process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS;
+    delete process.env.FAKE_CODEX_THREAD_RESUME_FAIL;
+    await shutdownCodexAppServer();
+  }
+
+  assert.equal(outcome.status, 'rejected');
+  assert.equal(getSession(sessionKey), 'thread-new');
+});
+
+test('turn/start timeout 뒤 active turn을 terminal까지 정리한다', async () => {
+  await shutdownCodexAppServer();
+  process.env.CODEX_REQUEST_TIMEOUT_MS = '40';
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '120';
+  const traceStart = traceMessages().length;
+  const timedCodex = await import(`../src/codex.js?timeout-cleanup=${Date.now()}`);
+  let outcome;
+
+  try {
+    outcome = await timedCodex.runCodex(
+      'session-turn-start-timeout',
+      'SLOW_TIMEOUT_START',
+      testDir,
+    ).then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+    await new Promise(resolve => setTimeout(resolve, 30));
+  } finally {
+    await timedCodex.shutdownCodexAppServer();
+    delete process.env.CODEX_REQUEST_TIMEOUT_MS;
+    delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  }
+
+  const newTrace = traceMessages().slice(traceStart);
+  const timedOutTurn = newTrace.find(message => turnPrompt(message) === 'SLOW_TIMEOUT_START');
+  assert.equal(outcome.status, 'rejected');
+  assert.ok(timedOutTurn);
+  assert.ok(newTrace.some(message => (
+    message.method === 'turn/interrupt'
+    && message.params.threadId === timedOutTurn.params.threadId
+  )));
 });
 
 test('thread/read 결과를 기존 sync 요약 형식으로 변환한다', async () => {
