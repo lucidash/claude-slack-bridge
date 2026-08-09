@@ -4,6 +4,7 @@ import { slack, fetchThreadHistorySince } from './slack.js';
 import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getAccounts, addAccount, removeAccount, setCurrentAccount, getThreadEngine, setThreadEngine } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { stopCodexQuery } from './codex.js';
+import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
 function formatElapsed(ms) {
@@ -36,20 +37,20 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!wd <path>\` — 이 스레드의 작업 디렉토리 지정
 \`!pwd\` — 현재 작업 디렉토리 확인
 
+*엔진*
+\`!engine\` — 현재 엔진 확인 (claude / pty-claude / codex)
+\`!engine <claude|pty-claude|codex>\` — 이 스레드의 엔진 변경 (세션 초기화됨)
+\`!engine reset\` — 기본값(claude SDK)으로 초기화
+
 *모델*
 \`!model\` — 현재 사용 중인 모델 확인
-\`!model <sonnet|opus|haiku>\` — 이 스레드의 모델 변경
+\`!model <id>\` — 이 스레드의 모델 변경 (Codex 엔진은 임의 모델 ID 허용)
 \`!model reset\` — 기본값으로 초기화
 
 *Effort*
 \`!effort\` — 현재 effort 수준 확인
 \`!effort <low|medium|high|max>\` — 이 스레드의 effort 변경
 \`!effort reset\` — 기본값으로 초기화
-
-*엔진*
-\`!engine\` — 현재 AI 엔진 확인
-\`!engine <claude|codex>\` — 이 스레드의 엔진 변경
-\`!engine reset\` — 기본값(claude)으로 초기화
 
 *실행 제어*
 \`!status\` — 진행 중인 작업 상태 확인 (경과 시간, 도구 사용, 컨텍스트)
@@ -65,7 +66,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 
 *Cron*
 \`!cron\` — 등록된 cron 목록
-\`!cron add "schedule" message [--workdir <path>] [-- 설명]\` — cron 등록
+\`!cron add "schedule" message [--workdir <path>] [--engine <claude|pty-claude|codex>] [-- 설명]\` — cron 등록
 \`!cron remove <id>\` — cron 삭제
 \`!cron pause <id>\` / \`!cron resume <id>\` — 일시정지/재개
 \`!cron run <id>\` — 즉시 실행
@@ -245,6 +246,68 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     return true;
   }
 
+  // engine — 이 스레드에서 사용할 AI 엔진 지정
+  const engineMatch = userMessage.match(/^[!\/]engine(?:\s+(.+))?$/i);
+  if (engineMatch) {
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    const VALID_ENGINES = ['claude', 'pty-claude', 'codex'];
+    const arg = engineMatch[1]?.trim().toLowerCase();
+
+    if (!arg || arg === 'current') {
+      const current = getThreadEngine(effectiveThreadKey) || 'claude';
+      const text = `🛠 현재 엔진: \`${current}\`${current === 'claude' ? ' (SDK 기본값)' : ''}\n변경: \`!engine <claude|pty-claude|codex>\``;
+      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      return true;
+    }
+
+    if (arg === 'reset' || arg === 'default') {
+      setThreadEngine(effectiveThreadKey, null);
+      clearSession(sessionKey);
+      const lock = sessionLocks?.get(sessionKey);
+      if (lock?.queue) lock.queue.length = 0;
+      await slack.chat.postMessage({
+        channel,
+        text: `🔄 엔진을 기본값(\`claude\` SDK)으로 초기화했습니다.\n세션 및 대기 큐가 초기화되었습니다.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    if (!VALID_ENGINES.includes(arg)) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ 알 수 없는 엔진: \`${arg}\`\n사용 가능: \`claude\`, \`pty-claude\`, \`codex\``,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    const prev = getThreadEngine(effectiveThreadKey) || 'claude';
+    if (prev === arg) {
+      await slack.chat.postMessage({
+        channel,
+        text: `🛠 엔진은 이미 \`${arg}\` 입니다.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+
+    setThreadEngine(effectiveThreadKey, arg);
+    // 엔진별 세션 ID가 호환되지 않으므로 세션과 이전 엔진 대상 대기 요청을 함께 비운다.
+    clearSession(sessionKey);
+    const lock = sessionLocks?.get(sessionKey);
+    if (lock?.queue) lock.queue.length = 0;
+    const modelHint = arg === 'codex'
+      ? `\n모델 기본값: \`${process.env.CODEX_MODEL || 'o3'}\` (변경: \`!model <model>\`)`
+      : '';
+    await slack.chat.postMessage({
+      channel,
+      text: `🛠 엔진을 \`${prev}\` → \`${arg}\`로 변경했습니다.\n세션 및 대기 큐가 초기화되었습니다.${modelHint}`,
+      thread_ts: replyThreadTs,
+    });
+    return true;
+  }
+
   // effort — 이 스레드에서 사용할 thinking effort 수준 지정
   const effortMatch = userMessage.match(/^[!\/]effort(?:\s+(.+))?$/i);
   if (effortMatch) {
@@ -285,65 +348,6 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     await slack.chat.postMessage({
       channel,
       text: `⚡ 이 스레드의 effort를 \`${arg}\`로 변경했습니다.`,
-      thread_ts: replyThreadTs,
-    });
-    return true;
-  }
-
-  // engine — 이 스레드에서 사용할 AI 엔진 지정 (claude / codex)
-  const engineMatch = userMessage.match(/^[!\/]engine(?:\s+(.+))?$/i);
-  if (engineMatch) {
-    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
-    const VALID_ENGINES = ['claude', 'codex'];
-    const arg = engineMatch[1]?.trim().toLowerCase();
-
-    if (!arg || arg === 'current') {
-      const threadEngine = getThreadEngine(effectiveThreadKey) || 'claude';
-      const text = `🔧 현재 엔진: \`${threadEngine}\`\n변경: \`!engine <claude|codex>\``;
-      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
-      return true;
-    }
-
-    if (arg === 'reset' || arg === 'default') {
-      setThreadEngine(effectiveThreadKey, null);
-      clearSession(sessionKey);
-      // 대기 큐 비움 (이전 엔진 대상 요청 제거)
-      const lockReset = sessionLocks?.get(sessionKey);
-      if (lockReset?.queue) lockReset.queue.length = 0;
-      await slack.chat.postMessage({
-        channel,
-        text: '🔄 엔진을 기본값으로 초기화했습니다: `claude`\n세션 및 대기 큐가 초기화되었습니다.',
-        thread_ts: replyThreadTs,
-      });
-      return true;
-    }
-
-    if (!VALID_ENGINES.includes(arg)) {
-      await slack.chat.postMessage({
-        channel,
-        text: `❌ 알 수 없는 엔진: \`${arg}\`\n사용 가능: \`claude\`, \`codex\``,
-        thread_ts: replyThreadTs,
-      });
-      return true;
-    }
-
-    const prevEngine = getThreadEngine(effectiveThreadKey) || 'claude';
-    setThreadEngine(effectiveThreadKey, arg);
-    // 엔진 변경 시 세션 초기화 (Claude 세션을 Codex로 resume 불가)
-    let resetNote = '';
-    if (prevEngine !== arg) {
-      clearSession(sessionKey);
-      // 이전 엔진으로 큐잉된 요청이 새 엔진으로 실행되지 않도록 대기 큐 제거
-      const lockSwitch = sessionLocks?.get(sessionKey);
-      if (lockSwitch?.queue) lockSwitch.queue.length = 0;
-      resetNote = '\n세션 및 대기 큐가 초기화되었습니다.';
-    }
-    const modelHint = arg === 'codex'
-      ? `\n모델 기본값: \`${process.env.CODEX_MODEL || 'o3'}\` (변경: \`!model <model>\`)`
-      : '';
-    await slack.chat.postMessage({
-      channel,
-      text: `🔧 이 스레드의 엔진을 \`${arg}\`로 변경했습니다.${resetNote}${modelHint}`,
       thread_ts: replyThreadTs,
     });
     return true;
@@ -443,9 +447,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   // !stop all — 작업 중단 + 큐 비우기
   if (['!stop', '/stop', '!kill', '/kill', '!stop all', '/stop all'].includes(msg)) {
     const clearQueue = msg.endsWith(' all');
-    const effectiveTk = threadKey || `${channel}-${replyThreadTs}`;
-    const engine = getThreadEngine(effectiveTk) || 'claude';
-    const killed = engine === 'codex' ? stopCodexQuery(sessionKey) : stopClaudeQuery(sessionKey);
+    const killed = stopClaudeQuery(sessionKey)
+      || stopClaudePtyQuery(sessionKey)
+      || stopCodexQuery(sessionKey);
     let queueCleared = 0;
     let queueRemaining = 0;
     if (sessionLocks) {
@@ -807,7 +811,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       if (!addMatch) {
         await slack.chat.postMessage({
           channel,
-          text: '사용법: `!cron add "0 9 * * 1-5" /scrum [--workdir ~/projects/likey-backend] [-- 매일 아침 스크럼]`',
+          text: '사용법: `!cron add "0 9 * * 1-5" /scrum [--workdir ~/projects/likey-backend] [--engine <claude|pty-claude|codex>] [-- 매일 아침 스크럼]`',
           thread_ts: replyThreadTs,
         });
         return true;
@@ -815,12 +819,28 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       const schedule = addMatch[1];
       let message = addMatch[2];
 
-      // --workdir <path> 추출 (description 의 `--` 보다 먼저 처리)
+      // --workdir / --engine 추출 (description 의 `--` 보다 먼저 처리)
       let workdir = null;
       const wdMatch = message.match(/\s+--workdir\s+(\S+)/);
       if (wdMatch) {
         workdir = wdMatch[1];
         message = message.replace(/\s+--workdir\s+\S+/, '');
+      }
+
+      let engine = null;
+      const VALID_CRON_ENGINES = ['claude', 'pty-claude', 'codex'];
+      const engMatch = message.match(/\s+--engine\s+(\S+)/);
+      if (engMatch) {
+        engine = engMatch[1].toLowerCase();
+        message = message.replace(/\s+--engine\s+\S+/, '');
+        if (!VALID_CRON_ENGINES.includes(engine)) {
+          await slack.chat.postMessage({
+            channel,
+            text: `❌ 알 수 없는 엔진: \`${engine}\`\n사용 가능: \`claude\`, \`pty-claude\`, \`codex\``,
+            thread_ts: replyThreadTs,
+          });
+          return true;
+        }
       }
 
       // -- description split
@@ -833,11 +853,12 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         message = message.trim();
       }
       try {
-        const job = addCronJob({ schedule, message, channel, userId, description, workdir });
+        const job = addCronJob({ schedule, message, channel, userId, description, workdir, engine });
         const wdLine = job.workdir ? `\n작업 디렉토리: \`${job.workdir}\`` : '';
+        const engLine = job.engine ? `\n엔진: \`${job.engine}\`` : '';
         await slack.chat.postMessage({
           channel,
-          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`${wdLine}\n설명: ${job.description}`,
+          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`${wdLine}${engLine}\n설명: ${job.description}`,
           thread_ts: replyThreadTs,
         });
       } catch (err) {
@@ -979,8 +1000,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         const status = j.enabled ? '✅' : '⏸️';
         const lastRun = j.lastRun ? new Date(j.lastRun).toLocaleString('ko-KR') : '-';
         const wdInfo = j.workdir ? ` | wd: \`${j.workdir}\`` : '';
+        const engInfo = j.engine ? ` | engine: \`${j.engine}\`` : '';
         lines.push(`${status} \`${j.id}\` | \`${j.schedule}\` | ${j.description}`);
-        lines.push(`    명령: \`${j.message}\`${wdInfo} | 마지막 실행: ${lastRun}`);
+        lines.push(`    명령: \`${j.message}\`${wdInfo}${engInfo} | 마지막 실행: ${lastRun}`);
       }
       await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
       return true;
@@ -1007,6 +1029,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       lines.push(`    trigger: ${w.trigger || '(미설정)'}`);
       lines.push(`    action: ${w.action || '(미설정)'}`);
       if (w.anchorChannel) lines.push(`    anchor: \`${w.anchorChannel}\``);
+      if (w.engine) lines.push(`    engine: \`${w.engine}\``);
     }
     await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
     return true;
@@ -1028,7 +1051,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   }
 
   // watch-set <channel_id> <field> <value>
-  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName|anchorChannel)\s+([\s\S]+)$/i);
+  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName|anchorChannel|engine)\s+([\s\S]+)$/i);
   if (watchSetMatch) {
     const [, chId, field, rawValue] = watchSetMatch;
     const existing = getWatch(chId);
@@ -1049,6 +1072,21 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       update.senders = [...new Set([...(existing.senders || []), ...senders])];
     } else if (field === 'enabled') {
       update.enabled = value === 'true' || value === '1';
+    } else if (field === 'engine') {
+      const VALID_WATCH_ENGINES = ['claude', 'pty-claude', 'codex'];
+      const v = value.toLowerCase();
+      if (v === 'reset' || v === 'default' || v === 'null') {
+        update.engine = null;
+      } else if (!VALID_WATCH_ENGINES.includes(v)) {
+        await slack.chat.postMessage({
+          channel,
+          text: `❌ 알 수 없는 엔진: \`${value}\`\n사용 가능: \`claude\`, \`pty-claude\`, \`codex\` (또는 \`reset\`)`,
+          thread_ts: replyThreadTs,
+        });
+        return true;
+      } else {
+        update.engine = v;
+      }
     } else {
       update[field] = value;
     }
