@@ -130,6 +130,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       break;
     case 'turn/start': {
       const prompt = message.params.input?.[0]?.text || '';
+      if (prompt === 'NO_START_SIGNAL') break;
       const turnId = 'turn-' + (++turnSequence);
       activeTurns.set(turnId, {
         threadId: message.params.threadId,
@@ -441,6 +442,45 @@ test('잘못된 Codex 네트워크 설정을 허용으로 승격하지 않는다
   assert.match(networkError?.message || '', /CODEX_NETWORK_ACCESS/);
 });
 
+test('빈 Codex 설정값은 미설정 기본값으로 처리한다', async () => {
+  await shutdownCodexAppServer();
+  const originalSandbox = process.env.CODEX_SANDBOX;
+  const originalApproval = process.env.CODEX_APPROVAL_POLICY;
+  const originalNetworkAccess = process.env.CODEX_NETWORK_ACCESS;
+  const traceStart = traceMessages().length;
+  let defaultOutput;
+  let networkOutput;
+
+  try {
+    process.env.CODEX_SANDBOX = '';
+    process.env.CODEX_APPROVAL_POLICY = '';
+    process.env.CODEX_NETWORK_ACCESS = '';
+    defaultOutput = await runCodex('session-empty-settings-default', 'EMPTY_SETTINGS_DEFAULT', testDir);
+
+    process.env.CODEX_SANDBOX = 'read-only';
+    networkOutput = await runCodex('session-empty-settings-network', 'EMPTY_SETTINGS_NETWORK', testDir);
+  } finally {
+    if (originalSandbox == null) delete process.env.CODEX_SANDBOX;
+    else process.env.CODEX_SANDBOX = originalSandbox;
+    if (originalApproval == null) delete process.env.CODEX_APPROVAL_POLICY;
+    else process.env.CODEX_APPROVAL_POLICY = originalApproval;
+    if (originalNetworkAccess == null) delete process.env.CODEX_NETWORK_ACCESS;
+    else process.env.CODEX_NETWORK_ACCESS = originalNetworkAccess;
+    await shutdownCodexAppServer();
+  }
+
+  const newTrace = traceMessages().slice(traceStart);
+  const defaultThreadStart = newTrace.find(message => (
+    message.method === 'thread/start' && message.params.model == null
+  ));
+  const networkTurnStart = newTrace.find(message => turnPrompt(message) === 'EMPTY_SETTINGS_NETWORK');
+  assert.equal(defaultOutput.result, 'FAKE_OK');
+  assert.equal(networkOutput.result, 'FAKE_OK');
+  assert.equal(defaultThreadStart?.params.sandbox, 'danger-full-access');
+  assert.equal(defaultThreadStart?.params.approvalPolicy, 'never');
+  assert.equal(networkTurnStart?.params.sandboxPolicy?.networkAccess, true);
+});
+
 test('App Server 초기화 중인 실행도 중단할 수 있다', async () => {
   await shutdownCodexAppServer();
   process.env.FAKE_CODEX_INIT_DELAY_MS = '120';
@@ -705,6 +745,57 @@ test('turn/start timeout 뒤 active turn을 terminal까지 정리한다', async 
     message.method === 'turn/interrupt'
     && message.params.threadId === timedOutTurn.params.threadId
   )));
+});
+
+test('turn/start 신호가 모두 유실돼도 thread 실행권을 회수한다', async () => {
+  await shutdownCodexAppServer();
+  process.env.CODEX_REQUEST_TIMEOUT_MS = '500';
+  const timedCodex = await import(`../src/codex.js?timeout-no-signal=${Date.now()}`);
+  const traceStart = traceMessages().length;
+  saveSession('session-timeout-other', 'thread-timeout-other');
+  saveSession('session-timeout-stuck', 'thread-timeout-stuck');
+  let otherRun;
+  let retry;
+  let firstOutcome;
+  let retryOutcome;
+
+  try {
+    otherRun = timedCodex.runCodex('session-timeout-other', 'SLOW_TIMEOUT_OTHER', testDir);
+    await waitForTrace(message => turnPrompt(message) === 'SLOW_TIMEOUT_OTHER', 1_000, traceStart);
+
+    firstOutcome = await timedCodex.runCodex(
+      'session-timeout-stuck',
+      'NO_START_SIGNAL',
+      testDir,
+    ).then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+
+    retry = timedCodex.runCodex(
+      'session-timeout-stuck',
+      'AFTER_NO_START_SIGNAL',
+      testDir,
+    ).then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+    retryOutcome = await Promise.race([
+      retry,
+      new Promise(resolve => setTimeout(() => resolve({ status: 'timeout' }), 1_300)),
+    ]);
+  } finally {
+    timedCodex.stopCodexQuery('session-timeout-other');
+    timedCodex.stopCodexQuery('session-timeout-stuck');
+    await timedCodex.shutdownCodexAppServer();
+    await Promise.allSettled([otherRun, retry].filter(Boolean));
+    delete process.env.CODEX_REQUEST_TIMEOUT_MS;
+  }
+
+  assert.equal(firstOutcome.status, 'rejected');
+  assert.match(firstOutcome.error.message, /turn\/start 요청 시간 초과/);
+  assert.equal(retryOutcome.status, 'fulfilled');
+  assert.equal(retryOutcome.value.result, 'RESUMED_OK');
 });
 
 test('fatal error 뒤 terminal 알림까지 같은 thread 실행권을 유지한다', async () => {

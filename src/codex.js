@@ -59,7 +59,7 @@ function runtimeRoots(workdir) {
 
 function validatedChoice(name, fallback, validValues) {
   const configured = process.env[name];
-  if (configured == null) return fallback;
+  if (configured == null || configured.trim() === '') return fallback;
   const value = configured.trim().toLowerCase();
   if (!validValues.has(value)) {
     throw new Error(`${name} 값이 올바르지 않습니다: ${configured}. 허용값: ${[...validValues].join(', ')}`);
@@ -69,7 +69,7 @@ function validatedChoice(name, fallback, validValues) {
 
 function validatedBoolean(name, fallback) {
   const configured = process.env[name];
-  if (configured == null) return fallback;
+  if (configured == null || configured.trim() === '') return fallback;
   const value = configured.trim().toLowerCase();
   if (value !== 'true' && value !== 'false') {
     throw new Error(`${name} 값이 올바르지 않습니다: ${configured}. 허용값: true, false`);
@@ -428,17 +428,26 @@ function createDeferredContext(callbacks, approvalPolicy) {
     terminalObserved: false,
     deferCleanupUntilTerminal: false,
     terminalCleanup: null,
+    terminalCleanupTimeoutId: null,
     completion,
     markTerminal() {
       if (context.terminalObserved) return;
       context.terminalObserved = true;
+      if (context.terminalCleanupTimeoutId) clearTimeout(context.terminalCleanupTimeoutId);
+      context.terminalCleanupTimeoutId = null;
       const cleanup = context.terminalCleanup;
       context.terminalCleanup = null;
       cleanup?.();
     },
     cleanupAfterTerminal(cleanup) {
-      if (context.terminalObserved) cleanup();
-      else context.terminalCleanup = cleanup;
+      if (context.terminalObserved) {
+        cleanup();
+        return;
+      }
+      context.terminalCleanup = cleanup;
+      context.terminalCleanupTimeoutId = setTimeout(() => {
+        context.markTerminal();
+      }, REQUEST_TIMEOUT_MS);
     },
     resolve() {
       if (context.settled) return;
