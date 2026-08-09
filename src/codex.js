@@ -323,7 +323,7 @@ function finishContext(context, turn) {
   if (context.settled) return;
   const status = turn?.status || 'completed';
   if (status === 'failed') {
-    context.reject(new Error(turn?.error?.message || 'Codex turn 실패'));
+    context.reject(context.lastError || new Error(turn?.error?.message || 'Codex turn 실패'));
   } else if (status === 'interrupted' || context.aborted) {
     context.reject(new Error('중단됨 (사용자 요청)'));
   } else {
@@ -380,7 +380,7 @@ function handleNotification(server, msg) {
       context.onProgress?.(context.activities, context.lastUsage, context.lastRateLimit);
       break;
     case 'error':
-      if (!params.willRetry) context.reject(new Error(params.error?.message || 'Codex 오류'));
+      if (!params.willRetry) context.lastError = new Error(params.error?.message || 'Codex 오류');
       break;
     case 'turn/failed':
       context.reject(new Error(params.error?.message || params.turn?.error?.message || 'Codex turn 실패'));
@@ -409,6 +409,7 @@ function createDeferredContext(callbacks, approvalPolicy) {
     pendingServerRequests: new Map(),
     lastUsage: null,
     lastRateLimit: null,
+    lastError: null,
     abortController: new AbortController(),
     threadId: null,
     turnId: null,

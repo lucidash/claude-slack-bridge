@@ -24,6 +24,7 @@ const interruptDelayMs = Number(process.env.FAKE_CODEX_INTERRUPT_DELAY_MS) || 0;
 const threadStartDelayMs = Number(process.env.FAKE_CODEX_THREAD_START_DELAY_MS) || 0;
 const threadResumeDelayMs = Number(process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS) || 0;
 const turnStartDelayMs = Number(process.env.FAKE_CODEX_TURN_START_DELAY_MS) || 0;
+const fatalTerminalDelayMs = Number(process.env.FAKE_CODEX_FATAL_TERMINAL_DELAY_MS) || 0;
 const failThreadResume = process.env.FAKE_CODEX_THREAD_RESUME_FAIL === 'true';
 let collisionThreadRead = null;
 
@@ -155,6 +156,18 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           rateLimits: { credits: { hasCredits: true, unlimited: false, balance: '10' } },
         } });
         setImmediate(() => complete(turnId));
+      } else if (prompt === 'FATAL_DELAY') {
+        send({ jsonrpc: '2.0', method: 'error', params: {
+          threadId: message.params.threadId, turnId,
+          error: { message: 'fatal turn error' }, willRetry: false,
+        } });
+        setTimeout(() => {
+          send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+            threadId: message.params.threadId,
+            turn: { id: turnId, status: 'failed', items: [], error: { message: 'fatal turn error' } },
+          } });
+          activeTurns.delete(turnId);
+        }, fatalTerminalDelayMs);
       } else if (prompt.startsWith('DELAY:')) {
         const delayMs = Number(prompt.split(':')[1].split(/\s/)[0]);
         setTimeout(() => complete(turnId), delayMs);
@@ -580,6 +593,36 @@ test('turn/start timeout 뒤 active turn을 terminal까지 정리한다', async 
     message.method === 'turn/interrupt'
     && message.params.threadId === timedOutTurn.params.threadId
   )));
+});
+
+test('fatal error 뒤 terminal 알림까지 같은 thread 실행권을 유지한다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_FATAL_TERMINAL_DELAY_MS = '120';
+  saveSession('session-fatal-a', 'thread-fatal');
+  saveSession('session-fatal-b', 'thread-fatal');
+  const traceStart = traceMessages().length;
+  let firstObserved;
+  let secondObserved;
+  let secondStartedEarly;
+
+  try {
+    firstObserved = runCodex('session-fatal-a', 'FATAL_DELAY', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await waitForTrace(message => turnPrompt(message) === 'FATAL_DELAY', 1_000, traceStart);
+    secondObserved = runCodex('session-fatal-b', 'AFTER_FATAL', testDir)
+      .then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    secondStartedEarly = traceMessages().slice(traceStart)
+      .some(message => turnPrompt(message) === 'AFTER_FATAL');
+  } finally {
+    delete process.env.FAKE_CODEX_FATAL_TERMINAL_DELAY_MS;
+  }
+
+  const [firstOutcome, secondOutcome] = await Promise.all([firstObserved, secondObserved]);
+  assert.equal(secondStartedEarly, false);
+  assert.equal(firstOutcome.status, 'rejected');
+  assert.match(firstOutcome.error.message, /fatal turn error/);
+  assert.equal(secondOutcome.status, 'fulfilled');
 });
 
 test('thread/read 결과를 기존 sync 요약 형식으로 변환한다', async () => {

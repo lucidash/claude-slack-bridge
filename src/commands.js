@@ -987,11 +987,13 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       }
       const job = runCronJobNow(id, {
         onStart: ({ sessionId }) => {
-          const effectiveTk = threadKey || `${channel}-${replyThreadTs}`;
-          const workdir = getThreadWorkdir(effectiveTk) || getWorkdir(userId) || '~';
+          const workdir = job.workdir || getWorkdir(job.userId) || '~';
+          const resumeCommand = job.engine === 'codex'
+            ? `codex resume ${sessionId}`
+            : `claude --resume ${sessionId}`;
           slack.chat.postMessage({
             channel,
-            text: `🔗 Session: \`${sessionId}\`\n\`\`\`cd ${workdir} && claude --resume ${sessionId}\`\`\``,
+            text: `🔗 Session: \`${sessionId}\`\n\`\`\`cd ${workdir} && ${resumeCommand}\`\`\``,
             thread_ts: replyThreadTs,
           }).catch(() => {});
         },
