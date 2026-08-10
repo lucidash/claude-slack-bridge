@@ -33,9 +33,16 @@ import {
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { runClaudeViaPty } from './claude-pty.js';
+import { readCodexSessionSummary, runCodex } from './codex.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
+import {
+  assertQuestionActive,
+  formatUserMessageForLog,
+  waitForUserAnswer,
+} from './user-question.js';
+import { formatRateLimitWindow } from './rate-limit.js';
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -151,8 +158,9 @@ async function handleSlackEvent(event) {
   const channel = event.channel;
   const replyThreadTs = event.thread_ts || event.ts;
   const sessionKey = `${userId}-${replyThreadTs}`;
+  const pending = pendingQuestions.get(sessionKey);
 
-  console.log(`[Slack] Message from ${userId} (session: ${sessionKey}): ${userMessage.substring(0, 50)}...`);
+  console.log(`[Slack] Message from ${userId} (session: ${sessionKey}): ${formatUserMessageForLog(userMessage, pending?.questions)}...`);
 
   // 특수 명령어 처리
   const handled = await handleCommand(userMessage, { channel, replyThreadTs, sessionKey, userId, threadKey, sessionLocks });
@@ -167,13 +175,12 @@ async function handleSlackEvent(event) {
   }
 
   // AskUserQuestion 대기 중인 질문이 있으면 답변으로 처리
-  const pending = pendingQuestions.get(sessionKey);
   if (pending) {
     const answers = parseUserAnswer(userMessage, pending.questions);
     clearTimeout(pending.timeoutId);
     pending.resolve(answers);
     pendingQuestions.delete(sessionKey);
-    console.log(`[AskUser] Answer received for ${sessionKey}: ${userMessage.substring(0, 50)}`);
+    console.log(`[AskUser] Answer received for ${sessionKey}: ${formatUserMessageForLog(userMessage, pending.questions)}`);
     try {
       await slack.reactions.add({ channel, name: 'white_check_mark', timestamp: event.ts });
     } catch { /* ignore */ }
@@ -370,7 +377,7 @@ function formatRateLimit(rl) {
       reset = h > 0 ? ` ${h}h${m}m` : ` ${m}m`;
     }
   }
-  return ` | 5h: ${rl.pct}%${reset}`;
+  return ` | ${formatRateLimitWindow(rl.windowDurationMins)}: ${rl.pct}%${reset}`;
 }
 
 async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false, anchorChannel = null }) {
@@ -499,54 +506,54 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
 
     // AskUserQuestion 콜백 (silent 모드에서는 비활성 — DM으로 질문받을 수 없으므로)
     const onAskUser = silent ? undefined : async (questions, signal, pendingText) => {
+      assertQuestionActive(signal);
       if (pendingText) {
         const maxLen = 3900;
         const contextText = pendingText.length > maxLen
           ? pendingText.substring(0, maxLen) + '\n\n... (truncated)'
           : pendingText;
         await slack.chat.postMessage({ channel, text: contextText, thread_ts: replyThreadTs });
+        assertQuestionActive(signal);
         console.log(`[AskUser] Flushed ${pendingText.length} chars of pending text`);
       }
       const text = formatAskUserQuestion(questions);
       await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+      assertQuestionActive(signal);
       console.log(`[AskUser] Question posted to ${channel}, waiting for answer...`);
 
-      return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          pendingQuestions.delete(sessionKey);
-          reject(new Error('AskUserQuestion 응답 시간 초과 (5분)'));
-        }, 5 * 60 * 1000);
-
-        if (signal) {
-          signal.addEventListener('abort', () => {
-            clearTimeout(timeoutId);
-            pendingQuestions.delete(sessionKey);
-            reject(new Error('중단됨'));
-          }, { once: true });
-        }
-
-        pendingQuestions.set(sessionKey, { resolve, reject, questions, timeoutId });
-      });
+      return waitForUserAnswer({ pendingQuestions, sessionKey, questions, signal });
     };
+
+    // 엔진 결정 (claude / pty-claude / codex)
+    const engine = getThreadEngine(effectiveThreadKey) || 'claude';
+    const isCodex = engine === 'codex';
 
     // 새 세션이면 세션 ID를 게시 (silent이면 DM에, DM 실패 시 생략)
     const onSessionReady = isNewSession ? (sid) => {
       if (silent && !logChannel) return; // DM 실패 시 원본 채널에 노출하지 않음
       const target = silent ? logChannel : channel;
       const targetTs = silent ? logThreadTs : replyThreadTs;
+      const resumeCmd = isCodex
+        ? `cd ${workdir || '~'} && codex resume ${sid}`
+        : `cd ${workdir || '~'} && claude --resume ${sid}`;
+      const engineLabel = isCodex ? '🟢 Codex' : '🔗';
       slack.chat.postMessage({
         channel: target,
-        text: `🔗 Session: \`${sid}\`\n\`\`\`cd ${workdir || '~'} && claude --resume ${sid}\`\`\``,
+        text: `${engineLabel} Session: \`${sid}\`\n\`\`\`${resumeCmd}\`\`\``,
         thread_ts: targetTs,
       }).catch(err => console.error('[Slack] Failed to post session ID:', err.message));
     } : undefined;
 
     const threadModel = getThreadModel(effectiveThreadKey);
     const threadEffort = getThreadEffort(effectiveThreadKey);
-    const engine = getThreadEngine(effectiveThreadKey) || 'claude';
 
     let result, usage, rateLimit;
-    if (engine === 'pty-claude') {
+    if (isCodex) {
+      ({ result, usage, rateLimit } = await runCodex(sessionKey, fullPrompt, workdir, {
+        onProgress, onAskUser, onSessionReady,
+        model: threadModel || undefined, effort: threadEffort || undefined,
+      }));
+    } else if (engine === 'pty-claude') {
       // pty 엔진은 AskUserQuestion / rate-limit 헤더 미지원 (Claude Code TUI 한계)
       ({ result, usage, rateLimit } = await runClaudeViaPty(sessionKey, fullPrompt, workdir, {
         onProgress, onSessionReady,
@@ -606,13 +613,15 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     try {
       const sid = getSession(sessionKey);
       if (sid) {
-        const summary = readSessionSummary(sid);
+        const summary = isCodex
+          ? await readCodexSessionSummary(sid).catch(() => null)
+          : readSessionSummary(sid);
         if (summary) saveSyncPoint(sid, summary.turns.length);
       }
     } catch { /* ignore */ }
 
   } catch (err) {
-    console.error('[Claude] Error:', err.message);
+    console.error('[Engine] Error:', err.message);
     clearTimeout(updateTimer);
 
     // 대기 중인 AskUserQuestion 정리
@@ -655,8 +664,10 @@ function formatAskUserQuestion(questions) {
   const parts = [];
   for (const q of questions) {
     const multiLabel = q.multiSelect ? ' (복수 선택 가능)' : '';
-    parts.push(`🔔 Claude가 질문합니다${multiLabel}:\n\n*${q.question}*`);
-    q.options.forEach((opt, i) => {
+    const provider = q.provider || 'Claude';
+    const secretLabel = q.isSecret ? '\n🔒 민감한 응답일 수 있으니 Slack 채널 공개 범위를 확인해주세요.' : '';
+    parts.push(`🔔 ${provider}가 질문합니다${multiLabel}:\n\n*${q.question}*${secretLabel}`);
+    (q.options || []).forEach((opt, i) => {
       const emoji = NUMBER_EMOJI[i] || `${i + 1}.`;
       parts.push(`${emoji} ${opt.label} — ${opt.description}`);
       // markdown 프리뷰 (코멘트 내용 등)를 표시
@@ -664,7 +675,9 @@ function formatAskUserQuestion(questions) {
         parts.push(`\`\`\`\n${opt.markdown}\n\`\`\``);
       }
     });
-    if (q.multiSelect) {
+    if (!q.options?.length) {
+      parts.push('\n답변을 자유롭게 입력해주세요.');
+    } else if (q.multiSelect) {
       parts.push('\n콤마로 구분하여 답해주세요 (예: 1,3)');
     } else {
       parts.push('\n숫자 또는 옵션명으로 답해주세요.');
@@ -685,19 +698,19 @@ function parseUserAnswer(userMessage, questions) {
       const selections = answer.split(/[,，]/).map(s => s.trim());
       const labels = selections.map(s => {
         const num = parseInt(s);
-        if (!isNaN(num) && num >= 1 && num <= q.options.length) {
+        if (!isNaN(num) && num >= 1 && num <= (q.options || []).length) {
           return q.options[num - 1].label;
         }
-        const match = q.options.find(o => o.label.toLowerCase() === s.toLowerCase());
+        const match = (q.options || []).find(o => o.label.toLowerCase() === s.toLowerCase());
         return match ? match.label : s;
       });
       answers[q.question] = labels.join(', ');
     } else {
       const num = parseInt(answer);
-      if (!isNaN(num) && num >= 1 && num <= q.options.length) {
+      if (!isNaN(num) && num >= 1 && num <= (q.options || []).length) {
         answers[q.question] = q.options[num - 1].label;
       } else {
-        const match = q.options.find(o => o.label.toLowerCase() === answer.toLowerCase());
+        const match = (q.options || []).find(o => o.label.toLowerCase() === answer.toLowerCase());
         answers[q.question] = match ? match.label : answer;
       }
     }

@@ -1,8 +1,10 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, chmodSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { homedir } from 'os';
 
-const BRIDGE_DIR = join(homedir(), '.claude', 'slack-bridge');
+const BRIDGE_DIR = process.env.BRIDGE_DATA_DIR
+  ? resolve(process.env.BRIDGE_DATA_DIR.replace(/^~(?=\/|$)/, homedir()))
+  : join(homedir(), '.claude', 'slack-bridge');
 const SESSIONS_FILE = join(BRIDGE_DIR, 'sessions.json');
 const THREADS_FILE = join(BRIDGE_DIR, 'threads.json');
 const WORKDIRS_FILE = join(BRIDGE_DIR, 'workdirs.json');
@@ -13,6 +15,7 @@ const SYNC_POINTS_FILE = join(BRIDGE_DIR, 'sync-points.json');
 const WATCHES_FILE = join(BRIDGE_DIR, 'watches.json');
 const PROCESSING_FILE = join(BRIDGE_DIR, 'processing.json');
 const ACCOUNTS_FILE = join(BRIDGE_DIR, 'accounts.json');
+const sessionRevisions = new Map();
 
 // 디렉토리 및 파일 초기화
 if (!existsSync(BRIDGE_DIR)) mkdirSync(BRIDGE_DIR, { recursive: true });
@@ -47,6 +50,14 @@ function writeSecretJson(file, data) {
 }
 
 // 세션 관리 (스레드 단위)
+export function getSessionRevision(sessionKey) {
+  return sessionRevisions.get(sessionKey) || 0;
+}
+
+function bumpSessionRevision(sessionKey) {
+  sessionRevisions.set(sessionKey, getSessionRevision(sessionKey) + 1);
+}
+
 export function getSession(sessionKey) {
   return readJson(SESSIONS_FILE)[sessionKey];
 }
@@ -55,12 +66,30 @@ export function saveSession(sessionKey, sessionId) {
   const sessions = readJson(SESSIONS_FILE);
   sessions[sessionKey] = sessionId;
   writeJson(SESSIONS_FILE, sessions);
+  bumpSessionRevision(sessionKey);
+}
+
+export function saveSessionIfRevision(sessionKey, sessionId, expectedRevision) {
+  if (getSessionRevision(sessionKey) !== expectedRevision) return false;
+  saveSession(sessionKey, sessionId);
+  return true;
 }
 
 export function clearSession(sessionKey) {
   const sessions = readJson(SESSIONS_FILE);
   delete sessions[sessionKey];
   writeJson(SESSIONS_FILE, sessions);
+  bumpSessionRevision(sessionKey);
+}
+
+export function clearSessionIfRevision(sessionKey, sessionId, expectedRevision) {
+  if (getSessionRevision(sessionKey) !== expectedRevision) return false;
+  const sessions = readJson(SESSIONS_FILE);
+  if (sessions[sessionKey] !== sessionId) return false;
+  delete sessions[sessionKey];
+  writeJson(SESSIONS_FILE, sessions);
+  bumpSessionRevision(sessionKey);
+  return true;
 }
 
 export function getAllSessions() {
@@ -81,7 +110,12 @@ export function saveWorkdir(userId, dir) {
 // 스레드 관리
 export function saveThread(threadKey, userId, workdir = null) {
   const threads = readJson(THREADS_FILE);
-  const data = { userId, createdAt: new Date().toISOString() };
+  const existing = threads[threadKey] || {};
+  const data = {
+    ...existing,
+    userId: userId || existing.userId,
+    createdAt: existing.createdAt || new Date().toISOString(),
+  };
   if (workdir) data.workdir = workdir;
   threads[threadKey] = data;
   writeJson(THREADS_FILE, threads);
@@ -109,6 +143,21 @@ export function setThreadSilent(threadKey, silent = true) {
 
 export function isThreadSilent(threadKey) {
   return readJson(THREADS_FILE)[threadKey]?.silent || false;
+}
+
+export function setThreadEngine(threadKey, engine) {
+  const threads = readJson(THREADS_FILE);
+  if (!threads[threadKey]) threads[threadKey] = {};
+  if (engine) {
+    threads[threadKey].engine = engine;
+  } else {
+    delete threads[threadKey].engine;
+  }
+  writeJson(THREADS_FILE, threads);
+}
+
+export function getThreadEngine(threadKey) {
+  return readJson(THREADS_FILE)[threadKey]?.engine || null;
 }
 
 export function setThreadModel(threadKey, model) {
@@ -139,21 +188,6 @@ export function setThreadEffort(threadKey, effort) {
 
 export function getThreadEffort(threadKey) {
   return readJson(THREADS_FILE)[threadKey]?.effort || null;
-}
-
-export function setThreadEngine(threadKey, engine) {
-  const threads = readJson(THREADS_FILE);
-  if (!threads[threadKey]) threads[threadKey] = {};
-  if (engine) {
-    threads[threadKey].engine = engine;
-  } else {
-    delete threads[threadKey].engine;
-  }
-  writeJson(THREADS_FILE, threads);
-}
-
-export function getThreadEngine(threadKey) {
-  return readJson(THREADS_FILE)[threadKey]?.engine || null;
 }
 
 export function archiveThread(threadKey, splitTo) {
