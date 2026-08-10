@@ -18,6 +18,7 @@ const record = value => fs.appendFileSync(trace, JSON.stringify(value) + '\\n');
 let resumed = false;
 let turnSequence = 0;
 let pendingQuestionTurnId = null;
+let orphanedTurn = null;
 const activeTurns = new Map();
 const initializeDelayMs = Number(process.env.FAKE_CODEX_INIT_DELAY_MS) || 0;
 const interruptDelayMs = Number(process.env.FAKE_CODEX_INTERRUPT_DELAY_MS) || 0;
@@ -100,6 +101,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     pendingQuestionTurnId = null;
     return;
   }
+  if (message.id === 903 && Object.hasOwn(message, 'result')) {
+    const answers = message.result?.answers?.comma?.answers;
+    complete(
+      pendingQuestionTurnId,
+      answers?.length === 1 && answers[0] === '네, 계속 진행합니다' ? 'COMMA_OPTION_OK' : 'COMMA_OPTION_BAD',
+    );
+    pendingQuestionTurnId = null;
+    return;
+  }
   if (message.id == null) return;
 
   switch (message.method) {
@@ -131,6 +141,41 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     case 'turn/start': {
       const prompt = message.params.input?.[0]?.text || '';
       if (prompt === 'NO_START_SIGNAL') break;
+      if (prompt === 'ORPHAN_FIRST') {
+        const turnId = 'turn-' + (++turnSequence);
+        orphanedTurn = { turnId, threadId: message.params.threadId };
+        activeTurns.set(turnId, {
+          threadId: message.params.threadId,
+          prefix: 'ORPHANED',
+        });
+        break;
+      }
+      if (prompt === 'AFTER_ORPHAN' && orphanedTurn) {
+        const abandoned = orphanedTurn;
+        setImmediate(() => {
+          send({ jsonrpc: '2.0', method: 'turn/completed', params: {
+            threadId: abandoned.threadId,
+            turn: { id: abandoned.turnId, status: 'completed', items: [], error: null },
+          } });
+          activeTurns.delete(abandoned.turnId);
+          orphanedTurn = null;
+
+          const turnId = 'turn-' + (++turnSequence);
+          activeTurns.set(turnId, {
+            threadId: message.params.threadId,
+            prefix: 'AFTER_ORPHAN_OK',
+          });
+          send({ jsonrpc: '2.0', method: 'turn/started', params: {
+            threadId: message.params.threadId,
+            turn: { id: turnId, status: 'inProgress', items: [], error: null },
+          } });
+          send({ jsonrpc: '2.0', id: message.id, result: {
+            turn: { id: turnId, status: 'inProgress', items: [], error: null },
+          } });
+          setImmediate(() => complete(turnId));
+        });
+        break;
+      }
       const turnId = 'turn-' + (++turnSequence);
       activeTurns.set(turnId, {
         threadId: message.params.threadId,
@@ -156,6 +201,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           threadId: message.params.threadId, turnId, itemId: 'question-free', isBlocking: true,
           questions: [{ id: 'free', header: '입력', question: '자유 입력', isOther: false, isSecret: false,
             options: null }],
+        } });
+      } else if (prompt === 'COMMA_OPTION') {
+        pendingQuestionTurnId = turnId;
+        send({ jsonrpc: '2.0', id: 903, method: 'item/tool/requestUserInput', params: {
+          threadId: message.params.threadId, turnId, itemId: 'question-comma', isBlocking: true,
+          questions: [{ id: 'comma', header: '확인', question: '계속할까요?', isOther: false, isSecret: false,
+            options: [{ label: '네, 계속 진행합니다', description: '계속 진행' }] }],
         } });
       } else if (prompt === 'AUTO_RESOLVE_QUESTION') {
         const requestId = 901;
@@ -329,6 +381,13 @@ test('옵션 없는 Codex 질문의 자유 입력을 하나의 답변으로 전�
     onAskUser: async () => ({ '자유 입력': '네, 진행해주세요' }),
   });
   assert.equal(output.result, 'FREE_TEXT_OK');
+});
+
+test('쉼표가 포함된 Codex 옵션 라벨을 하나의 답변으로 전달한다', async () => {
+  const output = await runCodex('session-comma-option', 'COMMA_OPTION', testDir, {
+    onAskUser: async () => ({ '계속할까요?': '네, 계속 진행합니다' }),
+  });
+  assert.equal(output.result, 'COMMA_OPTION_OK');
 });
 
 test('서버가 해제한 사용자 질문 waiter를 함께 취소한다', async () => {
@@ -796,6 +855,57 @@ test('turn/start 신호가 모두 유실돼도 thread 실행권을 회수한다'
   assert.match(firstOutcome.error.message, /turn\/start 요청 시간 초과/);
   assert.equal(retryOutcome.status, 'fulfilled');
   assert.equal(retryOutcome.value.result, 'RESUMED_OK');
+});
+
+test('강제 정리된 turn의 늦은 완료를 같은 thread 재시도가 흡수하지 않는다', async () => {
+  await shutdownCodexAppServer();
+  process.env.CODEX_REQUEST_TIMEOUT_MS = '500';
+  const timedCodex = await import(`../src/codex.js?orphan-turn=${Date.now()}`);
+  const traceStart = traceMessages().length;
+  saveSession('session-orphan-other', 'thread-orphan-other');
+  saveSession('session-orphan-stuck', 'thread-orphan-stuck');
+  let otherRun;
+  let retry;
+  let firstOutcome;
+  let retryOutcome;
+
+  try {
+    otherRun = timedCodex.runCodex('session-orphan-other', 'SLOW_ORPHAN_OTHER', testDir);
+    await waitForTrace(message => turnPrompt(message) === 'SLOW_ORPHAN_OTHER', 1_000, traceStart);
+
+    firstOutcome = await timedCodex.runCodex(
+      'session-orphan-stuck',
+      'ORPHAN_FIRST',
+      testDir,
+    ).then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+
+    retry = timedCodex.runCodex(
+      'session-orphan-stuck',
+      'AFTER_ORPHAN',
+      testDir,
+    ).then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+    retryOutcome = await Promise.race([
+      retry,
+      new Promise(resolve => setTimeout(() => resolve({ status: 'timeout' }), 1_800)),
+    ]);
+  } finally {
+    timedCodex.stopCodexQuery('session-orphan-other');
+    timedCodex.stopCodexQuery('session-orphan-stuck');
+    await timedCodex.shutdownCodexAppServer();
+    await Promise.allSettled([otherRun, retry].filter(Boolean));
+    delete process.env.CODEX_REQUEST_TIMEOUT_MS;
+  }
+
+  assert.equal(firstOutcome.status, 'rejected');
+  assert.match(firstOutcome.error.message, /turn\/start 요청 시간 초과/);
+  assert.equal(retryOutcome.status, 'fulfilled');
+  assert.equal(retryOutcome.value.result, 'AFTER_ORPHAN_OK');
 });
 
 test('fatal error 뒤 terminal 알림까지 같은 thread 실행권을 유지한다', async () => {

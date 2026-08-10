@@ -220,8 +220,42 @@ function contextForMessage(server, params) {
   const threadId = params?.threadId || params?.conversationId;
   const context = threadId ? server.contextsByThread.get(threadId) : null;
   const turnId = params?.turnId || params?.turn?.id;
+  if (
+    context
+    && !context.turnId
+    && turnId
+    && server.abandonedThreads.has(threadId)
+  ) return null;
   if (context?.turnId && turnId && context.turnId !== turnId) return null;
   return context;
+}
+
+function deferAbandonedTurnMessage(server, msg) {
+  const params = msg.params || {};
+  const threadId = params.threadId || params.conversationId;
+  const turnId = params.turnId || params.turn?.id;
+  const context = threadId ? server.contextsByThread.get(threadId) : null;
+  if (
+    !context
+    || context.turnId
+    || !turnId
+    || !server.abandonedThreads.has(threadId)
+  ) return false;
+
+  const messages = server.deferredTurnMessages.get(threadId) || [];
+  messages.push(msg);
+  server.deferredTurnMessages.set(threadId, messages);
+  return true;
+}
+
+function flushDeferredTurnMessages(server, threadId) {
+  const messages = server.deferredTurnMessages.get(threadId) || [];
+  server.deferredTurnMessages.delete(threadId);
+  server.abandonedThreads.delete(threadId);
+  for (const msg of messages) {
+    if (msg.id != null && msg.method) handleServerRequest(server, msg);
+    else handleNotification(server, msg);
+  }
 }
 
 function sendServerResponse(server, id, payload) {
@@ -279,12 +313,9 @@ async function handleUserInputRequest(server, msg, context) {
     const answers = {};
     for (const question of questions) {
       const answer = answerMap?.[question.question];
+      const answerText = answer == null ? '' : String(answer).trim();
       answers[question.codexId] = {
-        answers: answer == null || answer === ''
-          ? []
-          : question.options.length > 0
-            ? String(answer).split(/[,，]/).map(value => value.trim()).filter(Boolean)
-            : [String(answer).trim()],
+        answers: answerText === '' ? [] : [answerText],
       };
     }
     sendServerResponse(server, msg.id, { result: { answers } });
@@ -429,6 +460,7 @@ function createDeferredContext(callbacks, approvalPolicy) {
     deferCleanupUntilTerminal: false,
     terminalCleanup: null,
     terminalCleanupTimeoutId: null,
+    terminalCleanupTimedOut: false,
     completion,
     markTerminal() {
       if (context.terminalObserved) return;
@@ -446,6 +478,7 @@ function createDeferredContext(callbacks, approvalPolicy) {
       }
       context.terminalCleanup = cleanup;
       context.terminalCleanupTimeoutId = setTimeout(() => {
+        context.terminalCleanupTimedOut = true;
         context.markTerminal();
       }, REQUEST_TIMEOUT_MS);
     },
@@ -560,6 +593,8 @@ async function startAppServer() {
   const pending = new Map();
   const contextsByThread = new Map();
   const threadExecutionTails = new Map();
+  const abandonedThreads = new Set();
+  const deferredTurnMessages = new Map();
   let nextId = 1;
   let stderr = '';
   let exited = false;
@@ -570,6 +605,8 @@ async function startAppServer() {
     pending,
     contextsByThread,
     threadExecutionTails,
+    abandonedThreads,
+    deferredTurnMessages,
     lastRateLimit: null,
     write(message) {
       if (exited || !child.stdin?.writable) throw new Error('Codex app-server가 종료되었습니다.');
@@ -626,6 +663,7 @@ async function startAppServer() {
     }
     if (msg.jsonrpc != null && msg.jsonrpc !== '2.0') return;
 
+    if (msg.method && deferAbandonedTurnMessage(server, msg)) return;
     if (msg.id != null && msg.method) {
       handleServerRequest(server, msg);
       return;
@@ -817,6 +855,7 @@ export async function runCodex(sessionKey, prompt, workdir, {
       context.startingTurn = false;
     }
     context.turnId = turnResponse?.turn?.id || context.turnId;
+    if (context.turnId) flushDeferredTurnMessages(server, threadId);
 
     if (context.aborted) {
       if (!context.settled) requestInterrupt(server, context);
@@ -833,6 +872,9 @@ export async function runCodex(sessionKey, prompt, workdir, {
   } finally {
     if (runningQueries.get(sessionKey)?.context === context) runningQueries.delete(sessionKey);
     const cleanupThreadExecution = () => {
+      if (context.terminalCleanupTimedOut && context.threadId) {
+        server?.abandonedThreads.add(context.threadId);
+      }
       if (context.threadId && server?.contextsByThread.get(context.threadId) === context) {
         server.contextsByThread.delete(context.threadId);
       }
@@ -900,7 +942,7 @@ export async function readCodexSessionSummary(threadId) {
   return summarizeThread(response.thread);
 }
 
-/** 테스트 및 정상 종료 시 공유 App Server를 정리합니다. */
+/** 테스트에서 공유 App Server를 정리합니다. */
 export async function shutdownCodexAppServer() {
   const server = sharedServer;
   sharedServer = null;
