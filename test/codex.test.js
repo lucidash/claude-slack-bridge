@@ -630,6 +630,74 @@ test('App Server 초기화 중인 실행도 중단할 수 있다', async () => {
   assert.equal(newTrace.some(message => turnPrompt(message) === 'INIT_STOP'), false);
 });
 
+test('thread/start 성공 응답 직전 중단해도 생성된 구독을 해제한다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_THREAD_START_DELAY_MS = '120';
+  const sessionKey = 'session-thread-start-stop';
+  const traceStart = traceMessages().length;
+  let stopped;
+  let outcome;
+
+  try {
+    const running = runCodex(sessionKey, 'THREAD_START_STOP', testDir);
+    await waitForTrace(message => message.method === 'thread/start', 3_000, traceStart);
+    stopped = stopCodexQuery(sessionKey);
+    outcome = await running.then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+  } finally {
+    delete process.env.FAKE_CODEX_THREAD_START_DELAY_MS;
+    await shutdownCodexAppServer();
+  }
+
+  const newTrace = traceMessages().slice(traceStart);
+  assert.equal(stopped, true);
+  assert.equal(outcome.status, 'rejected');
+  assert.match(outcome.error.message, /중단됨/);
+  assert.equal(getSession(sessionKey), undefined);
+  assert.ok(newTrace.some(message => (
+    message.method === 'thread/unsubscribe'
+    && message.params.threadId === 'thread-test'
+  )));
+});
+
+test('thread/resume 성공 응답 직전 중단해도 재개 구독을 해제한다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS = '120';
+  const sessionKey = 'session-thread-resume-stop';
+  const threadId = 'thread-resume-stop';
+  const traceStart = traceMessages().length;
+  let stopped;
+  let outcome;
+
+  saveSession(sessionKey, threadId);
+  try {
+    const running = runCodex(sessionKey, 'THREAD_RESUME_STOP', testDir);
+    await waitForTrace(message => (
+      message.method === 'thread/resume' && message.params.threadId === threadId
+    ), 3_000, traceStart);
+    stopped = stopCodexQuery(sessionKey);
+    outcome = await running.then(
+      value => ({ status: 'fulfilled', value }),
+      error => ({ status: 'rejected', error }),
+    );
+  } finally {
+    delete process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS;
+    await shutdownCodexAppServer();
+  }
+
+  const newTrace = traceMessages().slice(traceStart);
+  assert.equal(stopped, true);
+  assert.equal(outcome.status, 'rejected');
+  assert.match(outcome.error.message, /중단됨/);
+  assert.equal(getSession(sessionKey), threadId);
+  assert.ok(newTrace.some(message => (
+    message.method === 'thread/unsubscribe'
+    && message.params.threadId === threadId
+  )));
+});
+
 test('interrupt terminal 알림 전에는 실행 Promise를 해제하지 않는다', async () => {
   await shutdownCodexAppServer();
   process.env.FAKE_CODEX_INTERRUPT_DELAY_MS = '120';
@@ -893,6 +961,10 @@ test('turn/start 신호가 모두 유실돼도 thread 실행권을 회수한다'
       value => ({ status: 'fulfilled', value }),
       error => ({ status: 'rejected', error }),
     );
+    await waitForTrace(message => (
+      message.method === 'thread/unsubscribe'
+      && message.params.threadId === 'thread-timeout-stuck'
+    ), 1_200, traceStart);
 
     retry = timedCodex.runCodex(
       'session-timeout-stuck',

@@ -810,15 +810,15 @@ export async function runCodex(sessionKey, prompt, workdir, {
       threadResponse = await server.request('thread/start', threadParams);
     }
 
-    if (context.aborted) throw abortError();
     const threadId = threadResponse?.thread?.id || threadResponse?.threadId || previousThreadId;
     if (!threadId) throw new Error('Codex thread 응답에 ID가 없습니다.');
+    context.threadId = threadId;
+    if (context.aborted) throw abortError();
     if (lockedThreadId !== threadId) {
       releaseThreadExecution?.();
       releaseThreadExecution = await acquireThreadExecution(server, threadId, context);
       lockedThreadId = threadId;
     }
-    context.threadId = threadId;
     server.contextsByThread.set(threadId, context);
 
     if (!isResume || threadId !== previousThreadId) {
@@ -881,7 +881,6 @@ export async function runCodex(sessionKey, prompt, workdir, {
         }
         if (
           context.threadId
-          && !context.terminalCleanupTimedOut
           && server
           && server.child.exitCode == null
           && !server.child.killed
