@@ -871,17 +871,32 @@ export async function runCodex(sessionKey, prompt, workdir, {
     };
   } finally {
     if (runningQueries.get(sessionKey)?.context === context) runningQueries.delete(sessionKey);
-    const cleanupThreadExecution = () => {
-      if (context.terminalCleanupTimedOut && context.threadId) {
-        server?.abandonedThreads.add(context.threadId);
+    const cleanupThreadExecution = async () => {
+      try {
+        if (context.terminalCleanupTimedOut && context.threadId) {
+          server?.abandonedThreads.add(context.threadId);
+        }
+        if (context.threadId && server?.contextsByThread.get(context.threadId) === context) {
+          server.contextsByThread.delete(context.threadId);
+        }
+        if (
+          context.threadId
+          && !context.terminalCleanupTimedOut
+          && server
+          && server.child.exitCode == null
+          && !server.child.killed
+        ) {
+          await server.request('thread/unsubscribe', { threadId: context.threadId }).catch(() => {});
+        }
+      } finally {
+        releaseThreadExecution?.();
       }
-      if (context.threadId && server?.contextsByThread.get(context.threadId) === context) {
-        server.contextsByThread.delete(context.threadId);
-      }
-      releaseThreadExecution?.();
     };
-    if (context.deferCleanupUntilTerminal) context.cleanupAfterTerminal(cleanupThreadExecution);
-    else cleanupThreadExecution();
+    if (context.deferCleanupUntilTerminal) {
+      context.cleanupAfterTerminal(() => { void cleanupThreadExecution(); });
+    } else {
+      await cleanupThreadExecution();
+    }
   }
 }
 

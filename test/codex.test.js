@@ -24,9 +24,11 @@ const initializeDelayMs = Number(process.env.FAKE_CODEX_INIT_DELAY_MS) || 0;
 const interruptDelayMs = Number(process.env.FAKE_CODEX_INTERRUPT_DELAY_MS) || 0;
 const threadStartDelayMs = Number(process.env.FAKE_CODEX_THREAD_START_DELAY_MS) || 0;
 const threadResumeDelayMs = Number(process.env.FAKE_CODEX_THREAD_RESUME_DELAY_MS) || 0;
+const threadUnsubscribeDelayMs = Number(process.env.FAKE_CODEX_THREAD_UNSUBSCRIBE_DELAY_MS) || 0;
 const turnStartDelayMs = Number(process.env.FAKE_CODEX_TURN_START_DELAY_MS) || 0;
 const fatalTerminalDelayMs = Number(process.env.FAKE_CODEX_FATAL_TERMINAL_DELAY_MS) || 0;
 const failThreadResume = process.env.FAKE_CODEX_THREAD_RESUME_FAIL === 'true';
+const failThreadUnsubscribe = process.env.FAKE_CODEX_THREAD_UNSUBSCRIBE_FAIL === 'true';
 const failInterrupt = process.env.FAKE_CODEX_INTERRUPT_FAIL === 'true';
 const rateLimitWindowMins = Number(process.env.FAKE_CODEX_RATE_WINDOW_MINS) || 300;
 let collisionThreadRead = null;
@@ -131,6 +133,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           send({ jsonrpc: '2.0', id: message.id, result: { thread: { id: message.params.threadId, cwd: message.params.cwd } } });
         }
       }, threadResumeDelayMs);
+      break;
+    case 'thread/unsubscribe':
+      setTimeout(() => {
+        if (failThreadUnsubscribe) {
+          send({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'unsubscribe failed' } });
+        } else {
+          send({ jsonrpc: '2.0', id: message.id, result: { status: 'unsubscribed' } });
+        }
+      }, threadUnsubscribeDelayMs);
       break;
     case 'account/rateLimits/read':
       send({ jsonrpc: '2.0', id: message.id, result: { rateLimits: {
@@ -341,6 +352,7 @@ after(async () => {
 });
 
 test('신규 thread를 만들고 스트리밍 결과와 usage를 수집한다', async () => {
+  const traceStart = traceMessages().length;
   let readyId = null;
   const progress = [];
   const output = await runCodex('session-new', 'HELLO', testDir, {
@@ -354,6 +366,10 @@ test('신규 thread를 만들고 스트리밍 결과와 usage를 수집한다', 
   assert.equal(output.usage.contextWindow, 200000);
   assert.equal(output.rateLimit.pct, 23);
   assert.ok(progress.some(entry => entry.activities.some(value => value.includes('commandExecution'))));
+  assert.ok(traceMessages().slice(traceStart).some(message => (
+    message.method === 'thread/unsubscribe'
+    && message.params.threadId === 'thread-test'
+  )));
 });
 
 test('저장된 thread를 thread/resume으로 이어간다', async () => {
@@ -363,6 +379,53 @@ test('저장된 thread를 thread/resume으로 이어간다', async () => {
   });
   assert.equal(output.result, 'RESUMED_OK');
   assert.equal(readyCount, 0);
+});
+
+test('thread 구독 해제가 끝날 때까지 같은 thread의 다음 turn을 기다린다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_THREAD_UNSUBSCRIBE_DELAY_MS = '100';
+  const firstSession = 'session-unsubscribe-first';
+  const secondSession = 'session-unsubscribe-second';
+  const threadId = 'thread-unsubscribe-lock';
+  const traceStart = traceMessages().length;
+  let secondStartedEarly;
+
+  saveSession(firstSession, threadId);
+  saveSession(secondSession, threadId);
+  try {
+    const first = runCodex(firstSession, 'UNSUBSCRIBE_FIRST', testDir);
+    await waitForTrace(message => turnPrompt(message) === 'UNSUBSCRIBE_FIRST', 3_000, traceStart);
+    const second = runCodex(secondSession, 'UNSUBSCRIBE_SECOND', testDir);
+    await waitForTrace(message => (
+      message.method === 'thread/unsubscribe' && message.params.threadId === threadId
+    ), 3_000, traceStart);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    secondStartedEarly = traceMessages().slice(traceStart)
+      .some(message => turnPrompt(message) === 'UNSUBSCRIBE_SECOND');
+    await Promise.all([first, second]);
+  } finally {
+    delete process.env.FAKE_CODEX_THREAD_UNSUBSCRIBE_DELAY_MS;
+    await shutdownCodexAppServer();
+  }
+
+  assert.equal(secondStartedEarly, false);
+});
+
+test('thread 구독 해제 실패 뒤에도 실행 lock을 해제한다', async () => {
+  await shutdownCodexAppServer();
+  process.env.FAKE_CODEX_THREAD_UNSUBSCRIBE_FAIL = 'true';
+  const sessionKey = 'session-unsubscribe-failure';
+  saveSession(sessionKey, 'thread-unsubscribe-failure');
+
+  try {
+    const first = await runCodex(sessionKey, 'UNSUBSCRIBE_FAIL_FIRST', testDir);
+    const second = await runCodex(sessionKey, 'UNSUBSCRIBE_FAIL_SECOND', testDir);
+    assert.equal(first.result, 'RESUMED_OK');
+    assert.equal(second.result, 'RESUMED_OK');
+  } finally {
+    delete process.env.FAKE_CODEX_THREAD_UNSUBSCRIBE_FAIL;
+    await shutdownCodexAppServer();
+  }
 });
 
 test('Codex 사용자 질문을 Slack 질문 콜백으로 중계한다', async () => {
