@@ -37,7 +37,11 @@ import { readCodexSessionSummary, runCodex } from './codex.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
-import { assertQuestionActive, waitForUserAnswer } from './user-question.js';
+import {
+  assertQuestionActive,
+  formatUserMessageForLog,
+  waitForUserAnswer,
+} from './user-question.js';
 import { formatRateLimitWindow } from './rate-limit.js';
 
 const app = express();
@@ -154,8 +158,9 @@ async function handleSlackEvent(event) {
   const channel = event.channel;
   const replyThreadTs = event.thread_ts || event.ts;
   const sessionKey = `${userId}-${replyThreadTs}`;
+  const pending = pendingQuestions.get(sessionKey);
 
-  console.log(`[Slack] Message from ${userId} (session: ${sessionKey}): ${userMessage.substring(0, 50)}...`);
+  console.log(`[Slack] Message from ${userId} (session: ${sessionKey}): ${formatUserMessageForLog(userMessage, pending?.questions)}...`);
 
   // 특수 명령어 처리
   const handled = await handleCommand(userMessage, { channel, replyThreadTs, sessionKey, userId, threadKey, sessionLocks });
@@ -170,13 +175,12 @@ async function handleSlackEvent(event) {
   }
 
   // AskUserQuestion 대기 중인 질문이 있으면 답변으로 처리
-  const pending = pendingQuestions.get(sessionKey);
   if (pending) {
     const answers = parseUserAnswer(userMessage, pending.questions);
     clearTimeout(pending.timeoutId);
     pending.resolve(answers);
     pendingQuestions.delete(sessionKey);
-    console.log(`[AskUser] Answer received for ${sessionKey}: ${userMessage.substring(0, 50)}`);
+    console.log(`[AskUser] Answer received for ${sessionKey}: ${formatUserMessageForLog(userMessage, pending.questions)}`);
     try {
       await slack.reactions.add({ channel, name: 'white_check_mark', timestamp: event.ts });
     } catch { /* ignore */ }

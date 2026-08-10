@@ -2,6 +2,13 @@ export function assertQuestionActive(signal) {
   if (signal?.aborted) throw new Error('중단됨');
 }
 
+export function formatUserMessageForLog(userMessage, questions) {
+  if (Array.isArray(questions) && questions.some(question => question?.isSecret)) {
+    return '[민감한 응답 숨김]';
+  }
+  return String(userMessage ?? '').substring(0, 50);
+}
+
 export function waitForUserAnswer({
   pendingQuestions,
   sessionKey,
