@@ -33,6 +33,7 @@ import {
 } from './store.js';
 import { runClaudeCode } from './claude.js';
 import { runClaudeViaPty } from './claude-pty.js';
+import { runOpencode } from './opencode-engine.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
@@ -549,6 +550,13 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     if (engine === 'pty-claude') {
       // pty 엔진은 AskUserQuestion / rate-limit 헤더 미지원 (Claude Code TUI 한계)
       ({ result, usage, rateLimit } = await runClaudeViaPty(sessionKey, fullPrompt, workdir, {
+        onProgress, onSessionReady,
+        model: threadModel || undefined, effort: threadEffort || undefined,
+      }));
+    } else if (engine === 'opencode') {
+      // opencode 엔진은 AskUserQuestion / rate-limit 헤더 미지원.
+      // model 은 provider/model 형식(openai/gpt-5.1 등)만 의미 있음 — claude 별칭은 무시됨
+      ({ result, usage, rateLimit } = await runOpencode(sessionKey, fullPrompt, workdir, {
         onProgress, onSessionReady,
         model: threadModel || undefined, effort: threadEffort || undefined,
       }));
