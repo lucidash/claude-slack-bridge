@@ -4,6 +4,7 @@ import { slack, fetchThreadHistorySince } from './slack.js';
 import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getThreadEngine, setThreadEngine, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
 import { stopClaudeQuery } from './claude.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
+import { stopOpencodeQuery } from './opencode-engine.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
 function formatElapsed(ms) {
@@ -37,8 +38,8 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!pwd\` — 현재 작업 디렉토리 확인
 
 *엔진*
-\`!engine\` — 현재 엔진 확인 (claude / pty-claude)
-\`!engine <claude|pty-claude>\` — 이 스레드의 엔진 변경 (세션 초기화됨)
+\`!engine\` — 현재 엔진 확인 (claude / pty-claude / opencode)
+\`!engine <claude|pty-claude|opencode>\` — 이 스레드의 엔진 변경 (세션 초기화됨)
 \`!engine reset\` — 기본값(claude SDK)으로 초기화
 
 *모델*
@@ -235,16 +236,16 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     return true;
   }
 
-  // engine — 이 스레드에서 사용할 AI 엔진 지정 (claude SDK / pty-claude TUI)
+  // engine — 이 스레드에서 사용할 AI 엔진 지정 (claude SDK / pty-claude TUI / opencode CLI)
   const engineMatch = userMessage.match(/^[!\/]engine(?:\s+(.+))?$/i);
   if (engineMatch) {
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
-    const VALID_ENGINES = ['claude', 'pty-claude'];
+    const VALID_ENGINES = ['claude', 'pty-claude', 'opencode'];
     const arg = engineMatch[1]?.trim().toLowerCase();
 
     if (!arg || arg === 'current') {
       const current = getThreadEngine(effectiveThreadKey) || 'claude';
-      const text = `🛠 현재 엔진: \`${current}\`${current === 'claude' ? ' (SDK 기본값)' : ''}\n변경: \`!engine <claude|pty-claude>\``;
+      const text = `🛠 현재 엔진: \`${current}\`${current === 'claude' ? ' (SDK 기본값)' : ''}\n변경: \`!engine <claude|pty-claude|opencode>\``;
       await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
       return true;
     }
@@ -265,7 +266,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     if (!VALID_ENGINES.includes(arg)) {
       await slack.chat.postMessage({
         channel,
-        text: `❌ 알 수 없는 엔진: \`${arg}\`\n사용 가능: \`claude\`, \`pty-claude\``,
+        text: `❌ 알 수 없는 엔진: \`${arg}\`\n사용 가능: \`claude\`, \`pty-claude\`, \`opencode\``,
         thread_ts: replyThreadTs,
       });
       return true;
@@ -433,7 +434,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   // !stop all — 작업 중단 + 큐 비우기
   if (['!stop', '/stop', '!kill', '/kill', '!stop all', '/stop all'].includes(msg)) {
     const clearQueue = msg.endsWith(' all');
-    const killed = stopClaudeQuery(sessionKey) || stopClaudePtyQuery(sessionKey);
+    const killed = stopClaudeQuery(sessionKey) || stopOpencodeQuery(sessionKey) || stopClaudePtyQuery(sessionKey);
     let queueCleared = 0;
     let queueRemaining = 0;
     if (sessionLocks) {
@@ -812,7 +813,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       }
 
       let engine = null;
-      const VALID_CRON_ENGINES = ['claude', 'pty-claude'];
+      const VALID_CRON_ENGINES = ['claude', 'pty-claude', 'opencode'];
       const engMatch = message.match(/\s+--engine\s+(\S+)/);
       if (engMatch) {
         engine = engMatch[1].toLowerCase();
@@ -820,7 +821,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         if (!VALID_CRON_ENGINES.includes(engine)) {
           await slack.chat.postMessage({
             channel,
-            text: `❌ 알 수 없는 엔진: \`${engine}\`\n사용 가능: \`claude\`, \`pty-claude\``,
+            text: `❌ 알 수 없는 엔진: \`${engine}\`\n사용 가능: \`claude\`, \`pty-claude\`, \`opencode\``,
             thread_ts: replyThreadTs,
           });
           return true;
@@ -1057,14 +1058,14 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     } else if (field === 'enabled') {
       update.enabled = value === 'true' || value === '1';
     } else if (field === 'engine') {
-      const VALID_WATCH_ENGINES = ['claude', 'pty-claude'];
+      const VALID_WATCH_ENGINES = ['claude', 'pty-claude', 'opencode'];
       const v = value.toLowerCase();
       if (v === 'reset' || v === 'default' || v === 'null') {
         update.engine = null;
       } else if (!VALID_WATCH_ENGINES.includes(v)) {
         await slack.chat.postMessage({
           channel,
-          text: `❌ 알 수 없는 엔진: \`${value}\`\n사용 가능: \`claude\`, \`pty-claude\` (또는 \`reset\`)`,
+          text: `❌ 알 수 없는 엔진: \`${value}\`\n사용 가능: \`claude\`, \`pty-claude\`, \`opencode\` (또는 \`reset\`)`,
           thread_ts: replyThreadTs,
         });
         return true;

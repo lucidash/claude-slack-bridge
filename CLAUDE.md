@@ -76,6 +76,9 @@ npm run dev    # 개발 (--watch)
 | `CLAUDE_SKIP_PERMISSIONS` | 권한 프롬프트 스킵 여부 |
 | `CLAUDE_BIN` | `pty-claude` 엔진용 claude CLI 절대경로 (기본: `/Users/muzi/.local/bin/claude`) |
 | `CLAUDE_PTY_HOME` | `pty-claude` 엔진의 자식 프로세스에 다른 `HOME` 을 주고 싶을 때 (선택). 본 머신 인증과 분리하고 별도 계정으로 운영할 때 사용 |
+| `OPENCODE_BIN` | `opencode` 엔진용 opencode CLI 경로 (기본: `opencode`, PATH 탐색) |
+| `OPENCODE_TIMEOUT_MS` | `opencode` 엔진 실행 타임아웃 (기본: 1800000 = 30분) |
+| `OPENCODE_AUTO` | `true`면 opencode에 `--auto` 플래그 전달 (미명시 권한 자동 승인. 기본은 opencode 설정의 permission 정책 따름) |
 | `OPENAI_API_KEY` | STT용 OpenAI API 키 (선택) |
 | `PORT` | 서버 포트 (기본: 3005). Socket 모드에서도 디버그 엔드포인트로 사용 |
 
@@ -87,8 +90,9 @@ npm run dev    # 개발 (--watch)
 |---|---|---|---|
 | `claude` (기본) | Agent SDK `query()` API | **Agent SDK 풀** (6/15부터 Max 20x 월 $200 한도) | AskUserQuestion, rate-limit 헤더 지원 |
 | `pty-claude` | Claude Code TUI 를 `node-pty` 로 spawn → `~/.claude/sessions/<pid>.json` + jsonl tail | **인터랙티브 구독 풀** (별도 한도) | AskUserQuestion / rate-limit 헤더 미지원 (TUI 한계). 자동화/무거운 작업을 SDK 한도와 분리해 돌릴 때 사용 |
+| `opencode` | opencode CLI 를 plain spawn (`run --format json`) → stdout JSON events 파싱, stdin 으로 프롬프트 전달 | **opencode 에 등록한 provider 과금** (예: OpenAI API) | AskUserQuestion / rate-limit 헤더 미지원. 모델은 `!model provider/model` 형식으로 지정 (claude 별칭 무시). rateLimit 항상 null |
 
-전환: `!engine <claude\|pty-claude>` (세션 초기화됨). `!engine reset` 으로 기본값 복귀.
+전환: `!engine <claude\|pty-claude\|opencode>` (세션 초기화됨). `!engine reset` 으로 기본값 복귀.
 
 cron / watch 도 작업 단위로 엔진 지정 가능:
 - `!cron add "<schedule>" <msg> --engine pty-claude -- <설명>` — 해당 cron 실행 시 스레드에 자동 적용
@@ -111,4 +115,4 @@ cron / watch 도 작업 단위로 엔진 지정 가능:
 | `!queue` | 대기열 확인 |
 | `!sync-all` | 최근 24h 내 변경된 모든 세션 일괄 동기화 |
 | `!sync-all <duration>` | 지정 기간 내 변경 세션 일괄 동기화 (예: `6h`, `30m`) |
-| `!engine` / `!engine <claude\|pty-claude>` | 스레드 AI 엔진 확인/변경 |
+| `!engine` / `!engine <claude\|pty-claude\|opencode>` | 스레드 AI 엔진 확인/변경 |
