@@ -8,6 +8,10 @@ import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 import { resolveSessionSource } from './session-source.js';
 import { formatRateLimitWindow } from './rate-limit.js';
+import { getSessionRevision } from './store.js';
+
+// 명령은 실행 큐 밖에서 처리된다. 조회 완료 순서가 아니라 사용자 명령 순서를 따른다.
+const threadCommandGenerations = new Map();
 
 function formatElapsed(ms) {
   const sec = Math.floor(ms / 1000);
@@ -93,6 +97,21 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 
 export async function handleCommand(userMessage, { channel, replyThreadTs, sessionKey, userId, threadKey, sessionLocks }) {
   const msg = userMessage.toLowerCase();
+  const stateKey = threadKey || `${channel}-${replyThreadTs}`;
+  if (/^(?:[!/]?(?:new|reset)$|[!/]split$|[!/](?:session|sync|wd|engine|model|effort)\s+\S)/i.test(userMessage)) {
+    threadCommandGenerations.set(stateKey, (threadCommandGenerations.get(stateKey) || 0) + 1);
+  }
+  const generation = threadCommandGenerations.get(stateKey);
+  const sessionRevision = getSessionRevision(sessionKey);
+  const isStaleLookup = () => threadCommandGenerations.get(stateKey) !== generation
+    || getSessionRevision(sessionKey) !== sessionRevision;
+  const discardStaleLookup = async () => {
+    await slack.chat.postMessage({
+      channel, thread_ts: replyThreadTs,
+      text: 'ℹ️ 이후 명령 또는 실행으로 상태가 변경되어 이전 세션 조회 결과를 적용하지 않았습니다.',
+    });
+    return true;
+  };
 
   // help
   if (['!help', '/help', '!h', 'help'].includes(msg)) {
@@ -124,6 +143,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       },
       readCodex: () => readCodexSessionSummary(newSessionId).catch(() => null),
     });
+    if (isStaleLookup()) return discardStaleLookup();
     let detectedDir = detected?.summary.cwd || null;
     if (detected) {
       const detectedEngine = detected.engine === 'codex'
@@ -765,6 +785,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       readClaude: async () => readSessionSummary(sessionId),
       readCodex: () => readCodexSessionSummary(sessionId).catch(() => null),
     });
+    if (isStaleLookup()) return discardStaleLookup();
     const summary = detected?.summary || null;
     if (detected) {
       const detectedEngine = detected.engine === 'codex'
