@@ -118,6 +118,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     case 'initialize':
       setTimeout(() => send({ jsonrpc: '2.0', id: message.id, result: { userAgent: 'fake' } }), initializeDelayMs);
       break;
+    case 'config/read':
+      send({ jsonrpc: '2.0', id: message.id, result: { config: { mcp_servers: { dangerous: { enabled: true }, 'server.with.dots': {} } } } });
+      break;
     case 'thread/start':
       resumed = false;
       setTimeout(() => {
@@ -349,6 +352,41 @@ function turnPrompt(message) {
 
 after(async () => {
   await shutdownCodexAppServer();
+});
+
+test('watch 감지는 작업 세션/권한/모델과 분리된 ephemeral thread로 실행한다', async () => {
+  const key = 'watch-triage-isolated';
+  saveSession(key, 'existing-action-thread');
+  const envKeys = ['CODEX_SANDBOX', 'CODEX_APPROVAL_POLICY', 'CODEX_NETWORK_ACCESS', 'CODEX_MODEL', 'CODEX_EFFORT', 'CODEX_ALLOWED_DIRS'];
+  const previous = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+  Object.assign(process.env, { CODEX_SANDBOX: 'danger-full-access', CODEX_APPROVAL_POLICY: 'never', CODEX_NETWORK_ACCESS: 'true', CODEX_MODEL: 'gpt-default', CODEX_EFFORT: 'ultra', CODEX_ALLOWED_DIRS: '/private/action-dir' });
+  try {
+    for (const model of ['gpt-triage', undefined]) {
+      const start = traceMessages().length;
+      await runCodex(key, 'TRIAGE', testDir, { triage: true, model });
+      const trace = traceMessages().slice(start);
+      assert.equal(trace.some(message => message.method === 'thread/resume'), false);
+      const thread = trace.find(message => message.method === 'thread/start').params;
+      assert.equal(thread.ephemeral, true);
+      assert.equal(thread.model, model || 'gpt-default');
+      assert.equal(thread.sandbox, 'read-only');
+      assert.equal(thread.runtimeWorkspaceRoots, null);
+      assert.deepEqual(thread.config.mcp_servers, { dangerous: { enabled: false }, 'server.with.dots': { enabled: false } });
+      assert.equal(thread.config.features.shell_tool, false);
+      assert.equal(thread.config.features.apps, false);
+      assert.equal(thread.config.web_search, 'disabled');
+      const turn = trace.find(message => message.method === 'turn/start').params;
+      assert.deepEqual(turn.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+      assert.equal(turn.effort, null);
+      assert.equal(turn.outputSchema.properties.shouldRespond.type, 'boolean');
+      assert.equal(getSession(key), 'existing-action-thread');
+    }
+  } finally {
+    clearSession(key);
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });
 
 test('신규 thread를 만들고 스트리밍 결과와 usage를 수집한다', async () => {

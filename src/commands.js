@@ -9,6 +9,7 @@ import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, 
 import { resolveSessionSource } from './session-source.js';
 import { formatRateLimitWindow } from './rate-limit.js';
 import { getSessionRevision } from './store.js';
+import { watchRuntimeField, watchRuntimeUpdate, watchRuntimeSummary } from './watch-config.js';
 
 // 명령은 실행 큐 밖에서 처리된다. 조회 완료 순서가 아니라 사용자 명령 순서를 따른다.
 const threadCommandGenerations = new Map();
@@ -81,6 +82,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 *Channel Watch*
 \`!watch <channel_id>\` — 채널 watching 등록 (멀티라인으로 sender/trigger/action 설정)
 \`!watch-set <channel_id> <field> <value>\` — watch 설정 개별 수정
+감지: \`triageEngine\` / \`triageModel\`, 수행: \`engine\` / \`model\` (각 필드는 \`reset\` 가능)
 \`!unwatch <channel_id>\` — watching 해제
 \`!watches\` — 전체 watch 목록
 
@@ -1132,7 +1134,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       lines.push(`    trigger: ${w.trigger || '(미설정)'}`);
       lines.push(`    action: ${w.action || '(미설정)'}`);
       if (w.anchorChannel) lines.push(`    anchor: \`${w.anchorChannel}\``);
-      if (w.engine) lines.push(`    engine: \`${w.engine}\``);
+      lines.push(...watchRuntimeSummary(w).map(line => `    ${line}`));
     }
     await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
     return true;
@@ -1154,9 +1156,10 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   }
 
   // watch-set <channel_id> <field> <value>
-  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName|anchorChannel|engine)\s+([\s\S]+)$/i);
+  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName|anchorChannel|engine|model|actionEngine|actionModel|triageEngine|triageModel)\s+([\s\S]+)$/i);
   if (watchSetMatch) {
-    const [, chId, field, rawValue] = watchSetMatch;
+    const [, chId, rawField, rawValue] = watchSetMatch;
+    const field = watchRuntimeField(rawField) || ({ channelname: 'channelName', anchorchannel: 'anchorChannel' }[rawField.toLowerCase()] || rawField.toLowerCase());
     const existing = getWatch(chId);
     if (!existing) {
       await slack.chat.postMessage({
@@ -1175,20 +1178,14 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       update.senders = [...new Set([...(existing.senders || []), ...senders])];
     } else if (field === 'enabled') {
       update.enabled = value === 'true' || value === '1';
-    } else if (field === 'engine') {
-      const VALID_WATCH_ENGINES = ['claude', 'pty-claude', 'codex'];
-      const v = value.toLowerCase();
-      if (v === 'reset' || v === 'default' || v === 'null') {
-        update.engine = null;
-      } else if (!VALID_WATCH_ENGINES.includes(v)) {
+    } else if (watchRuntimeField(field)) {
+      try {
+        Object.assign(update, watchRuntimeUpdate(existing, { [field]: value }));
+      } catch (error) {
         await slack.chat.postMessage({
-          channel,
-          text: `❌ 알 수 없는 엔진: \`${value}\`\n사용 가능: \`claude\`, \`pty-claude\`, \`codex\` (또는 \`reset\`)`,
-          thread_ts: replyThreadTs,
+          channel, text: `❌ ${error.message}`, thread_ts: replyThreadTs,
         });
         return true;
-      } else {
-        update.engine = v;
       }
     } else {
       update[field] = value;
@@ -1197,7 +1194,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     saveWatch(chId, update);
     await slack.chat.postMessage({
       channel,
-      text: `✅ Watch 설정 업데이트: \`${chId}\` ${field} → ${JSON.stringify(update[field] ?? update.senders)}`,
+      text: `✅ Watch 설정 업데이트: \`${chId}\` ${field} → ${JSON.stringify(Object.hasOwn(update, field) ? update[field] : update.senders)}\n${watchRuntimeSummary(getWatch(chId)).join('\n')}\n변경은 이후 감지되는 메시지부터 적용됩니다.`,
       thread_ts: replyThreadTs,
     });
     return true;
@@ -1211,13 +1208,16 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
     // 멀티라인 파싱: "key: value" 형태
     const config = { enabled: true, addedBy: userId, createdAt: new Date().toISOString() };
+    const runtimeValues = {};
     const lines = body.split('\n');
     for (const line of lines) {
-      const kv = line.match(/^\s*(sender|trigger|action|channelName|anchorChannel)\s*:\s*(.+)$/i);
+      const kv = line.match(/^\s*(sender|trigger|action|channelName|anchorChannel|engine|model|actionEngine|actionModel|triageEngine|triageModel)\s*:\s*(.+)$/i);
       if (kv) {
         const [, key, val] = kv;
         const k = key.toLowerCase();
-        if (k === 'sender') {
+        if (watchRuntimeField(k)) {
+          runtimeValues[watchRuntimeField(k)] = val;
+        } else if (k === 'sender') {
           const senders = val.trim().split(/[,，]\s*/).map(s => s.trim()).filter(Boolean);
           config.senders = [...new Set([...(config.senders || []), ...senders])];
         } else if (k === 'channelname') {
@@ -1232,6 +1232,12 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
     // 기존 설정이 있으면 머지
     const existing = getWatch(chId);
+    try {
+      Object.assign(config, watchRuntimeUpdate(existing || {}, runtimeValues));
+    } catch (error) {
+      await slack.chat.postMessage({ channel, text: `❌ ${error.message}`, thread_ts: replyThreadTs });
+      return true;
+    }
     if (existing) {
       if (config.senders && existing.senders) {
         config.senders = [...new Set([...existing.senders, ...config.senders])];
@@ -1247,6 +1253,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     report.push(`trigger: ${saved.trigger || '(미설정)'}`);
     report.push(`action: ${saved.action || '(미설정)'}`);
     if (saved.anchorChannel) report.push(`anchor: \`${saved.anchorChannel}\``);
+    report.push(...watchRuntimeSummary(saved));
 
     const missing = [];
     if (!saved.senders?.length) missing.push('sender');

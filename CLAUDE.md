@@ -110,6 +110,13 @@ cron / watch 도 작업 단위로 엔진 지정 가능:
 - `!cron add "<schedule>" <msg> --engine <pty-claude\|codex> -- <설명>` — 해당 cron 실행 시 스레드에 자동 적용
 - `!watch-set <channel_id> engine <pty-claude\|codex>` — watch 가 만든 스레드에 자동 적용 (reset 으로 해제)
 
+Watch는 채널별 감지와 수행 설정을 독립 저장한다:
+- 감지: `triageEngine` (`claude`/`codex`), `triageModel`. 미설정 시 기존 Claude SDK + `haiku`.
+- 수행: 기존 `engine` (`claude`/`pty-claude`/`codex`), `model`. `actionEngine`/`actionModel` 별칭도 지원. 미설정 시 기존 엔진별 모델 기본값을 유지한다.
+- `!watch` 등록 본문의 `key: value` 또는 `!watch-set <channel> <field> <value>`로 설정하고 `reset`으로 해제한다. 엔진을 바꾸면 해당 단계의 모델만 초기화한다(동시 등록한 모델은 유지).
+- `!watches`는 감지/수행의 유효 엔진·모델을 표시한다. 변경은 이후 감지되는 메시지에만 적용하며 기존 실행 스레드는 변경하지 않는다.
+- 감지는 매번 독립 실행하고 세션을 저장하지 않는다. Codex 감지는 ephemeral/read-only/network off 및 MCP/shell/apps/subagents 비활성화, JSON schema 판정을 사용한다. PTY는 수행 단계만 지원한다. 감지 오류/잘못된 JSON/시간 초과 시 작업을 실행하지 않는다.
+
 지정 안 하면 기본값 `claude` (SDK). 자동화는 SDK 한도와 분리해 운영하고 싶을 때 `pty-claude` 추천.
 
 ## 주요 명령어

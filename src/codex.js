@@ -376,7 +376,7 @@ function handleServerRequest(server, msg) {
     return;
   }
 
-  const approve = context?.approvalPolicy === 'never';
+  const approve = context?.approvalPolicy === 'never' && !context?.triage;
   const approval = approvalResponse(msg.method, approve);
   if (approval) {
     sendServerResponse(server, msg.id, approval);
@@ -807,12 +807,19 @@ export async function runCodex(sessionKey, prompt, workdir, {
   onSessionReady,
   model: modelOverride,
   effort: effortOverride,
+  triage = false,
 } = {}) {
   const sessionRevision = getSessionRevision(sessionKey);
-  const previousThreadId = getSession(sessionKey);
+  const previousThreadId = triage ? null : getSession(sessionKey);
   const isResume = Boolean(previousThreadId);
-  const settings = codexSettings(workdir, modelOverride, effortOverride);
+  // 감지는 작업용 권한/effort/세션을 상속하지 않는 독립 읽기 전용 실행이다.
+  const settings = triage ? {
+    cwd: workdir ? expandPath(workdir) : process.cwd(), roots: [],
+    model: modelOverride || process.env.CODEX_MODEL || null, effort: null,
+    sandbox: 'read-only', sandboxPolicy: { type: 'readOnly', networkAccess: false }, approvalPolicy: 'never',
+  } : codexSettings(workdir, modelOverride, effortOverride);
   const context = createDeferredContext({ onProgress, onAskUser }, settings.approvalPolicy);
+  context.triage = triage;
   const entry = { server: null, context };
   runningQueries.set(sessionKey, entry);
   let server = null;
@@ -833,6 +840,19 @@ export async function runCodex(sessionKey, prompt, workdir, {
       sandbox: settings.sandbox,
       model: settings.model,
     };
+    if (triage) {
+      // 빈 mcp_servers 맵은 기존 설정을 지우지 않으므로 서버마다 명시적으로 비활성화한다.
+      const { config } = await server.request('config/read', { includeLayers: false, cwd: settings.cwd });
+      if (!config || typeof config !== 'object') throw new Error('Codex 감지 도구 설정을 확인할 수 없습니다.');
+      threadParams.ephemeral = true;
+      threadParams.config = {
+        mcp_servers: Object.fromEntries(Object.keys(config.mcp_servers || {}).map(name => [name, { enabled: false }])),
+        features: { shell_tool: false, apps: false, multi_agent: false, multi_agent_v2: false },
+        web_search: 'disabled',
+      };
+      threadParams.baseInstructions = 'Classify the supplied message only. Do not use tools, perform actions, or ask questions. Return only the requested JSON.';
+      if (context.aborted) throw abortError();
+    }
 
     if (isResume) {
       releaseThreadExecution = await acquireThreadExecution(server, previousThreadId, context);
@@ -865,7 +885,7 @@ export async function runCodex(sessionKey, prompt, workdir, {
     }
     server.contextsByThread.set(threadId, context);
 
-    if (!isResume || threadId !== previousThreadId) {
+    if (!triage && (!isResume || threadId !== previousThreadId)) {
       const saved = saveSessionIfRevision(sessionKey, threadId, sessionRevision);
       if (saved) onSessionReady?.(threadId);
     }
@@ -891,6 +911,10 @@ export async function runCodex(sessionKey, prompt, workdir, {
         sandboxPolicy: settings.sandboxPolicy,
         model: settings.model,
         effort: settings.effort,
+        ...(triage ? { outputSchema: {
+          type: 'object', properties: { shouldRespond: { type: 'boolean' }, reason: { type: 'string' } },
+          required: ['shouldRespond', 'reason'], additionalProperties: false,
+        } } : {}),
       });
     } catch (error) {
       await cleanupTurnStartFailure(server, context, error);

@@ -36,7 +36,7 @@ import { runClaudeViaPty } from './claude-pty.js';
 import { readCodexSessionSummary, runCodex } from './codex.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
-import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
+import { triageMessage, matchesSender, getActiveWatch, applyWatchActionConfig } from './watch.js';
 import {
   assertQuestionActive,
   formatUserMessageForLog,
@@ -788,7 +788,7 @@ async function handleWatchedMessage(event, watch) {
 
   console.log(`[Watch] Triaging message in ${channel}: ${messageText.substring(0, 80)}...`);
 
-  // Haiku로 triage
+  // 채널별 감지 엔진/모델 (미설정 시 Claude Haiku)
   const triage = await triageMessage(messageText, watch);
   if (!triage.shouldRespond) {
     console.log(`[Watch] Skipped: ${triage.reason}`);
@@ -815,12 +815,10 @@ ${watch.action}
 - Slack 멘션 형식: <@USER_ID>
 - 필요하면 코드베이스를 분석하세요.`;
 
-  // silent 모드로 실행 (스레드를 활성 등록하지 않음 — 이후 사용자 메시지에 자동 반응 방지)
-  // 필요 시 @멘션으로 명시적 호출 가능
+  // silent 모드: 진행 상태는 shadow anchor에 기록하고 원본에는 최종 응답만 게시한다.
   const watchThreadKey = `${channel}-${messageTs}`;
+  applyWatchActionConfig(watchThreadKey, watch);
   setThreadSilent(watchThreadKey, true);
-  // watch 에 engine 이 지정되어 있으면 이 스레드에 적용 (executeClaudeRequest 가 읽음)
-  if (watch.engine) setThreadEngine(watchThreadKey, watch.engine);
 
   // processMessage를 통해 Claude 실행 (silent 모드 — 결과 텍스트만 게시)
   const userId = watch.addedBy;
