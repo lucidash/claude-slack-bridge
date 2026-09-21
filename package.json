@@ -1,17 +1,19 @@
 {
   "name": "claude-slack-bridge",
   "version": "1.0.0",
-  "description": "Slack에서 Claude Code CLI를 원격 제어하는 브릿지 서버",
+  "description": "Slack에서 Claude Code와 Codex CLI를 원격 제어하는 브릿지 서버",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "test": "node --test"
   },
   "keywords": [
     "slack",
     "claude",
     "claude-code",
+    "codex",
     "bridge",
     "remote"
   ],

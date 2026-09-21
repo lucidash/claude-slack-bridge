@@ -1,6 +1,6 @@
-# Claude Slack Bridge
+# Claude & Codex Slack Bridge
 
-Slack에서 Claude Code Agent SDK를 통해 Claude를 원격 제어하는 브릿지 서버. Slack DM이나 멘션으로 메시지를 보내면 로컬 머신에서 Agent SDK의 `query()` API로 Claude를 실행하고 결과를 스레드에 반환한다.
+Slack에서 Claude Code와 Codex CLI를 원격 제어하는 브릿지 서버. Slack DM이나 멘션으로 메시지를 보내면 선택된 엔진을 로컬 머신에서 실행하고 결과를 스레드에 반환한다.
 
 ## 대상 프로젝트
 
@@ -23,6 +23,7 @@ Slack에서 Claude Code Agent SDK를 통해 Claude를 원격 제어하는 브릿
 - Node.js (ESM), Express
 - `@slack/web-api` — Slack 연동
 - `@anthropic-ai/claude-agent-sdk` — Claude Code Agent SDK (`query()` API로 실행)
+- Codex App Server — `codex app-server` JSON-RPC/NDJSON 프로토콜
 - OpenAI API / Google STT — 음성 인식 (fallback 체인)
 
 ## 프로젝트 구조
@@ -31,6 +32,7 @@ Slack에서 Claude Code Agent SDK를 통해 Claude를 원격 제어하는 브릿
 src/
   index.js    — Express 서버, Slack 이벤트 수신 및 Claude 실행 오케스트레이션
   claude.js   — Agent SDK query() 실행, 스트리밍 이벤트 처리, 세션 관리
+  codex.js    — Codex App Server 연결, thread/turn/질문/중단/usage 처리
   commands.js — 명령어 처리 (!new, !cd, !session, !pause, !resume, !status, !stop, !queue)
   store.js    — 세션/스레드/작업디렉토리/인박스 영속 저장 (~/.claude/slack-bridge/)
   slack.js    — Slack WebClient, 스레드 히스토리 조회
@@ -43,12 +45,13 @@ src/
 ```bash
 npm start      # 프로덕션
 npm run dev    # 개발 (--watch)
+npm test       # Codex App Server 통합 테스트
 ```
 
 ## 핵심 동작 흐름
 
 1. Slack 이벤트 수신 → 서명 검증 + 화이트리스트 확인
-2. 명령어(`!` prefix)면 즉시 처리, 아니면 Agent SDK `query()` 실행
+2. 명령어(`!` prefix)면 즉시 처리, 아니면 스레드에 지정된 엔진 실행
 3. 세션별 lock/queue로 동시 요청 직렬화
 4. SDK 스트리밍 이벤트(`assistant`, `result`, `rate_limit_event`)로 진행 상태를 Slack에 실시간 업데이트
 5. 새 세션이면 세션 ID를 스레드에 댓글로 기록
@@ -74,6 +77,14 @@ npm run dev    # 개발 (--watch)
 | `CLAUDE_MODEL` | Claude 모델 (기본: sonnet) |
 | `CLAUDE_ALLOWED_DIRS` | Claude CLI 허용 디렉토리 (콤마 구분) |
 | `CLAUDE_SKIP_PERMISSIONS` | 권한 프롬프트 스킵 여부 |
+| `CODEX_MODEL` | Codex 엔진 사용 시 기본 모델 (미지정 시 CLI 기본값) |
+| `CODEX_PATH` | Codex CLI 바이너리 경로 (기본: `codex`, PATH 탐색) |
+| `CODEX_ALLOWED_DIRS` | Codex CLI 허용 디렉토리 (미지정 시 `CLAUDE_ALLOWED_DIRS` 사용) |
+| `CODEX_EFFORT` | Codex 기본 reasoning effort (미지정 시 모델 기본값) |
+| `CODEX_SANDBOX` | `read-only`, `workspace-write`, `danger-full-access` (기본) |
+| `CODEX_APPROVAL_POLICY` | `never`만 지원 (기본, Slack 승인 중계 미지원) |
+| `CODEX_NETWORK_ACCESS` | read/workspace sandbox 네트워크 접근 여부 (기본: true) |
+| `BRIDGE_DATA_DIR` | 브리지 상태 파일 경로 (기본: `~/.claude/slack-bridge`) |
 | `CLAUDE_BIN` | `pty-claude` 엔진용 claude CLI 절대경로 (기본: `/Users/muzi/.local/bin/claude`) |
 | `CLAUDE_PTY_HOME` | `pty-claude` 엔진의 자식 프로세스에 다른 `HOME` 을 주고 싶을 때 (선택). 본 머신 인증과 분리하고 별도 계정으로 운영할 때 사용 |
 | `OPENAI_API_KEY` | STT용 OpenAI API 키 (선택) |
@@ -87,12 +98,24 @@ npm run dev    # 개발 (--watch)
 |---|---|---|---|
 | `claude` (기본) | Agent SDK `query()` API | **Agent SDK 풀** (6/15부터 Max 20x 월 $200 한도) | AskUserQuestion, rate-limit 헤더 지원 |
 | `pty-claude` | Claude Code TUI 를 `node-pty` 로 spawn → `~/.claude/sessions/<pid>.json` + jsonl tail | **인터랙티브 구독 풀** (별도 한도) | AskUserQuestion / rate-limit 헤더 미지원 (TUI 한계). 자동화/무거운 작업을 SDK 한도와 분리해 돌릴 때 사용 |
+| `codex` | 공유 `codex app-server` JSON-RPC 프로세스 | **Codex 계정 한도** | thread 생성/재개, 사용자 질문, tool 진행 상황, token/rate-limit, turn interrupt 지원 |
 
-전환: `!engine <claude\|pty-claude>` (세션 초기화됨). `!engine reset` 으로 기본값 복귀.
+전환: `!engine <claude\|pty-claude\|codex>`. 활성 세션이나 대기/실행 중인 작업이 있는 스레드에서는 엔진 변경을 거부한다(모든 참여자 기준). 새 스레드에서 선택하거나, 작업 종료 후 모든 참여자가 `!new`로 세션을 초기화한 뒤 변경한다. `!engine reset` 및 `!session`/`!sync`의 자동 엔진 감지에도 같은 제한을 적용한다.
+
+- `!model`은 Claude 계열 엔진에서 allow-list를 검증한다. Codex 엔진에서는 Codex CLI가 해석할 임의 모델 문자열을 허용한다.
+- `!effort`는 모든 엔진에서 지원한다. Codex는 `low/medium/high/xhigh/ultra`를 지원하고 호환성을 위해 `max→xhigh`로 매핑한다.
+- Codex 질문은 `item/tool/requestUserInput` RPC와 `agentMessage.delivery=async` 형식을 모두 처리한다. 비동기 질문 답변은 `turn/steer`로 현재 turn에 전달하며, silent 실행에서 비동기 질문이 오면 해당 turn을 중단하고 오류를 반환한다.
 
 cron / watch 도 작업 단위로 엔진 지정 가능:
-- `!cron add "<schedule>" <msg> --engine pty-claude -- <설명>` — 해당 cron 실행 시 스레드에 자동 적용
-- `!watch-set <channel_id> engine pty-claude` — watch 가 만든 스레드에 자동 적용 (reset 으로 해제)
+- `!cron add "<schedule>" <msg> --engine <pty-claude\|codex> -- <설명>` — 해당 cron 실행 시 스레드에 자동 적용
+- `!watch-set <channel_id> engine <pty-claude\|codex>` — watch 가 만든 스레드에 자동 적용 (reset 으로 해제)
+
+Watch는 채널별 감지와 수행 설정을 독립 저장한다:
+- 감지: `triageEngine` (`claude`/`codex`), `triageModel`. 미설정 시 기존 Claude SDK + `haiku`.
+- 수행: 기존 `engine` (`claude`/`pty-claude`/`codex`), `model`. `actionEngine`/`actionModel` 별칭도 지원. 미설정 시 기존 엔진별 모델 기본값을 유지한다.
+- `!watch` 등록 본문의 `key: value` 또는 `!watch-set <channel> <field> <value>`로 설정하고 `reset`으로 해제한다. 엔진을 바꾸면 해당 단계의 모델만 초기화한다(동시 등록한 모델은 유지).
+- `!watches`는 감지/수행의 유효 엔진·모델을 표시한다. 변경은 이후 감지되는 메시지에만 적용하며 기존 실행 스레드는 변경하지 않는다.
+- 감지는 매번 독립 실행하고 세션을 저장하지 않는다. Codex 감지는 ephemeral/read-only/network off 및 MCP/shell/apps/subagents 비활성화, JSON schema 판정을 사용한다. PTY는 수행 단계만 지원한다. 감지 오류/잘못된 JSON/시간 초과 시 작업을 실행하지 않는다.
 
 지정 안 하면 기본값 `claude` (SDK). 자동화는 SDK 한도와 분리해 운영하고 싶을 때 `pty-claude` 추천.
 
@@ -107,8 +130,10 @@ cron / watch 도 작업 단위로 엔진 지정 가능:
 | `!session <id>` | 세션 전환 (작업 디렉토리 자동 감지) |
 | `!pause` / `!resume` | 스레드 일시정지/재개 |
 | `!status` | 진행 중인 작업 상태 확인 |
-| `!stop` | 실행 중 작업 중단 + 큐 비우기 |
+| `!stop` / `!stop all` | 실행 중 작업 중단 / 작업 중단 후 큐 비우기 |
 | `!queue` | 대기열 확인 |
+| `!engine` / `!engine <claude\|pty-claude\|codex>` | 스레드 AI 엔진 확인/변경 |
+| `!model` / `!model <id>` | 스레드 모델 확인/변경 (엔진별 유효 모델) |
+| `!effort <level>` | thinking effort 조정 (Codex는 `xhigh`, `ultra` 포함) |
 | `!sync-all` | 최근 24h 내 변경된 모든 세션 일괄 동기화 |
 | `!sync-all <duration>` | 지정 기간 내 변경 세션 일괄 동기화 (예: `6h`, `30m`) |
-| `!engine` / `!engine <claude\|pty-claude>` | 스레드 AI 엔진 확인/변경 |

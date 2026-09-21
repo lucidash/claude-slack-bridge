@@ -1,8 +1,8 @@
-# Claude Slack Bridge
+# Claude & Codex Slack Bridge
 
-A bridge service that lets you remotely control Claude Code sessions through Slack threads.
+Slack 스레드에서 Claude Code와 Codex CLI 세션을 원격으로 실행하는 브리지 서비스입니다.
 
-Send a DM or mention the bot, and Claude Code runs on your local machine with results streamed back to the Slack thread. Built on the [Anthropic Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk).
+DM이나 봇 멘션을 보내면 로컬 머신의 선택된 엔진이 작업을 실행하고 결과와 진행 상황을 Slack 스레드로 전달합니다. Claude 엔진은 [Anthropic Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk), Codex 엔진은 최신 `codex app-server` JSON-RPC 프로토콜을 사용합니다.
 
 ## Features
 
@@ -15,9 +15,11 @@ Send a DM or mention the bot, and Claude Code runs on your local machine with re
 - **Thread Pause** — Freeze threads with `!pause`/`!resume`. Missed messages are automatically collected on resume
 - **Silent Mode** — Run a request quietly (`!silent <msg>`); progress is shadowed to DM, only the final result lands in the original thread
 - **Cron Automation** — Schedule recurring tasks with cron expressions, optionally with a per-job working directory
-- **Channel Watch** — Triage messages in any channel with Haiku and auto-respond to matching ones (`!watch`)
+- **Channel Watch** — Independent per-channel triage and action engine/model settings; Claude Haiku triage by default (`!watch`)
 - **Account Switching** — Register multiple Claude OAuth tokens and hot-swap between them (`!account switch`)
 - **Question Relay** — Claude's `AskUserQuestion` presented as numbered choices in Slack, with answers forwarded back
+- **Codex App Server** — Codex thread 생성/재개, 실시간 tool 활동, 토큰·rate limit, 사용자 질문, turn 중단을 Slack 기능과 연결
+- **Per-thread Engine** — `claude`, `pty-claude`, `codex` 중 스레드별 선택; cron과 channel watch에도 엔진 지정 가능
 - **Voice Input** — Auto STT transcription on audio/video file upload (OpenAI with Google fallback)
 - **Security** — Slack request signature verification + user whitelist
 
@@ -25,6 +27,7 @@ Send a DM or mention the bot, and Claude Code runs on your local machine with re
 
 - Node.js >= 18
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- Codex 엔진 사용 시 [Codex CLI](https://developers.openai.com/codex/cli/) 설치 및 로그인
 - Slack Bot Token (Bot User OAuth Token)
 - For HTTP mode only: tunneling for external access (ngrok, Cloudflare Tunnel, etc.)
 
@@ -51,6 +54,15 @@ cp .env.example .env
 | `CLAUDE_MODEL` | — | `sonnet` | Default Claude model (`opus`, `sonnet`, `haiku`) |
 | `CLAUDE_ALLOWED_DIRS` | — | — | Directories Claude Code can access (comma-separated) |
 | `CLAUDE_SKIP_PERMISSIONS` | — | `false` | Skip permission prompts when `true` |
+| `CODEX_PATH` | — | `codex` | Codex CLI 실행 파일 경로 |
+| `CODEX_MODEL` | — | CLI 기본값 | 기본 Codex 모델 ID |
+| `CODEX_EFFORT` | — | 모델 기본값 | 기본 reasoning effort |
+| `CODEX_ALLOWED_DIRS` | — | `CLAUDE_ALLOWED_DIRS` | Codex runtime workspace root 목록(쉼표 구분) |
+| `CODEX_SANDBOX` | — | `danger-full-access` | `read-only`, `workspace-write`, `danger-full-access` |
+| `CODEX_APPROVAL_POLICY` | — | `never` | `never`만 지원 (Slack 승인 중계 미지원) |
+| `CODEX_NETWORK_ACCESS` | — | `true` | read/workspace sandbox의 네트워크 접근 여부 |
+| `CODEX_REQUEST_TIMEOUT_MS` | — | `30000` | App Server JSON-RPC 요청 제한 시간(ms) |
+| `BRIDGE_DATA_DIR` | — | `~/.claude/slack-bridge` | 브리지 상태 파일 저장 경로 |
 | `OPENAI_API_KEY` | — | — | OpenAI API key for STT (falls back to Google if unset) |
 
 ## Usage
@@ -101,6 +113,18 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!sync-all [<duration>]` | Sync all sessions changed within window (default 24h, e.g. `6h`, `30m`) |
 | `!split` | Archive current thread and continue in a fresh thread (long-context relief) |
 
+`!session`, `!sync`, `!sync-all`, `!split`은 Claude와 Codex 세션을 모두 지원합니다. `!session <id>`와 `!sync <id>`는 저장된 세션 형식을 확인해 Codex 엔진과 작업 디렉토리를 자동 복원합니다.
+
+### Engine
+
+| Command | Description |
+|---------|-------------|
+| `!engine` | 현재 스레드 엔진 확인 |
+| `!engine <claude\|pty-claude\|codex>` | 활성 세션/작업이 없는 스레드에서만 엔진 변경 |
+| `!engine reset` | 기본 Claude SDK 엔진으로 복원 |
+
+활성 세션 또는 대기/실행 중인 작업이 있는 스레드에서는 엔진을 바꿀 수 없습니다(모든 참여자 기준). 새 스레드에서 엔진을 선택하거나, 작업 종료 후 모든 참여자가 `!new`로 초기화하세요. `!engine reset` 및 `!session`/`!sync`의 자동 엔진 전환도 같은 제한을 적용합니다.
+
 ### Working Directory / Model / Effort
 
 | Command | Description |
@@ -108,7 +132,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!wd <path>` | Set thread working directory (resets session) |
 | `!pwd` | Show current working directory |
 | `!model [<opus\|sonnet\|haiku>]` | Show or override Claude model for this thread (`!model reset` to clear) |
-| `!effort [<low\|medium\|high\|max>]` | Show or override reasoning effort for this thread (`!effort reset` to clear) |
+| `!effort [<level>]` | reasoning effort 변경. Codex는 `xhigh`, `ultra`도 지원 (`!effort reset`으로 해제) |
 
 ### Execution Control
 
@@ -140,9 +164,29 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | Command | Description |
 |---------|-------------|
 | `!watch <channel_id>` | Register a channel watch (multi-line `sender:` / `trigger:` / `action:` body) |
-| `!watch-set <channel_id> <field> <value>` | Edit a single field (`sender`, `trigger`, `action`, `enabled`, `channelName`, `anchorChannel`) |
+| `!watch-set <channel_id> <field> <value>` | Edit `sender`, `trigger`, `action`, `enabled`, `channelName`, `anchorChannel`, or the runtime fields below |
 | `!watches` | List all watches |
 | `!unwatch <channel_id>` | Remove a watch |
+
+Each channel has one watch, with independent settings for **condition detection** and **action execution**:
+
+| Phase | Engine field | Model field | Default when unset |
+|---|---|---|---|
+| Detection | `triageEngine`: `claude` / `codex` | `triageModel` | Claude SDK / `haiku` |
+| Action | `engine`: `claude` / `pty-claude` / `codex` | `model` | Claude SDK / `CLAUDE_MODEL` (or `sonnet`) |
+
+```text
+!watch-set C012345 triageEngine claude
+!watch-set C012345 triageModel haiku
+!watch-set C012345 engine codex
+!watch-set C012345 model <codex-model-id>
+```
+
+- `actionEngine` / `actionModel` are aliases for `engine` / `model`. All four settings are also accepted as `key: value` lines in the initial `!watch` registration.
+- `reset` (also `default` / `null`) removes that field's override. Changing a phase's engine clears only that phase's old model, unless a replacement model is supplied in the same registration. Set the engine before its model with `!watch-set`.
+- Settings are channel-local and apply to subsequently detected messages; they do not change existing execution threads. `!watches` shows both phases and their effective defaults.
+- Existing watches require no migration. An existing `engine` remains the action engine. No action model override means the selected engine's existing default: `CLAUDE_MODEL`/`sonnet` for SDK, Claude CLI default for `pty-claude`, `CODEX_MODEL`/CLI default for Codex. Codex detection without `triageModel` also uses `CODEX_MODEL`/CLI default, never the action model.
+- Detection is a separate non-persistent classification run. Claude detection disables tools; Codex detection uses an ephemeral read-only thread with network, configured MCP servers, shell, apps and subagents disabled. PTY is supported for actions only. Invalid/failed/timed-out detection does not start an action. Watch actions remain silent, so interactive questions are not supported there.
 
 ### Claude Account (OAuth tokens)
 
@@ -160,6 +204,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 src/
 ├── index.js       # Express server + Socket Mode client, event handler, orchestration
 ├── claude.js      # Agent SDK query() wrapper, stream parsing, tool callbacks
+├── codex.js       # Codex App Server JSON-RPC client, stream/question/session handling
 ├── commands.js    # Command handlers (!new, !session, !wd, !cron, !watch, etc.)
 ├── cron.js        # Cron job management and scheduled execution
 ├── watch.js       # Channel watch — Haiku triage and auto-response
@@ -197,6 +242,16 @@ Session and state data are stored as JSON files in `~/.claude/slack-bridge/`:
 | DELETE | `/inbox` | both | Clear inbox |
 
 In Socket mode, `/slack/events` is not registered; events arrive over the Slack WebSocket.
+
+## Tests
+
+```bash
+npm test
+```
+
+테스트는 가짜 Codex App Server를 사용해 신규 thread, resume, RPC/비동기 사용자 질문, turn interrupt, thread history 변환 및 명령어 상태 경합을 검증하므로 Codex 로그인이나 API 사용량이 필요하지 않습니다.
+
+Codex의 `agentMessage.delivery=async` 질문은 실행 완료 전에 게시하며 답변을 현재 turn에 전달합니다. 질문 UI가 없는 silent 실행에서 이 질문이 발생하면 무한 대기 대신 오류와 함께 해당 turn을 중단합니다.
 
 ## License
 
