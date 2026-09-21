@@ -100,7 +100,7 @@ npm test       # Codex App Server 통합 테스트
 | `pty-claude` | Claude Code TUI 를 `node-pty` 로 spawn → `~/.claude/sessions/<pid>.json` + jsonl tail | **인터랙티브 구독 풀** (별도 한도) | AskUserQuestion / rate-limit 헤더 미지원 (TUI 한계). 자동화/무거운 작업을 SDK 한도와 분리해 돌릴 때 사용 |
 | `codex` | 공유 `codex app-server` JSON-RPC 프로세스 | **Codex 계정 한도** | thread 생성/재개, 사용자 질문, tool 진행 상황, token/rate-limit, turn interrupt 지원 |
 
-전환: `!engine <claude\|pty-claude\|codex>` (세션과 대기 큐가 초기화됨). `!engine reset` 으로 기본값 복귀.
+전환: `!engine <claude\|pty-claude\|codex>`. 활성 세션이나 대기/실행 중인 작업이 있는 스레드에서는 엔진 변경을 거부한다(모든 참여자 기준). 새 스레드에서 선택하거나, 작업 종료 후 모든 참여자가 `!new`로 세션을 초기화한 뒤 변경한다. `!engine reset` 및 `!session`/`!sync`의 자동 엔진 감지에도 같은 제한을 적용한다.
 
 - `!model`은 Claude 계열 엔진에서 allow-list를 검증한다. Codex 엔진에서는 Codex CLI가 해석할 임의 모델 문자열을 허용한다.
 - `!effort`는 모든 엔진에서 지원한다. Codex는 `low/medium/high/xhigh/ultra`를 지원하고 호환성을 위해 `max→xhigh`로 매핑한다.

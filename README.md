@@ -120,8 +120,10 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | Command | Description |
 |---------|-------------|
 | `!engine` | 현재 스레드 엔진 확인 |
-| `!engine <claude\|pty-claude\|codex>` | 엔진 변경(호환되지 않는 세션·모델·effort 초기화) |
+| `!engine <claude\|pty-claude\|codex>` | 활성 세션/작업이 없는 스레드에서만 엔진 변경 |
 | `!engine reset` | 기본 Claude SDK 엔진으로 복원 |
+
+활성 세션 또는 대기/실행 중인 작업이 있는 스레드에서는 엔진을 바꿀 수 없습니다(모든 참여자 기준). 새 스레드에서 엔진을 선택하거나, 작업 종료 후 모든 참여자가 `!new`로 초기화하세요. `!engine reset` 및 `!session`/`!sync`의 자동 엔진 전환도 같은 제한을 적용합니다.
 
 ### Working Directory / Model / Effort
 

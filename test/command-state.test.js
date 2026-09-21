@@ -86,3 +86,49 @@ test('세션 조회 중 새 실행이 저장한 세션을 덮어쓰지 않는다
   await delayedLookup('!session', ctx, async () => store.saveSession(ctx.sessionKey, 'new-run'));
   assert.equal(store.getSession(ctx.sessionKey), 'new-run');
 });
+
+for (const [engine, command] of [['claude', '!engine codex'], ['codex', '!engine reset']]) {
+  test(`${command}는 다른 참여자의 활성 세션이 있으면 거부한다`, async () => {
+    const ctx = context();
+    store.saveThread(ctx.threadKey, 'U1', '/tmp');
+    store.setThreadEngine(ctx.threadKey, engine);
+    store.setThreadModel(ctx.threadKey, 'existing-model');
+    store.setThreadEffort(ctx.threadKey, 'high');
+    store.saveSession(ctx.sessionKey, 'existing-session');
+    ctx.sessionLocks.set(ctx.sessionKey, { processing: false, queue: ['queued'] });
+    await handleCommand(command, { ...ctx, userId: 'U2', sessionKey: `U2-${ctx.replyThreadTs}` });
+    assert.equal(store.getThreadEngine(ctx.threadKey), engine);
+    assert.equal(store.getThreadModel(ctx.threadKey), 'existing-model');
+    assert.equal(store.getThreadEffort(ctx.threadKey), 'high');
+    assert.equal(store.getSession(ctx.sessionKey), 'existing-session');
+    assert.deepEqual(ctx.sessionLocks.get(ctx.sessionKey).queue, ['queued']);
+    assert.match(messages.at(-1).text, /엔진을 변경할 수 없습니다/);
+  });
+}
+for (const command of ['!session', '!sync']) {
+  test(`${command}도 활성 세션의 엔진을 자동 변경하지 않는다`, async () => {
+    const ctx = context();
+    store.saveSession(ctx.sessionKey, 'claude-session');
+    await handleCommand(`${command} ${fast}`, ctx);
+    assert.equal(store.getThreadEngine(ctx.threadKey), null);
+    assert.equal(store.getSession(ctx.sessionKey), 'claude-session');
+    assert.match(messages.at(-1).text, /엔진을 변경할 수 없습니다/);
+  });
+}
+test('ID 저장 전 실행 중인 다른 참여자의 엔진도 변경하지 않는다', async () => {
+  const ctx = context();
+  ctx.sessionLocks.set(ctx.sessionKey, { processing: true, queue: [] });
+  await handleCommand('!engine codex', { ...ctx, userId: 'U2', sessionKey: `U2-${ctx.replyThreadTs}` });
+  assert.equal(store.getThreadEngine(ctx.threadKey), null);
+});
+test('활성 세션이 없는 스레드는 엔진 선택 및 !new 뒤 변경이 가능하다', async () => {
+  const ctx = context();
+  await handleCommand('!engine codex', ctx);
+  assert.equal(store.getThreadEngine(ctx.threadKey), 'codex');
+  store.saveSession(ctx.sessionKey, 'codex-session');
+  await handleCommand('!engine codex', ctx);
+  assert.equal(store.getSession(ctx.sessionKey), 'codex-session');
+  await handleCommand('!new', ctx);
+  await handleCommand('!engine claude', ctx);
+  assert.equal(store.getThreadEngine(ctx.threadKey), 'claude');
+});

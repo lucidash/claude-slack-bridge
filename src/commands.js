@@ -45,7 +45,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 
 *엔진*
 \`!engine\` — 현재 엔진 확인 (claude / pty-claude / codex)
-\`!engine <claude|pty-claude|codex>\` — 이 스레드의 엔진 변경 (세션 초기화됨)
+\`!engine <claude|pty-claude|codex>\` — 이 스레드의 엔진 변경 (활성 세션이 없을 때만)
 \`!engine reset\` — 기본값(claude SDK)으로 초기화
 
 *모델*
@@ -112,6 +112,20 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     });
     return true;
   };
+  const engineChangeBlocked = nextEngine => {
+    if ((getThreadEngine(stateKey) || 'claude') === nextEngine) return false;
+    const belongsToThread = key => key.endsWith(`-${replyThreadTs}`);
+    return Object.entries(getAllSessions()).some(([key, id]) => id && belongsToThread(key))
+      || [...(sessionLocks?.entries() || [])].some(([key, lock]) =>
+        belongsToThread(key) && (lock.processing || lock.queue?.length > 0));
+  };
+  const rejectEngineChange = async () => {
+    await slack.chat.postMessage({
+      channel, thread_ts: replyThreadTs,
+      text: '❌ 이 스레드에 활성 세션 또는 대기/실행 중인 작업이 있어 엔진을 변경할 수 없습니다. 새 스레드에서 엔진을 선택하거나, 모든 참여자가 작업 종료 후 `!new`로 세션을 초기화해주세요.',
+    });
+    return true;
+  };
 
   // help
   if (['!help', '/help', '!h', 'help'].includes(msg)) {
@@ -149,6 +163,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       const detectedEngine = detected.engine === 'codex'
         ? 'codex'
         : (currentEngine === 'pty-claude' ? 'pty-claude' : 'claude');
+      if (engineChangeBlocked(detectedEngine)) return rejectEngineChange();
       if (currentEngine !== detectedEngine) {
         setThreadModel(effectiveThreadKey, null);
         setThreadEffort(effectiveThreadKey, null);
@@ -306,6 +321,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     }
 
     if (arg === 'reset' || arg === 'default') {
+      if (engineChangeBlocked('claude')) return rejectEngineChange();
       setThreadEngine(effectiveThreadKey, null);
       setThreadModel(effectiveThreadKey, null);
       setThreadEffort(effectiveThreadKey, null);
@@ -339,6 +355,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       return true;
     }
 
+    if (engineChangeBlocked(arg)) return rejectEngineChange();
     setThreadEngine(effectiveThreadKey, arg);
     // 엔진별 세션 ID가 호환되지 않으므로 세션과 이전 엔진 대상 대기 요청을 함께 비운다.
     setThreadModel(effectiveThreadKey, null);
@@ -791,6 +808,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       const detectedEngine = detected.engine === 'codex'
         ? 'codex'
         : (syncEngine === 'pty-claude' ? 'pty-claude' : 'claude');
+      if (engineChangeBlocked(detectedEngine)) return rejectEngineChange();
       if (syncEngine !== detectedEngine) {
         setThreadModel(effectiveThreadKey, null);
         setThreadEffort(effectiveThreadKey, null);
