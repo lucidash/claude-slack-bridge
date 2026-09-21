@@ -229,7 +229,9 @@ In Socket mode, `/slack/events` is not registered; events arrive over the Slack 
 npm test
 ```
 
-테스트는 가짜 Codex App Server를 사용해 신규 thread, resume, 사용자 질문, turn interrupt, thread history 변환을 검증하므로 Codex 로그인이나 API 사용량이 필요하지 않습니다.
+테스트는 가짜 Codex App Server를 사용해 신규 thread, resume, RPC/비동기 사용자 질문, turn interrupt, thread history 변환 및 명령어 상태 경합을 검증하므로 Codex 로그인이나 API 사용량이 필요하지 않습니다.
+
+Codex의 `agentMessage.delivery=async` 질문은 실행 완료 전에 게시하며 답변을 현재 turn에 전달합니다. 질문 UI가 없는 silent 실행에서 이 질문이 발생하면 무한 대기 대신 오류와 함께 해당 turn을 중단합니다.
 
 ## License
 

@@ -104,6 +104,7 @@ npm test       # Codex App Server 통합 테스트
 
 - `!model`은 Claude 계열 엔진에서 allow-list를 검증한다. Codex 엔진에서는 Codex CLI가 해석할 임의 모델 문자열을 허용한다.
 - `!effort`는 모든 엔진에서 지원한다. Codex는 `low/medium/high/xhigh/ultra`를 지원하고 호환성을 위해 `max→xhigh`로 매핑한다.
+- Codex 질문은 `item/tool/requestUserInput` RPC와 `agentMessage.delivery=async` 형식을 모두 처리한다. 비동기 질문 답변은 `turn/steer`로 현재 turn에 전달하며, silent 실행에서 비동기 질문이 오면 해당 turn을 중단하고 오류를 반환한다.
 
 cron / watch 도 작업 단위로 엔진 지정 가능:
 - `!cron add "<schedule>" <msg> --engine <pty-claude\|codex> -- <설명>` — 해당 cron 실행 시 스레드에 자동 적용

@@ -200,6 +200,7 @@ function resultText(context) {
 
 function setAgentDelta(context, params) {
   if (!params.itemId || !params.delta) return;
+  if (context.asyncQuestionIds.has(params.itemId)) return;
   const current = context.messages.get(params.itemId) || { text: '', streamed: true };
   current.text += params.delta;
   current.streamed = true;
@@ -284,6 +285,48 @@ function normalizeQuestions(questions) {
   }));
 }
 
+function askUserInOrder(context, questions, signal) {
+  const answer = context.questionTail.then(() => {
+    if (signal.aborted) throw abortError();
+    const pendingText = resultText(context);
+    // async 질문 중 새로 생성되는 메시지까지 지우지 않도록 게시할 부분만 먼저 비운다.
+    context.messages.clear();
+    return context.onAskUser(questions, signal, pendingText);
+  });
+  context.questionTail = answer.catch(() => {});
+  return answer;
+}
+
+async function handleAsyncQuestion(server, context, item, turnId) {
+  if (context.asyncQuestionIds.has(item.id)) return;
+  context.asyncQuestionIds.add(item.id);
+  context.messages.delete(item.id);
+  const signal = context.abortController.signal;
+  try {
+    if (signal.aborted) return;
+    if (!context.onAskUser) throw new Error('이 실행 모드는 비동기 사용자 질문을 지원하지 않습니다. 일반 스레드에서 다시 실행해주세요.');
+    const questions = item.questions.map(question => ({
+      question: question.title,
+      options: (question.options || []).map(label => ({ label, description: '' })),
+      multiSelect: false,
+      provider: 'Codex',
+    }));
+    const answers = await askUserInOrder(context, questions, signal);
+    if (signal.aborted) return;
+    const text = questions.map(question => `${question.question}\n${answers?.[question.question] ?? ''}`).join('\n\n');
+    // async 질문은 응답할 JSON-RPC request ID가 없다. 현재 turn에 사용자 입력으로 전달한다.
+    await server.request('turn/steer', {
+      threadId: context.threadId,
+      expectedTurnId: turnId,
+      input: [{ type: 'text', text }],
+    });
+  } catch (error) {
+    if (signal.aborted) return;
+    context.inputError = error;
+    requestInterrupt(server, context);
+  }
+}
+
 async function handleUserInputRequest(server, msg, context) {
   const original = msg.params?.questions || [];
   if (!context?.onAskUser) {
@@ -302,14 +345,8 @@ async function handleUserInputRequest(server, msg, context) {
   try {
     if (requestController.signal.aborted) return;
     const questions = normalizeQuestions(original);
-    const answerMap = await context.onAskUser(
-      questions,
-      requestController.signal,
-      resultText(context),
-    );
+    const answerMap = await askUserInOrder(context, questions, requestController.signal);
     if (requestController.signal.aborted) return;
-    // 질문 전에 Slack으로 내보낸 텍스트가 최종 응답에 중복되지 않도록 비운다.
-    context.messages.clear();
     const answers = {};
     for (const question of questions) {
       const answer = answerMap?.[question.question];
@@ -362,7 +399,7 @@ function finishContext(context, turn) {
   if (status === 'failed') {
     context.reject(context.lastError || new Error(turn?.error?.message || 'Codex turn 실패'));
   } else if (status === 'interrupted' || context.aborted) {
-    context.reject(new Error('중단됨 (사용자 요청)'));
+    context.reject(context.inputError || new Error('중단됨 (사용자 요청)'));
   } else {
     context.resolve();
   }
@@ -400,7 +437,11 @@ function handleNotification(server, msg) {
       updateActivity(context, params.item);
       break;
     case 'item/completed':
-      if (params.item?.type === 'agentMessage') setCompletedAgentMessage(context, params.item);
+      if (params.item?.type === 'agentMessage'
+        && params.item.delivery === 'async' && params.item.questions?.length) {
+        context.turnId ||= params.turnId;
+        void handleAsyncQuestion(server, context, params.item, params.turnId || context.turnId);
+      } else if (params.item?.type === 'agentMessage') setCompletedAgentMessage(context, params.item);
       else updateActivity(context, params.item);
       break;
     case 'item/reasoning/delta':
@@ -444,10 +485,13 @@ function createDeferredContext(callbacks, approvalPolicy) {
     activities: [],
     activityIndexes: new Map(),
     messages: new Map(),
+    asyncQuestionIds: new Set(),
+    questionTail: Promise.resolve(),
     pendingServerRequests: new Map(),
     lastUsage: null,
     lastRateLimit: null,
     lastError: null,
+    inputError: null,
     abortController: new AbortController(),
     threadId: null,
     turnId: null,
@@ -535,11 +579,11 @@ function requestInterrupt(server, context) {
   }).then(() => {
     if (!context.settled) {
       context.interruptTimeoutId = setTimeout(() => {
-        rejectWithoutStoppingOtherRuns(server, context, abortError());
+        rejectWithoutStoppingOtherRuns(server, context, context.inputError || abortError());
       }, REQUEST_TIMEOUT_MS);
     }
   }).catch(() => {
-    rejectWithoutStoppingOtherRuns(server, context, abortError());
+    rejectWithoutStoppingOtherRuns(server, context, context.inputError || abortError());
   });
 }
 
