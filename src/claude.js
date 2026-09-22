@@ -109,6 +109,8 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   }
 
   // canUseTool 콜백: AskUserQuestion은 Slack으로 릴레이, 나머지는 자동 승인
+  // bypassPermissions 에서는 SDK 가 "canUseTool will not be invoked" 경고(CLAUDE_SDK_CAN_USE_TOOL_SHADOWED)를 출력하지만
+  // AskUserQuestion 은 bypassPermissions 에서도 이 콜백이 호출되므로 경고는 무시해도 된다
   const abortController = new AbortController();
   const canUseTool = async (toolName, input) => {
     if (toolName === 'AskUserQuestion' && onAskUser) {
