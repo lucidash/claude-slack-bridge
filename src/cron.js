@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { randomUUID } from 'crypto';
-import { getCrons, saveCrons, getSession, saveThread, setThreadEngine } from './store.js';
+import { getCrons, saveCrons, getSession, saveThread, setThreadEngine, setThreadModel } from './store.js';
 import { slack } from './slack.js';
 
 const scheduledJobs = new Map(); // id → cron.ScheduledTask
@@ -49,12 +49,13 @@ async function executeCronJob(job, callbacks = {}) {
 
     const sessionKey = `${job.userId}-${msg.ts}`;
 
-    // job.workdir / job.engine 이 지정되어 있으면 새 스레드에 매핑 등록
-    // (executeClaudeRequest 가 getThreadWorkdir / getThreadEngine 으로 읽음)
+    // job.workdir / job.engine / job.model 이 지정되어 있으면 새 스레드에 매핑 등록
+    // (executeClaudeRequest 가 getThreadWorkdir / getThreadEngine / getThreadModel 으로 읽음)
     const threadKey = `${job.channel}-${msg.ts}`;
-    if (job.workdir || job.engine) {
+    if (job.workdir || job.engine || job.model) {
       saveThread(threadKey, job.userId, job.workdir || null);
       if (job.engine) setThreadEngine(threadKey, job.engine);
+      if (job.model) setThreadModel(threadKey, job.model);
     }
 
     // 세션 ID가 생성되면 콜백 호출 (실행 초기에 감지)
@@ -108,7 +109,7 @@ async function executeCronJob(job, callbacks = {}) {
   }
 }
 
-export function addCronJob({ schedule, message, channel, userId, description, workdir, engine }) {
+export function addCronJob({ schedule, message, channel, userId, description, workdir, engine, model }) {
   if (!cron.validate(schedule)) {
     throw new Error(`유효하지 않은 cron 표현식: \`${schedule}\``);
   }
@@ -122,6 +123,7 @@ export function addCronJob({ schedule, message, channel, userId, description, wo
     description: description || message,
     workdir: workdir || null,
     engine: engine || null,
+    model: model || null,
     enabled: true,
     createdAt: new Date().toISOString(),
     lastRun: null,

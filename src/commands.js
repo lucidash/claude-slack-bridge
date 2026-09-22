@@ -6,6 +6,10 @@ import { stopClaudeQuery } from './claude.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
+// !model / !cron add --model 에서 공통으로 쓰는 허용 모델 목록
+const VALID_MODELS = ['sonnet', 'opus', 'haiku',
+  'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7', 'claude-haiku-4-5-20251001'];
+
 function formatElapsed(ms) {
   const sec = Math.floor(ms / 1000);
   return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${sec % 60}s`;
@@ -65,7 +69,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 
 *Cron*
 \`!cron\` — 등록된 cron 목록
-\`!cron add "schedule" message [--workdir <path>] [--engine <claude|pty-claude>] [-- 설명]\` — cron 등록
+\`!cron add "schedule" message [--workdir <path>] [--engine <claude|pty-claude>] [--model <sonnet|opus|haiku>] [-- 설명]\` — cron 등록
 \`!cron remove <id>\` — cron 삭제
 \`!cron pause <id>\` / \`!cron resume <id>\` — 일시정지/재개
 \`!cron run <id>\` — 즉시 실행
@@ -192,8 +196,6 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   const modelMatch = userMessage.match(/^[!\/]model(?:\s+(.+))?$/i);
   if (modelMatch) {
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
-    const VALID_MODELS = ['sonnet', 'opus', 'haiku',
-      'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7', 'claude-haiku-4-5-20251001'];
     const arg = modelMatch[1]?.trim().toLowerCase();
 
     if (!arg || arg === 'current') {
@@ -789,13 +791,13 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const args = (cronMatch[1] || '').trim();
     const sub = args.split(/\s+/)[0]?.toLowerCase();
 
-    // !cron add "schedule" message [--workdir <path>] [-- description]
+    // !cron add "schedule" message [--workdir <path>] [--engine <engine>] [--model <model>] [-- description]
     if (sub === 'add') {
       const addMatch = args.match(/^add\s+"([^"]+)"\s+(.+)$/i);
       if (!addMatch) {
         await slack.chat.postMessage({
           channel,
-          text: '사용법: `!cron add "0 9 * * 1-5" /scrum [--workdir ~/projects/likey-backend] [-- 매일 아침 스크럼]`',
+          text: '사용법: `!cron add "0 9 * * 1-5" /scrum [--workdir ~/projects/likey-backend] [--engine claude] [--model sonnet] [-- 매일 아침 스크럼]`',
           thread_ts: replyThreadTs,
         });
         return true;
@@ -803,11 +805,11 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       const schedule = addMatch[1];
       let message = addMatch[2];
 
-      // --workdir / --engine 추출 (description 의 `--` 보다 먼저 처리)
+      // --workdir / --engine / --model 추출 (description 의 `--` 보다 먼저 처리)
       let workdir = null;
       const wdMatch = message.match(/\s+--workdir\s+(\S+)/);
       if (wdMatch) {
-        workdir = wdMatch[1];
+        workdir = wdMatch[1].replace(/^~/, homedir());
         message = message.replace(/\s+--workdir\s+\S+/, '');
       }
 
@@ -827,6 +829,21 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         }
       }
 
+      let model = null;
+      const mdlMatch = message.match(/\s+--model\s+(\S+)/);
+      if (mdlMatch) {
+        model = mdlMatch[1].toLowerCase();
+        message = message.replace(/\s+--model\s+\S+/, '');
+        if (!VALID_MODELS.includes(model)) {
+          await slack.chat.postMessage({
+            channel,
+            text: `❌ 알 수 없는 모델: \`${model}\`\n사용 가능: \`sonnet\`, \`opus\`, \`haiku\``,
+            thread_ts: replyThreadTs,
+          });
+          return true;
+        }
+      }
+
       // -- description split
       let description = null;
       const descSplit = message.match(/^(.+?)\s+--\s+(.+)$/);
@@ -837,12 +854,13 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         message = message.trim();
       }
       try {
-        const job = addCronJob({ schedule, message, channel, userId, description, workdir, engine });
+        const job = addCronJob({ schedule, message, channel, userId, description, workdir, engine, model });
         const wdLine = job.workdir ? `\n작업 디렉토리: \`${job.workdir}\`` : '';
         const engLine = job.engine ? `\n엔진: \`${job.engine}\`` : '';
+        const mdlLine = job.model ? `\n모델: \`${job.model}\`` : '';
         await slack.chat.postMessage({
           channel,
-          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`${wdLine}${engLine}\n설명: ${job.description}`,
+          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`${wdLine}${engLine}${mdlLine}\n설명: ${job.description}`,
           thread_ts: replyThreadTs,
         });
       } catch (err) {
@@ -985,8 +1003,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         const lastRun = j.lastRun ? new Date(j.lastRun).toLocaleString('ko-KR') : '-';
         const wdInfo = j.workdir ? ` | wd: \`${j.workdir}\`` : '';
         const engInfo = j.engine ? ` | engine: \`${j.engine}\`` : '';
+        const mdlInfo = j.model ? ` | model: \`${j.model}\`` : '';
         lines.push(`${status} \`${j.id}\` | \`${j.schedule}\` | ${j.description}`);
-        lines.push(`    명령: \`${j.message}\`${wdInfo}${engInfo} | 마지막 실행: ${lastRun}`);
+        lines.push(`    명령: \`${j.message}\`${wdInfo}${engInfo}${mdlInfo} | 마지막 실행: ${lastRun}`);
       }
       await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
       return true;

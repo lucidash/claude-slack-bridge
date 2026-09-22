@@ -96,6 +96,10 @@ cron / watch 도 작업 단위로 엔진 지정 가능:
 
 지정 안 하면 기본값 `claude` (SDK). 자동화는 SDK 한도와 분리해 운영하고 싶을 때 `pty-claude` 추천.
 
+cron 은 모델도 작업 단위로 지정 가능:
+- `!cron add "<schedule>" <msg> --model sonnet -- <설명>` — 해당 cron 이 만든 스레드에 `!model` 과 동일하게 적용
+- 지정 안 하면 `CLAUDE_MODEL` 기본값 사용
+
 ## 주요 명령어
 
 | 명령어 | 설명 |
