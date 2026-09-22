@@ -129,7 +129,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | Command | Description |
 |---------|-------------|
 | `!cron` / `!cron list` | List all jobs |
-| `!cron add "<schedule>" <message> [--workdir <path>] [-- <desc>]` | Register a scheduled job (optional workdir + description) |
+| `!cron add "<schedule>" <message> [--workdir <path>] [--engine <claude\|pty-claude>] [--model <sonnet\|opus\|haiku>] [-- <desc>]` | Register a scheduled job (optional workdir / engine / model + description) |
 | `!cron pause <id>` / `!cron resume <id>` | Toggle job |
 | `!cron run <id>` | Execute immediately |
 | `!cron remove <id>` | Delete job |
