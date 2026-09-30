@@ -1,0 +1,24 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Seoul
+    # package.json 의 버전 범위도 새 버전으로 올린다 (lock 만 갱신하지 않음)
+    versioning-strategy: increase
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # Agent SDK 는 0.x 라 minor 업데이트에도 동작 변경(모델 alias 해석 등)이 포함되므로 별도 PR 로 분리한다
+      agent-sdk:
+        patterns:
+          - "@anthropic-ai/claude-agent-sdk"
+      # 나머지 의존성의 minor·patch 는 PR 1개로 묶고, major 는 의존성마다 PR 을 따로 생성한다
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
