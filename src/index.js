@@ -31,7 +31,7 @@ import {
   saveProcessing, clearProcessing, getStaleProcessing,
   getSessionPrUrl, getThreadModel, getThreadEffort, getThreadEngine, setThreadEngine,
 } from './store.js';
-import { runClaudeCode } from './claude.js';
+import { runClaudeCode, formatBackgroundTasks } from './claude.js';
 import { runClaudeViaPty } from './claude-pty.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
@@ -440,12 +440,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
   if (lock) {
     lock.startTime = startTime;
     lock.lastActivities = [];
+    lock.backgroundTasks = [];
     lock.lastUsage = null;
     lock.currentMessage = userMessage.length > 80 ? userMessage.substring(0, 80) + '…' : userMessage;
   }
 
   try {
     let lastActivities = [];
+    let lastBackgroundTasks = [];
     let nextUpdateDelay = 5000;
     const MAX_UPDATE_DELAY = 60000;
     const BACKOFF_MULTIPLIER = 1.5;
@@ -462,9 +464,10 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
           const prUrl = sid ? getSessionPrUrl(sid) : null;
           const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
           const recentActivities = lastActivities.slice(-5).join('\n  ');
-          const statusText = recentActivities
-            ? `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo}${prInfo})\n  ${recentActivities}`
-            : `⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo}${prInfo})`;
+          const statusLines = [`⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo}${prInfo})`];
+          if (recentActivities) statusLines.push(`  ${recentActivities}`);
+          statusLines.push(...formatBackgroundTasks(lastBackgroundTasks));
+          const statusText = statusLines.join('\n');
           try {
             await slack.chat.update({ channel: logChannel, ts: processingTs, text: statusText });
           } catch { /* ignore update errors */ }
@@ -474,14 +477,16 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       })();
     }
 
-    const onProgress = (activities, usage, rateLimit) => {
+    const onProgress = (activities, usage, rateLimit, backgroundTasks) => {
       lastActivities = [...activities];
       if (usage) lastUsage = usage;
       if (rateLimit) lastRateLimit = rateLimit;
+      if (backgroundTasks) lastBackgroundTasks = backgroundTasks;
       if (lock) {
         lock.lastActivities = lastActivities;
         lock.lastUsage = lastUsage;
         lock.lastRateLimit = lastRateLimit;
+        lock.backgroundTasks = lastBackgroundTasks;
       }
     };
 
@@ -545,7 +550,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     const threadEffort = getThreadEffort(effectiveThreadKey);
     const engine = getThreadEngine(effectiveThreadKey) || 'claude';
 
-    let result, usage, rateLimit;
+    let result, usage, rateLimit, backgroundKill;
     if (engine === 'pty-claude') {
       // pty 엔진은 AskUserQuestion / rate-limit 헤더 미지원 (Claude Code TUI 한계)
       ({ result, usage, rateLimit } = await runClaudeViaPty(sessionKey, fullPrompt, workdir, {
@@ -553,7 +558,7 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
         model: threadModel || undefined, effort: threadEffort || undefined,
       }));
     } else {
-      ({ result, usage, rateLimit } = await runClaudeCode(sessionKey, fullPrompt, workdir, {
+      ({ result, usage, rateLimit, backgroundKill } = await runClaudeCode(sessionKey, fullPrompt, workdir, {
         onProgress, onAskUser, onSessionReady,
         model: threadModel || undefined, effort: threadEffort || undefined,
       }));
@@ -593,6 +598,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim() || '(빈 응답)';
+    }
+
+    // 백그라운드 작업이 대기 한도로 강제 종료됨 — 다음 메시지로 세션을 이으면 중단 알림을 받고 재개할 수 있다
+    if (backgroundKill) {
+      const { ceilingMs, tasks } = backgroundKill;
+      const ceiling = ceilingMs >= 60000 ? `${Math.round(ceilingMs / 60000)}분` : `${Math.round(ceilingMs / 1000)}초`;
+      const names = tasks.length ? `: ${tasks.join(', ')}` : '';
+      cleanResult += `\n\n⚠️ 백그라운드 작업이 대기 한도(${ceiling})를 넘겨 강제 종료됐습니다${names}\n이어서 진행하려면 이 스레드에 메시지를 보내주세요.`;
     }
 
     // 응답을 원본 스레드에 게시 (항상 — silent이든 아니든)
