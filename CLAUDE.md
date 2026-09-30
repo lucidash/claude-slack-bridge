@@ -50,7 +50,9 @@ npm run dev    # 개발 (--watch)
 1. Slack 이벤트 수신 → 서명 검증 + 화이트리스트 확인
 2. 명령어(`!` prefix)면 즉시 처리, 아니면 Agent SDK `query()` 실행
 3. 세션별 lock/queue로 동시 요청 직렬화
-4. SDK 스트리밍 이벤트(`assistant`, `result`, `rate_limit_event`)로 진행 상태를 Slack에 실시간 업데이트
+4. SDK 스트리밍 이벤트(`assistant`, `result`, `rate_limit_event`, 백그라운드 작업 `background_tasks_changed`·`task_*`)로 진행 상태를 Slack에 실시간 업데이트
+   - 서브에이전트 메시지(`parent_tool_use_id`)는 진행 표시에만 쓰고 최종 응답에는 넣지 않는다
+   - 메인 턴이 끝나도 백그라운드 작업이 남아 있으면 스트림이 계속되고, 완료 알림마다 턴이 이어져 `result` 가 여러 번 올 수 있다
 5. 새 세션이면 세션 ID를 스레드에 댓글로 기록
 
 ## 개발 컨벤션
@@ -74,6 +76,7 @@ npm run dev    # 개발 (--watch)
 | `CLAUDE_MODEL` | Claude 모델 (기본: sonnet) |
 | `CLAUDE_ALLOWED_DIRS` | Claude CLI 허용 디렉토리 (콤마 구분) |
 | `CLAUDE_SKIP_PERMISSIONS` | 권한 프롬프트 스킵 여부 |
+| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | 메인 턴이 끝난 뒤 백그라운드 작업(서브에이전트 등)을 기다리는 최대 시간 (기본: `3600000` = 1시간, `0` = 무제한). 넘으면 CLI 가 남은 작업을 강제 종료하고, 브릿지는 최종 응답에 안내를 붙인다 |
 | `CLAUDE_BIN` | `pty-claude` 엔진용 claude CLI 절대경로 (기본: `/Users/muzi/.local/bin/claude`) |
 | `CLAUDE_PTY_HOME` | `pty-claude` 엔진의 자식 프로세스에 다른 `HOME` 을 주고 싶을 때 (선택). 본 머신 인증과 분리하고 별도 계정으로 운영할 때 사용 |
 | `OPENAI_API_KEY` | STT용 OpenAI API 키 (선택) |

@@ -2,7 +2,7 @@ import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
 import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getThreadEngine, setThreadEngine, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
-import { stopClaudeQuery } from './claude.js';
+import { stopClaudeQuery, formatBackgroundTasks } from './claude.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
@@ -424,6 +424,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       lines.push(`🔧 최근 활동:`);
       activities.forEach(a => lines.push(`  ${a}`));
     }
+    lines.push(...formatBackgroundTasks(lock.backgroundTasks));
     if (lock.queue.length > 0) {
       lines.push(`📥 대기열: ${lock.queue.length}건`);
     }

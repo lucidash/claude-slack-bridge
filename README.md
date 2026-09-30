@@ -51,6 +51,7 @@ cp .env.example .env
 | `CLAUDE_MODEL` | — | `sonnet` | Default Claude model (`opus`, `sonnet`, `haiku`) |
 | `CLAUDE_ALLOWED_DIRS` | — | — | Directories Claude Code can access (comma-separated) |
 | `CLAUDE_SKIP_PERMISSIONS` | — | `false` | Skip permission prompts when `true` |
+| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | — | `3600000` | Max time to wait for background tasks (subagents etc.) after the main turn ends; `0` waits indefinitely. Remaining tasks are killed past this limit |
 | `OPENAI_API_KEY` | — | — | OpenAI API key for STT (falls back to Google if unset) |
 
 ## Usage
