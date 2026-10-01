@@ -60,7 +60,9 @@ npm run dev    # 개발 (--watch)
 5. Slack 표시는 턴 단위 (`turn-view.js`)
    - 턴마다 스트리밍 메시지 하나(`chat.startStream`, timeline): 모델의 글 + 도구 호출 카드(`task_update`). 병렬 호출은 카드 하나로 묶는다
    - `task_update` 는 같은 id 로 다시 보내면 title·status 는 교체, details·output 은 **이어 붙는다** — 바뀌는 정보(서브에이전트 진행)는 title 에 넣는다
-   - `stopStream` 시점에 진행 중인 카드는 error 로 바뀐다 — 턴을 넘기는 백그라운드 작업은 스트림이 아니라 현황 카드(`plan` 블록, `chat.update`)에서 관리한다
+   - `stopStream` 시점에 진행 중인(`pending` 포함) 카드는 error 로 바뀐다 — 턴을 넘기는 백그라운드 작업은 스트림이 아니라 현황 카드(`plan` 블록, `chat.update`)에서 관리한다
+   - Slack 은 스트리밍 메시지를 시작 약 5분 뒤 닫는다 (갱신과 무관, 이후 `appendStream` 은 `message_not_in_streaming_state`). 그래서 4분이 지나면 새 메시지로 넘긴다
+   - 메시지를 넘길 때(4분·길이 제한·질문으로 멈춤·만료) 진행 중 카드는 새 메시지에 처음부터 다시 띄우고, 이전 메시지에서는 `chat.update` 로 뺀다 (카드만 있던 메시지는 지운다). 닫힌 스트리밍 메시지도 `chat.update` 로 고칠 수 있다 (`task_card` 의 status 는 `in_progress`·`complete`·`error` 만)
    - 서브에이전트 메시지(`parent_tool_use_id`)는 진행 표시에만 쓰고 응답 글에는 넣지 않는다
 6. 백그라운드 대기 중(턴 사이) 스레드에 온 메시지는 같은 query 에 바로 넣어 다음 턴으로 처리한다. 턴 도중 온 메시지는 대기열에 두었다가 턴이 끝나면 넣는다
 7. 새 세션이면 세션 ID를 스레드에 댓글로 기록

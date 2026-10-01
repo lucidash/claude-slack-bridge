@@ -7,6 +7,8 @@ const FLUSH_DELAY_MS = 700; // 청크를 모아 보내는 간격 (appendStream �
 const MAX_CHUNKS_PER_CALL = 20;
 const SEGMENT_TEXT_LIMIT = 3500; // 이보다 길면 새 메시지로 이어 쓴다 (긴 rich text 는 앞부분이 잘려 보이는 문제)
 const SEGMENT_CARD_LIMIT = 30; // 메시지당 블록 수 제한 대비
+// Slack 은 스트리밍 메시지를 시작 약 5분 뒤 닫고(갱신과 무관) 진행 중 카드를 error 로 바꾼다 — 그 전에 새 메시지로 넘긴다
+const SEGMENT_MAX_AGE_MS = 4 * 60_000;
 const MAX_DETAIL_LINES = 5; // 병렬 호출 묶음은 5건까지만 세부를 적고 나머지는 제목의 건수로 보여준다
 const MAX_DETAIL_LINE_LEN = 200;
 const FALLBACK_PIECE_LEN = 11000; // markdown 블록 합계 12,000자 제한
@@ -94,6 +96,9 @@ export class TurnView {
     this.toolToCard = new Map(); // tool_use_id → cardId
     this.lastGroup = null; // 병렬 호출 묶음 { messageId, name, cardId }
     this.flushTimer = null;
+    this.rolloverTimer = null;
+    this.retire = null; // 새 메시지로 옮겨서 이전 메시지에서 뺄 카드 { ts, ids }
+    this.held = null; // 멈춘 동안 다시 띄우지 않고 있는 진행 중 카드
     this.chain = Promise.resolve();
     this.fallback = null; // 스트리밍을 못 쓰면 글만 모아 일반 메시지로 보낸다 { text }
   }
@@ -175,10 +180,13 @@ export class TurnView {
     this.#queueCard(card);
   }
 
-  /** AskUserQuestion 등으로 턴이 멈출 때 지금까지 내용을 확정한다 — 이후 내용은 새 메시지로 이어진다 */
+  /**
+   * AskUserQuestion 등으로 턴이 멈출 때 지금까지 내용을 확정한다 — 이후 내용은 새 메시지로 이어진다.
+   * 진행 중 카드는 질문 아래에 오도록 다음 내용이 올 때 다시 띄운다
+   */
   async pause() {
     if (this.finished || !this.started) return;
-    this.#cut({ force: true });
+    this.#cut({ hold: true });
     await this.#flush();
   }
 
@@ -225,22 +233,29 @@ export class TurnView {
   }
 
   // 아직 안 보낸 같은 카드 갱신이 있으면 새로 넣지 않는다 — 보낼 때 최신 상태로 만든다 (메시지 경계는 넘지 않는다)
-  #queueCard(card) {
+  #queueCard(card, { full = false } = {}) {
     for (let i = this.ops.length - 1; i >= 0 && (this.ops[i].chunk || this.ops[i].card); i--) {
       if (this.ops[i].card === card) return;
     }
-    this.#enqueue({ card });
+    this.#enqueue({ card, full });
   }
 
-  // 새 메시지로 넘긴다. 진행 중 카드가 있으면 넘기지 않는다 (넘기면 이전 메시지에서 error 로 바뀜)
-  #cut({ force = false } = {}) {
-    if (!force && [...this.segCards].some(id => this.cards.get(id)?.status === 'in_progress')) return;
-    this.#enqueue({ cut: true });
+  // 새 메시지로 넘긴다. 진행 중 카드는 새 메시지로 옮긴다 — 이전 메시지에 두면 닫힐 때 error 로 바뀐다.
+  // hold 면 다음 내용이 올 때까지 다시 띄우지 않는다
+  #cut({ hold = false } = {}) {
+    const carry = [...this.segCards].filter(id => this.cards.get(id)?.status === 'in_progress');
+    this.#enqueue({ cut: true, carry, hold });
     this.segText = 0;
-    this.segCards = new Set();
+    this.segCards = new Set(carry);
+    if (hold) this.held = carry;
+    else for (const id of carry) this.#queueCard(this.cards.get(id), { full: true });
   }
 
   #enqueue(op) {
+    if (this.held && (op.chunk || op.card)) {
+      for (const id of this.held) this.ops.push({ card: this.cards.get(id), full: true });
+      this.held = null;
+    }
     this.ops.push(op);
     if ((op.chunk || op.card) && !this.flushTimer) {
       this.flushTimer = setTimeout(() => {
@@ -265,12 +280,12 @@ export class TurnView {
         const chunks = [];
         while (this.ops.length && (this.ops[0].chunk || this.ops[0].card) && chunks.length < MAX_CHUNKS_PER_CALL) {
           const op = this.ops.shift();
-          chunks.push(op.chunk || this.#cardChunk(op.card));
+          chunks.push(op.chunk || this.#cardChunk(op.card, { full: op.full }));
         }
         await this.#send(chunks);
       } else {
         const op = this.ops.shift();
-        await this.#close(op.stop ? op.footer : null, !!op.stop);
+        await this.#close(op.stop ? op.footer : null, !!op.stop, op);
       }
     }
   }
@@ -289,9 +304,12 @@ export class TurnView {
       if (this.segment) {
         // 스트림이 끊겼으면(만료 등) 새 메시지로 이어 쓴다
         console.warn(`[TurnView] appendStream failed (${code}), continuing in a new message`);
+        const { ts } = this.segment;
         this.#dropSegment();
+        const restart = this.#restartChunks(chunks);
+        await this.#setRetire(ts, restart.filter(c => c.type === 'task_update').map(c => c.id));
         try {
-          await this.#startSegment(this.#restartChunks(chunks));
+          await this.#startSegment(restart);
           return;
         } catch (err2) {
           console.warn(`[TurnView] restart stream failed (${err2.data?.error || err2.message})`);
@@ -313,11 +331,42 @@ export class TurnView {
     });
     this.segment = { ts: res.ts };
     if (this.processingKey) saveProcessing(this.processingKey, { channel: this.channel, ts: res.ts, threadTs: this.threadTs, kind: 'stream' });
+    this.rolloverTimer = setTimeout(() => {
+      if (this.finished || this.segment?.ts !== res.ts) return;
+      this.#cut();
+      this.#flush();
+    }, SEGMENT_MAX_AGE_MS);
+    // 새 메시지에 띄운 뒤에 이전 메시지에서 빼야 카드가 잠깐이라도 사라지지 않는다
+    await this.#runRetire();
   }
 
   #dropSegment() {
+    clearTimeout(this.rolloverTimer);
     this.segment = null;
     if (this.processingKey) clearProcessing(this.processingKey);
+  }
+
+  async #setRetire(ts, ids) {
+    await this.#runRetire(); // 아직 못 뺀 게 있으면 먼저 정리한다
+    if (ids.length) this.retire = { ts, ids };
+  }
+
+  // 새 메시지로 옮긴 카드를 이전 메시지에서 뺀다 — 카드만 있던 메시지면 지운다
+  async #runRetire() {
+    if (!this.retire) return;
+    const { ts, ids } = this.retire;
+    this.retire = null;
+    try {
+      const res = await slack.conversations.replies({ channel: this.channel, ts: this.threadTs, oldest: ts, latest: ts, inclusive: true, limit: 1 });
+      const msg = res.messages?.find(m => m.ts === ts);
+      if (!msg?.blocks) return;
+      const blocks = msg.blocks.filter(b => !(b.type === 'task_card' && ids.includes(b.task_id)));
+      if (blocks.length === msg.blocks.length) return;
+      if (blocks.length) await slack.chat.update({ channel: this.channel, ts, text: msg.text || ' ', blocks });
+      else await slack.chat.delete({ channel: this.channel, ts });
+    } catch (err) {
+      console.warn(`[TurnView] retire cards failed: ${err.data?.error || err.message}`);
+    }
   }
 
   // 끊긴 메시지 대신 새 메시지를 열 때 보낼 청크 — 진행 중 카드와 이번에 보내던 카드를 처음부터 한 번씩 다시 띄운다
@@ -329,7 +378,7 @@ export class TurnView {
     return [...cardChunks, ...chunks.filter(c => c.type !== 'task_update')];
   }
 
-  async #close(footer, final) {
+  async #close(footer, final, { carry = [], hold = false } = {}) {
     if (this.fallback) {
       if (final) await this.#postFallback(footer);
       return;
@@ -346,6 +395,8 @@ export class TurnView {
     this.#dropSegment();
     await slack.chat.stopStream({ channel: this.channel, ts, ...(final && footer ? { blocks: [contextBlock(footer)] } : {}) })
       .catch(err => console.warn(`[TurnView] stopStream failed: ${err.data?.error || err.message}`));
+    await this.#setRetire(ts, carry);
+    if (hold) await this.#runRetire(); // 다시 띄울 때까지 이전 메시지에 error 로 남지 않도록 바로 뺀다
   }
 
   #absorb(chunks) {
