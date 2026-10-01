@@ -31,8 +31,9 @@ import {
   saveProcessing, clearProcessing, getStaleProcessing,
   getSessionPrUrl, getThreadModel, getThreadEffort, getThreadEngine, setThreadEngine,
 } from './store.js';
-import { runClaudeCode, formatBackgroundTasks } from './claude.js';
+import { runClaudeSession } from './session.js';
 import { runClaudeViaPty } from './claude-pty.js';
+import { formatElapsed, formatCtx, formatRateLimit } from './format.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
@@ -291,7 +292,12 @@ async function processMessage({ userMessage, channel, replyThreadTs, userId, eve
     return;
   }
 
-  lock.queue.push({ userMessage, channel, replyThreadTs, userId, eventTs: eventTs || null, threadTs: threadTs || null, silent, anchorChannel });
+  const item = { userMessage, channel, replyThreadTs, userId, eventTs: eventTs || null, threadTs: threadTs || null, silent, anchorChannel };
+
+  // 백그라운드 작업을 기다리는 중(턴 사이)이면 실행 중인 query 의 다음 턴으로 바로 넣는다
+  if (lock.processing && lock.live?.inject(item)) return;
+
+  lock.queue.push(item);
 
   if (lock.processing) {
     console.log(`[Queue] Queued for busy session ${sessionKey} (${lock.queue.length} pending)`);
@@ -339,40 +345,6 @@ function splitMessage(text) {
   return chunks;
 }
 
-function formatElapsed(ms) {
-  const sec = Math.floor(ms / 1000);
-  return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${sec % 60}s`;
-}
-
-function formatTokens(n) {
-  if (!n) return '0';
-  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
-  return String(n);
-}
-
-function formatCtx(usage) {
-  if (!usage || !usage.inputTokens) return '';
-  const ctx = formatTokens(usage.inputTokens);
-  if (usage.contextWindow) {
-    return ` | ctx: ${ctx}/${formatTokens(usage.contextWindow)}`;
-  }
-  return ` | ctx: ${ctx}`;
-}
-
-function formatRateLimit(rl) {
-  if (!rl || rl.pct == null) return '';
-  let reset = '';
-  if (rl.resetsAt) {
-    const remaining = Math.max(0, rl.resetsAt - Math.floor(Date.now() / 1000));
-    if (remaining > 0) {
-      const h = Math.floor(remaining / 3600);
-      const m = Math.floor((remaining % 3600) / 60);
-      reset = h > 0 ? ` ${h}h${m}m` : ` ${m}m`;
-    }
-  }
-  return ` | 5h: ${rl.pct}%${reset}`;
-}
-
 async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThreadTs, userId, eventTs, threadTs, silent = false, anchorChannel = null }) {
   const effectiveThreadKey = `${channel}-${replyThreadTs}`;
   const workdir = getThreadWorkdir(effectiveThreadKey) || getWorkdir(userId);
@@ -414,6 +386,108 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     } catch { /* 이미 있거나 실패 시 무시 */ }
   }
 
+  // 새 세션의 첫 메시지에만 스레드 히스토리를 컨텍스트로 포함
+  let fullPrompt = userMessage;
+  const isNewSession = !getSession(sessionKey);
+  if (isNewSession && threadTs) {
+    console.log(`[Context] Fetching thread history for ${threadTs}`);
+    const threadHistory = await fetchThreadHistory(channel, threadTs);
+    if (threadHistory) {
+      console.log(`[Context] Thread history: ${threadHistory.length} chars`);
+      fullPrompt = `아래는 이 슬랙 스레드의 이전 대화 내용입니다:\n---\n${threadHistory}\n---\n\n위 대화 맥락을 참고하여 다음 요청에 답해주세요:\n${userMessage}`;
+    }
+  }
+
+  // AskUserQuestion 콜백 (silent 모드에서는 비활성 — DM으로 질문받을 수 없으므로)
+  // 질문 전까지의 내용은 턴 메시지가 이미 보여주므로 질문만 올린다
+  const onAskUser = silent ? undefined : async (questions, signal) => {
+    const text = formatAskUserQuestion(questions);
+    await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
+    console.log(`[AskUser] Question posted to ${channel}, waiting for answer...`);
+
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        pendingQuestions.delete(sessionKey);
+        reject(new Error('AskUserQuestion 응답 시간 초과 (5분)'));
+      }, 5 * 60 * 1000);
+
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          clearTimeout(timeoutId);
+          pendingQuestions.delete(sessionKey);
+          reject(new Error('중단됨'));
+        }, { once: true });
+      }
+
+      pendingQuestions.set(sessionKey, { resolve, reject, questions, timeoutId });
+    });
+  };
+
+  // 새 세션이면 세션 ID를 게시 (silent이면 DM에, DM 실패 시 생략)
+  const onSessionReady = isNewSession ? (sid) => {
+    if (silent && !logChannel) return; // DM 실패 시 원본 채널에 노출하지 않음
+    const target = silent ? logChannel : channel;
+    const targetTs = silent ? logThreadTs : replyThreadTs;
+    slack.chat.postMessage({
+      channel: target,
+      text: `🔗 Session: \`${sid}\`\n\`\`\`cd ${workdir || '~'} && claude --resume ${sid}\`\`\``,
+      thread_ts: targetTs,
+    }).catch(err => console.error('[Slack] Failed to post session ID:', err.message));
+  } : undefined;
+
+  const model = getThreadModel(effectiveThreadKey) || undefined;
+  const effort = getThreadEffort(effectiveThreadKey) || undefined;
+  const engine = getThreadEngine(effectiveThreadKey) || 'claude';
+  const lock = sessionLocks.get(sessionKey);
+  const item = { userMessage, channel, replyThreadTs, userId, eventTs, silent };
+
+  try {
+    if (engine === 'pty-claude') {
+      await executePtyRequest(sessionKey, { lock, item, prompt: fullPrompt, workdir, logChannel, logThreadTs, onSessionReady, model, effort });
+    } else {
+      await runClaudeSession({ sessionKey, lock, item, prompt: fullPrompt, workdir, logChannel, logThreadTs, onAskUser, onSessionReady, model, effort });
+    }
+    await setSilentResult(channel, silentReactionTs, 'done');
+
+    // sync point 저장 (로컬 터미널에서 이어서 작업 후 !sync 시 사용)
+    try {
+      const sid = getSession(sessionKey);
+      if (sid) {
+        const summary = readSessionSummary(sid);
+        if (summary) saveSyncPoint(sid, summary.turns.length);
+      }
+    } catch { /* ignore */ }
+  } catch (err) {
+    console.error('[Claude] Error:', err.message);
+
+    // 대기 중인 AskUserQuestion 정리
+    const pending = pendingQuestions.get(sessionKey);
+    if (pending) {
+      clearTimeout(pending.timeoutId);
+      pendingQuestions.delete(sessionKey);
+    }
+    await setSilentResult(channel, silentReactionTs, 'x');
+  }
+}
+
+// silent 모드: 트리거 메시지의 :loading2: → 결과 리액션
+async function setSilentResult(channel, ts, name) {
+  if (!ts) return;
+  try {
+    await slack.reactions.remove({ channel, name: 'loading2', timestamp: ts });
+  } catch { /* ignore */ }
+  try {
+    await slack.reactions.add({ channel, name, timestamp: ts });
+  } catch { /* ignore */ }
+}
+
+/**
+ * pty-claude 엔진 — TUI 라 턴 이벤트가 없어 "처리 중" 상태 메시지 + 최종 응답으로 보여준다.
+ * 실패하면 상태 메시지를 오류로 바꾼 뒤 에러를 던진다
+ */
+async function executePtyRequest(sessionKey, { lock, item, prompt, workdir, logChannel, logThreadTs, onSessionReady, model, effort }) {
+  const { userMessage, channel, replyThreadTs, silent } = item;
+
   // "처리 중" 메시지 전송
   let processingTs = null;
   if (logChannel) {
@@ -436,7 +510,6 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
   let lastRateLimit = null;
 
   // lock에 진행 상태 기록 (!status 명령어용)
-  const lock = sessionLocks.get(sessionKey);
   if (lock) {
     lock.startTime = startTime;
     lock.lastActivities = [];
@@ -447,7 +520,6 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
 
   try {
     let lastActivities = [];
-    let lastBackgroundTasks = [];
     let nextUpdateDelay = 5000;
     const MAX_UPDATE_DELAY = 60000;
     const BACKOFF_MULTIPLIER = 1.5;
@@ -466,10 +538,8 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
           const recentActivities = lastActivities.slice(-5).join('\n  ');
           const statusLines = [`⏳ 처리 중... (${elapsed}${ctxInfo}${rlInfo}${prInfo})`];
           if (recentActivities) statusLines.push(`  ${recentActivities}`);
-          statusLines.push(...formatBackgroundTasks(lastBackgroundTasks));
-          const statusText = statusLines.join('\n');
           try {
-            await slack.chat.update({ channel: logChannel, ts: processingTs, text: statusText });
+            await slack.chat.update({ channel: logChannel, ts: processingTs, text: statusLines.join('\n') });
           } catch { /* ignore update errors */ }
           nextUpdateDelay = Math.min(nextUpdateDelay * BACKOFF_MULTIPLIER, MAX_UPDATE_DELAY);
           scheduleUpdate();
@@ -477,92 +547,21 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       })();
     }
 
-    const onProgress = (activities, usage, rateLimit, backgroundTasks) => {
+    const onProgress = (activities, usage, rateLimit) => {
       lastActivities = [...activities];
       if (usage) lastUsage = usage;
       if (rateLimit) lastRateLimit = rateLimit;
-      if (backgroundTasks) lastBackgroundTasks = backgroundTasks;
       if (lock) {
         lock.lastActivities = lastActivities;
         lock.lastUsage = lastUsage;
         lock.lastRateLimit = lastRateLimit;
-        lock.backgroundTasks = lastBackgroundTasks;
       }
     };
 
-    // 새 세션의 첫 메시지에만 스레드 히스토리를 컨텍스트로 포함
-    let fullPrompt = userMessage;
-    const isNewSession = !getSession(sessionKey);
-    if (isNewSession && threadTs) {
-      console.log(`[Context] Fetching thread history for ${threadTs}`);
-      const threadHistory = await fetchThreadHistory(channel, threadTs);
-      if (threadHistory) {
-        console.log(`[Context] Thread history: ${threadHistory.length} chars`);
-        fullPrompt = `아래는 이 슬랙 스레드의 이전 대화 내용입니다:\n---\n${threadHistory}\n---\n\n위 대화 맥락을 참고하여 다음 요청에 답해주세요:\n${userMessage}`;
-      }
-    }
-
-    // AskUserQuestion 콜백 (silent 모드에서는 비활성 — DM으로 질문받을 수 없으므로)
-    const onAskUser = silent ? undefined : async (questions, signal, pendingText) => {
-      if (pendingText) {
-        const maxLen = 3900;
-        const contextText = pendingText.length > maxLen
-          ? pendingText.substring(0, maxLen) + '\n\n... (truncated)'
-          : pendingText;
-        await slack.chat.postMessage({ channel, text: contextText, thread_ts: replyThreadTs });
-        console.log(`[AskUser] Flushed ${pendingText.length} chars of pending text`);
-      }
-      const text = formatAskUserQuestion(questions);
-      await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
-      console.log(`[AskUser] Question posted to ${channel}, waiting for answer...`);
-
-      return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          pendingQuestions.delete(sessionKey);
-          reject(new Error('AskUserQuestion 응답 시간 초과 (5분)'));
-        }, 5 * 60 * 1000);
-
-        if (signal) {
-          signal.addEventListener('abort', () => {
-            clearTimeout(timeoutId);
-            pendingQuestions.delete(sessionKey);
-            reject(new Error('중단됨'));
-          }, { once: true });
-        }
-
-        pendingQuestions.set(sessionKey, { resolve, reject, questions, timeoutId });
-      });
-    };
-
-    // 새 세션이면 세션 ID를 게시 (silent이면 DM에, DM 실패 시 생략)
-    const onSessionReady = isNewSession ? (sid) => {
-      if (silent && !logChannel) return; // DM 실패 시 원본 채널에 노출하지 않음
-      const target = silent ? logChannel : channel;
-      const targetTs = silent ? logThreadTs : replyThreadTs;
-      slack.chat.postMessage({
-        channel: target,
-        text: `🔗 Session: \`${sid}\`\n\`\`\`cd ${workdir || '~'} && claude --resume ${sid}\`\`\``,
-        thread_ts: targetTs,
-      }).catch(err => console.error('[Slack] Failed to post session ID:', err.message));
-    } : undefined;
-
-    const threadModel = getThreadModel(effectiveThreadKey);
-    const threadEffort = getThreadEffort(effectiveThreadKey);
-    const engine = getThreadEngine(effectiveThreadKey) || 'claude';
-
-    let result, usage, rateLimit, backgroundKill;
-    if (engine === 'pty-claude') {
-      // pty 엔진은 AskUserQuestion / rate-limit 헤더 미지원 (Claude Code TUI 한계)
-      ({ result, usage, rateLimit } = await runClaudeViaPty(sessionKey, fullPrompt, workdir, {
-        onProgress, onSessionReady,
-        model: threadModel || undefined, effort: threadEffort || undefined,
-      }));
-    } else {
-      ({ result, usage, rateLimit, backgroundKill } = await runClaudeCode(sessionKey, fullPrompt, workdir, {
-        onProgress, onAskUser, onSessionReady,
-        model: threadModel || undefined, effort: threadEffort || undefined,
-      }));
-    }
+    // pty 엔진은 AskUserQuestion / rate-limit 헤더 미지원 (Claude Code TUI 한계)
+    const { result, usage, rateLimit } = await runClaudeViaPty(sessionKey, prompt, workdir, {
+      onProgress, onSessionReady, model, effort,
+    });
     clearTimeout(updateTimer);
     if (rateLimit) lastRateLimit = rateLimit;
 
@@ -579,16 +578,6 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
     }
     clearProcessing(sessionKey);
 
-    // silent 모드: :loading2: → :done: 으로 교체
-    if (silentReactionTs) {
-      try {
-        await slack.reactions.remove({ channel, name: 'loading2', timestamp: silentReactionTs });
-      } catch { /* ignore */ }
-      try {
-        await slack.reactions.add({ channel, name: 'done', timestamp: silentReactionTs });
-      } catch { /* ignore */ }
-    }
-
     // 응답 텍스트 정리 (silent 모드에서는 도구 마커 라인 제거)
     let cleanResult = result || '(빈 응답)';
     if (silent) {
@@ -600,41 +589,14 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
         .trim() || '(빈 응답)';
     }
 
-    // 백그라운드 작업이 대기 한도로 강제 종료됨 — 다음 메시지로 세션을 이으면 중단 알림을 받고 재개할 수 있다
-    if (backgroundKill) {
-      const { ceilingMs, tasks } = backgroundKill;
-      const ceiling = ceilingMs >= 60000 ? `${Math.round(ceilingMs / 60000)}분` : `${Math.round(ceilingMs / 1000)}초`;
-      const names = tasks.length ? `: ${tasks.join(', ')}` : '';
-      cleanResult += `\n\n⚠️ 백그라운드 작업이 대기 한도(${ceiling})를 넘겨 강제 종료됐습니다${names}\n이어서 진행하려면 이 스레드에 메시지를 보내주세요.`;
-    }
-
     // 응답을 원본 스레드에 게시 (항상 — silent이든 아니든)
     const chunks = splitMessage(cleanResult);
     for (const chunk of chunks) {
       await slack.chat.postMessage({ channel, text: chunk, thread_ts: replyThreadTs });
     }
     console.log(`[Slack] Response sent to ${channel} (${chunks.length} message(s), ${cleanResult.length} chars${silent ? ', silent' : ''})`);
-
-    // sync point 저장 (로컬 터미널에서 이어서 작업 후 !sync 시 사용)
-    try {
-      const sid = getSession(sessionKey);
-      if (sid) {
-        const summary = readSessionSummary(sid);
-        if (summary) saveSyncPoint(sid, summary.turns.length);
-      }
-    } catch { /* ignore */ }
-
   } catch (err) {
-    console.error('[Claude] Error:', err.message);
     clearTimeout(updateTimer);
-
-    // 대기 중인 AskUserQuestion 정리
-    const pending = pendingQuestions.get(sessionKey);
-    if (pending) {
-      clearTimeout(pending.timeoutId);
-      pendingQuestions.delete(sessionKey);
-    }
-
     const elapsed = formatElapsed(Date.now() - startTime);
     const ctxInfo = formatCtx(lastUsage);
     // "처리 중" → 에러로 업데이트 (logChannel — silent이면 DM)
@@ -642,21 +604,10 @@ async function executeClaudeRequest(sessionKey, { userMessage, channel, replyThr
       await slack.chat.update({ channel: logChannel, ts: processingTs, text: `❌ 오류 (${elapsed}${ctxInfo}): ${err.message}` }).catch(() => {});
     }
     clearProcessing(sessionKey);
-
-    // silent 모드: :loading2: → :x: 으로 교체
-    if (silentReactionTs) {
-      try {
-        await slack.reactions.remove({ channel, name: 'loading2', timestamp: silentReactionTs });
-      } catch { /* ignore */ }
-      try {
-        await slack.reactions.add({ channel, name: 'x', timestamp: silentReactionTs });
-      } catch { /* ignore */ }
-    }
-
     if (!silent) {
-      const errorText = `❌ 오류 발생: ${err.message}`;
-      await slack.chat.postMessage({ channel, text: errorText, thread_ts: replyThreadTs }).catch(() => {});
+      await slack.chat.postMessage({ channel, text: `❌ 오류 발생: ${err.message}`, thread_ts: replyThreadTs }).catch(() => {});
     }
+    throw err;
   }
 }
 
@@ -846,6 +797,21 @@ app.get('/inbox', (_req, res) => res.json(getInbox()));
 app.delete('/inbox', (_req, res) => { clearInbox(); res.json({ status: 'cleared' }); });
 app.get('/sessions', (_req, res) => res.json(getAllSessions()));
 
+// 재시작으로 끊긴 백그라운드 현황 카드 — 어떤 작업이 돌고 있었는지는 남기고 진행 중 표시만 중단으로 바꾼다
+async function markStaleBackgroundCard(channel, ts, threadTs) {
+  const title = '⚠️ 서버 재시작으로 백그라운드 작업이 중단됐습니다';
+  const res = await slack.conversations.replies({ channel, ts: threadTs, oldest: ts, latest: ts, inclusive: true, limit: 1 }).catch(() => null);
+  const blocks = res?.messages?.find(m => m.ts === ts)?.blocks;
+  if (!blocks?.some(b => b.type === 'plan')) {
+    await slack.chat.update({ channel, ts, text: title, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: title } }] });
+    return;
+  }
+  const stopped = blocks.map(b => (b.type === 'plan'
+    ? { ...b, title, tasks: (b.tasks || []).map(t => (t.status === 'in_progress' || t.status === 'pending' ? { ...t, status: 'error' } : t)) }
+    : b.type === 'context' ? { type: 'context', elements: [{ type: 'mrkdwn', text: '재시작으로 갱신 중단' }] } : b));
+  await slack.chat.update({ channel, ts, text: title, blocks: stopped });
+}
+
 // ── Socket Mode 시작 ───────────────────────────────────────────
 
 async function startSocketMode() {
@@ -881,14 +847,20 @@ async function startSocketMode() {
 app.listen(PORT, async () => {
   console.log(`[Server] Claude Slack Bridge running on port ${PORT} (mode: ${SLACK_MODE})`);
 
-  // 서버 재시작 시 stale "처리 중" 메시지 정리
+  // 서버 재시작 시 stale "처리 중" 메시지 정리 (스트리밍 중이던 턴 메시지, 백그라운드 현황 카드 포함)
   const stale = getStaleProcessing();
-  for (const [key, { channel, ts }] of stale) {
+  for (const [key, { channel, ts, threadTs, kind }] of stale) {
     try {
-      await slack.chat.update({ channel, ts, text: '⚠️ 서버 재시작으로 작업이 중단되었습니다. 다시 요청해주세요.' });
+      if (kind === 'stream') {
+        await slack.chat.stopStream({ channel, ts, blocks: [{ type: 'context', elements: [{ type: 'mrkdwn', text: '⚠️ 서버 재시작으로 중단됐습니다. 다시 요청해주세요.' }] }] });
+      } else if (kind === 'bgcard') {
+        await markStaleBackgroundCard(channel, ts, threadTs);
+      } else {
+        await slack.chat.update({ channel, ts, text: '⚠️ 서버 재시작으로 작업이 중단되었습니다. 다시 요청해주세요.' });
+      }
       console.log(`[Cleanup] Updated stale processing message: ${key}`);
     } catch (err) {
-      console.warn(`[Cleanup] Failed to update stale message ${key}: ${err.message}`);
+      console.warn(`[Cleanup] Failed to update stale message ${key}: ${err.data?.error || err.message}`);
     }
   }
   if (stale.length > 0) console.log(`[Cleanup] Cleaned up ${stale.length} stale processing message(s)`);
