@@ -2,8 +2,9 @@ import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
 import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getThreadEngine, setThreadEngine, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
-import { stopClaudeQuery, formatBackgroundTasks } from './claude.js';
+import { stopClaudeQuery, getClaudeQueryState } from './claude.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
+import { formatBackgroundTasks } from './format.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 
 // !model / !cron add --model 에서 공통으로 쓰는 허용 모델 목록
@@ -21,6 +22,11 @@ function formatCtx(usage) {
   return usage.contextWindow
     ? ` | ctx: ${fmt(usage.inputTokens)}/${fmt(usage.contextWindow)}`
     : ` | ctx: ${fmt(usage.inputTokens)}`;
+}
+
+// 세션을 바꾸는 명령 전에 열려 있는 query 를 끝낸다 — 백그라운드 대기 중인 query 가 남아 있으면 이후 메시지가 이전 세션으로 들어간다
+function stopLiveQuery(sessionKey) {
+  return stopClaudeQuery(sessionKey) ? '\n🛑 진행 중이던 작업(백그라운드 포함)을 중단했습니다.' : '';
 }
 
 /**
@@ -103,10 +109,11 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
   // new / reset
   if (['!new', '!reset', '/new', '/reset', 'new', 'reset'].includes(msg)) {
+    const stopped = stopLiveQuery(sessionKey);
     clearSession(sessionKey);
     await slack.chat.postMessage({
       channel,
-      text: '🔄 새 세션이 시작되었습니다.',
+      text: `🔄 새 세션이 시작되었습니다.${stopped}`,
       thread_ts: replyThreadTs,
     });
     return true;
@@ -116,11 +123,12 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   const sessionMatch = userMessage.match(/^[!\/]session\s+(.+)$/i);
   if (sessionMatch) {
     const newSessionId = sessionMatch[1].trim().replace(/`/g, '');
+    const stopped = stopLiveQuery(sessionKey);
     saveSession(sessionKey, newSessionId);
 
     // 세션 파일에서 원래 작업 디렉토리 자동 감지 → 스레드에 바인딩
     const detectedDir = findSessionWorkdir(newSessionId);
-    const lines = [`🔗 세션이 전환되었습니다: \`${newSessionId}\``];
+    const lines = [`🔗 세션이 전환되었습니다: \`${newSessionId}\`${stopped}`];
     if (detectedDir) {
       const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
       saveThread(effectiveThreadKey, userId, detectedDir);
@@ -159,10 +167,11 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       if (!statSync(dir).isDirectory()) throw new Error('Not a directory');
       const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
       saveThread(effectiveThreadKey, userId, dir);
+      const stopped = stopLiveQuery(sessionKey);
       clearSession(sessionKey);
       await slack.chat.postMessage({
         channel,
-        text: `📂 이 스레드의 작업 디렉토리: \`${dir}\``,
+        text: `📂 이 스레드의 작업 디렉토리: \`${dir}\`${stopped}`,
         thread_ts: replyThreadTs,
       });
     } catch {
@@ -253,12 +262,13 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
     if (arg === 'reset' || arg === 'default') {
       setThreadEngine(effectiveThreadKey, null);
+      const stopped = stopLiveQuery(sessionKey);
       clearSession(sessionKey);
       const lock = sessionLocks?.get(sessionKey);
       if (lock) lock.queue = [];
       await slack.chat.postMessage({
         channel,
-        text: `🔄 엔진을 기본값(\`claude\` SDK)으로 초기화하고 세션을 비웠습니다.`,
+        text: `🔄 엔진을 기본값(\`claude\` SDK)으로 초기화하고 세션을 비웠습니다.${stopped}`,
         thread_ts: replyThreadTs,
       });
       return true;
@@ -285,12 +295,13 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
 
     setThreadEngine(effectiveThreadKey, arg);
     // 엔진이 바뀌면 세션/큐 초기화 (두 엔진 간 세션 ID 호환 X — 일단 같은 형식이지만 안전을 위해)
+    const stopped = stopLiveQuery(sessionKey);
     clearSession(sessionKey);
     const lock = sessionLocks?.get(sessionKey);
     if (lock) lock.queue = [];
     await slack.chat.postMessage({
       channel,
-      text: `🛠 엔진을 \`${prev}\` → \`${arg}\`로 변경했습니다. 세션이 초기화됩니다.`,
+      text: `🛠 엔진을 \`${prev}\` → \`${arg}\`로 변경했습니다. 세션이 초기화됩니다.${stopped}`,
       thread_ts: replyThreadTs,
     });
     return true;
@@ -415,7 +426,12 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const sid = getSession(sessionKey);
     const prUrl = sid ? getSessionPrUrl(sid) : null;
     const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
-    const lines = [`▶️ 작업 진행 중 (${elapsed}${ctxInfo}${rlInfo}${prInfo})`];
+    // 턴 사이(idle)면 모델은 쉬고 백그라운드 작업만 도는 중 — 이때 보낸 메시지는 바로 다음 턴으로 들어간다
+    const waiting = getClaudeQueryState(sessionKey) === 'idle';
+    const meta = `${ctxInfo}${rlInfo}${prInfo}`.replace(/^ \| /, '');
+    const lines = [waiting
+      ? `🔄 백그라운드 작업 대기 중 — 메시지를 보내면 바로 이어서 처리합니다${meta ? ` (${meta})` : ''}`
+      : `▶️ 작업 진행 중 (${elapsed}${ctxInfo}${rlInfo}${prInfo})`];
     if (lock.currentMessage) {
       lines.push(`📝 요청: ${lock.currentMessage}`);
     }

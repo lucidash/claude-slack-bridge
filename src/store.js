@@ -2,7 +2,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSy
 import { join } from 'path';
 import { homedir } from 'os';
 
-const BRIDGE_DIR = join(homedir(), '.claude', 'slack-bridge');
+// SLACK_BRIDGE_DATA_DIR 은 테스트 하네스가 운영 데이터를 건드리지 않도록 분리할 때 쓴다
+const BRIDGE_DIR = process.env.SLACK_BRIDGE_DATA_DIR || join(homedir(), '.claude', 'slack-bridge');
 const SESSIONS_FILE = join(BRIDGE_DIR, 'sessions.json');
 const THREADS_FILE = join(BRIDGE_DIR, 'threads.json');
 const WORKDIRS_FILE = join(BRIDGE_DIR, 'workdirs.json');
@@ -393,9 +394,13 @@ export function removeWatch(channelId) {
 
 // ── Processing 메시지 추적 (서버 재시작 시 stale 정리용) ──
 
-export function saveProcessing(sessionKey, { channel, ts, threadTs }) {
+/**
+ * 진행 중 표시 메시지 기록 — 재시작 시 정리용
+ * kind: 없음(텍스트 상태 메시지) | 'stream'(스트리밍 중인 턴 메시지) | 'bgcard'(백그라운드 현황 카드)
+ */
+export function saveProcessing(key, { channel, ts, threadTs, kind }) {
   const data = readJson(PROCESSING_FILE);
-  data[sessionKey] = { channel, ts, threadTs, startedAt: new Date().toISOString() };
+  data[key] = { channel, ts, threadTs, kind, startedAt: new Date().toISOString() };
   writeJson(PROCESSING_FILE, data);
 }
 

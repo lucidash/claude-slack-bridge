@@ -1,27 +1,45 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { randomUUID } from 'crypto';
 import { getSession, saveSession, clearSession, getActiveToken } from './store.js';
+import { describeTool, truncate } from './format.js';
 
-// 실행 중인 SDK query 객체 추적 (세션별)
-const runningQueries = new Map();
+// 실행 중인 SDK query (세션별) — 중단·메시지 주입·상태 확인용
+const liveQueries = new Map();
 
 // 메인 턴이 끝난 뒤 백그라운드 작업(셸·서브에이전트)을 기다리는 최대 시간. 메인이 마지막으로 idle 이 된 시점부터 잰다.
 // 브릿지는 입력을 열어 둔 채(streaming input) 기다리므로 CLI 자체 대기 한도는 적용되지 않고 이 값을 브릿지가 집행한다
 // (.env 로 조정, 0 = 무제한)
 const DEFAULT_BG_WAIT_CEILING_MS = 60 * 60 * 1000;
-// 턴이 끝나고 남은 작업이 없을 때 입력을 닫기 전 잠깐 기다린다 — 결과 직후 도착한 완료 알림이 다음 턴을 열 수 있도록
+// 턴이 끝나고 남은 작업이 없을 때 입력을 닫기 전 잠깐 기다린다 — 결과 직후 도착한 완료 알림이 다음 턴을 열 수 있도록.
+// 대기 중에 완료 알림을 이미 받았다면 곧 그 알림으로 턴이 열리므로 더 길게 기다린다
 const CLOSE_GRACE_MS = 1500;
+const NOTIFIED_CLOSE_GRACE_MS = 15000;
+const MAX_ACTIVITIES = 20;
 
 /**
- * 실행 중인 Claude query를 중단
+ * 실행 중인 Claude query를 중단 (백그라운드 작업도 함께 종료된다)
  */
 export function stopClaudeQuery(sessionKey) {
-  const q = runningQueries.get(sessionKey);
+  const q = liveQueries.get(sessionKey);
   if (q) {
     q.abort();
     return true;
   }
   return false;
+}
+
+/**
+ * 턴 사이(백그라운드 작업 대기 중)인 query 에 사용자 메시지를 넣어 다음 턴을 연다. 넣지 못하면 false
+ */
+export function sendToClaudeQuery(sessionKey, text) {
+  return liveQueries.get(sessionKey)?.send(text) ?? false;
+}
+
+/**
+ * @returns {'turn'|'idle'|'closing'|null} turn: 턴 진행 중, idle: 턴 사이(백그라운드 대기), closing: 입력을 닫고 종료 중
+ */
+export function getClaudeQueryState(sessionKey) {
+  return liveQueries.get(sessionKey)?.state() ?? null;
 }
 
 /**
@@ -55,72 +73,38 @@ function createInputStream() {
   };
 }
 
-const TOOL_EMOJI = {
-  Read: '📖', Edit: '✏️', Write: '📝', Bash: '💻',
-  Grep: '🔍', Glob: '📁', WebFetch: '🌐', WebSearch: '🔎',
-  Task: '🤖', Agent: '🤖', default: '⚙️',
-};
-
-function truncate(s, len = 50) {
-  return s && s.length > len ? s.substring(0, len) + '…' : s;
-}
-
-function shortenPath(p) {
-  return p ? truncate(p.replace(/^.*\//, ''), 40) : null;
-}
-
-function extractToolDetail(toolName, input) {
-  try {
-    switch (toolName) {
-      case 'Read': case 'Write': case 'Edit':
-        return shortenPath(input.file_path);
-      case 'Bash':
-        return truncate(input.command, 60);
-      case 'Grep':
-        return truncate(input.pattern, 50);
-      case 'Glob':
-        return truncate(input.pattern, 40);
-      case 'WebSearch':
-        return truncate(input.query, 50);
-      case 'WebFetch':
-        return truncate(input.url, 50);
-      case 'Task': case 'Agent':
-        return truncate(input.description, 40);
-      default:
-        return null;
-    }
-  } catch {
-    return null;
-  }
+function toolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(c => c?.text || '').join('\n');
+  return '';
 }
 
 /**
- * 실행 중인 백그라운드 작업 목록을 진행 표시용 줄로 변환 (없으면 빈 배열)
- * @param {Array<{description: string, lastTool?: string, toolUses?: number}>|undefined} tasks
- */
-export function formatBackgroundTasks(tasks, max = 3) {
-  if (!tasks?.length) return [];
-  const lines = [`🔄 백그라운드 작업 ${tasks.length}개 진행 중`];
-  for (const t of tasks.slice(0, max)) {
-    const detail = t.lastTool ? ` (${t.lastTool}${t.toolUses ? ` · 도구 ${t.toolUses}회` : ''})` : '';
-    lines.push(`  · ${truncate(t.description, 60)}${detail}`);
-  }
-  if (tasks.length > max) lines.push(`  · 외 ${tasks.length - max}개`);
-  return lines;
-}
-
-/**
- * Claude Code를 Agent SDK로 실행하고 스트리밍 결과를 반환
+ * Claude Code를 Agent SDK로 실행한다. 턴이 끝나도 백그라운드 작업이 남아 있으면 query 를 열어 두고,
+ * 작업 완료 알림이나 sendToClaudeQuery() 로 넣은 메시지마다 턴이 이어진다
+ *
  * @param {string} sessionKey - 스레드 기반 세션 키
- * @param {string} prompt - 사용자 프롬프트
+ * @param {string} prompt - 첫 턴 프롬프트
  * @param {string|null} workdir - 작업 디렉토리
- * @param {object} callbacks - 콜백 함수들
- * @param {function|null} callbacks.onProgress - 진행상황 콜백 (activities, usage, rateLimit, backgroundTasks)
- * @param {function|null} callbacks.onAskUser - AskUserQuestion 릴레이 콜백 (questions) => Promise<answers>
- * @returns {Promise<{result: string, usage: object|null, rateLimit: object|null, backgroundKill: {ceilingMs: number, tasks: string[]}|null}>}
- *   최종 응답 텍스트와 usage 정보. backgroundKill 은 백그라운드 작업이 대기 한도로 강제 종료됐을 때만 채워진다
+ * @param {object} handlers
+ * @param {function} [handlers.onTurnStart] - 두 번째 턴부터 턴이 시작될 때 ({ notifications: [{description, status}] }) — 직전 result 이후 끝난 백그라운드 작업
+ * @param {function} [handlers.onText] - 메인 스레드 텍스트 블록 (text)
+ * @param {function} [handlers.onToolUse] - 메인 스레드 도구 호출 ({ id, name, input, messageId })
+ * @param {function} [handlers.onToolResult] - 메인 스레드 도구 결과 ({ id, isError, text })
+ * @param {function} [handlers.onSubagentProgress] - 서브에이전트 진행 ({ toolUseId, lastTool, toolUses, summary })
+ * @param {function} [handlers.onBackgroundTasks] - 백그라운드 작업 변경 (tasks) — 한 번이라도 백그라운드에 오른 작업 전체
+ * @param {function} [handlers.onTurnEnd] - 턴 종료 (await 됨) ({ text, resultText, usage, rateLimit, background })
+ * @param {function} [handlers.onProgress] - !status 용 진행 상태 (activities, usage, rateLimit)
+ * @param {function} [handlers.onAskUser] - AskUserQuestion 릴레이 (questions, signal) => Promise<answers>
+ * @param {function} [handlers.onSessionReady] - 새 세션 ID 확정 (sessionId)
+ * @returns {Promise<{usage: object|null, rateLimit: object|null, backgroundKill: {ceilingMs: number, tasks: string[]}|null}>}
+ *   backgroundKill 은 백그라운드 작업이 대기 한도로 강제 종료됐을 때만 채워진다
  */
-export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, onAskUser, onSessionReady, model: modelOverride, effort: effortOverride } = {}) {
+export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) {
+  const {
+    onTurnStart, onText, onToolUse, onToolResult, onSubagentProgress, onBackgroundTasks, onTurnEnd,
+    onProgress, onAskUser, onSessionReady, model: modelOverride, effort: effortOverride,
+  } = handlers;
   let sessionId = getSession(sessionKey);
   const isResume = !!sessionId;
 
@@ -157,6 +141,8 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
     settingSources: ['user', 'project', 'local'],
     env: cleanEnv,
     stderr,
+    // 서브에이전트가 무엇을 하는지 ~30초마다 한 줄 요약 (task_progress.summary) — 진행 표시용
+    agentProgressSummaries: true,
     ...(skipPermissions
       ? { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }
       : {}),
@@ -179,10 +165,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   const canUseTool = async (toolName, input) => {
     if (toolName === 'AskUserQuestion' && onAskUser) {
       try {
-        // AskUserQuestion 호출 시점까지 쌓인 텍스트를 함께 전달 (컨텍스트 표시용)
-        const pendingText = finalResult.trim();
-        if (pendingText) finalResult = '';
-        const answers = await onAskUser(input.questions, abortController.signal, pendingText);
+        const answers = await onAskUser(input.questions, abortController.signal);
         return { behavior: 'allow', updatedInput: { ...input, answers } };
       } catch (err) {
         return { behavior: 'deny', message: err.message || 'AskUserQuestion 거부됨' };
@@ -202,33 +185,15 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
     },
   });
 
-  // abort + close 래퍼 저장
-  runningQueries.set(sessionKey, {
-    abort: () => {
-      abortController.abort(); // onAskUser의 signal을 fire하여 pending 질문 reject
-      input.close();
-      try { q.close(); } catch { /* 이미 종료됨 */ } // SDK subprocess 종료
-    },
-  });
-
-  let finalResult = '';
-  const activities = [];
-  let lastUsage = null;
-  let resultUsage = null;
-  let contextWindow = 1000000;
-  let lastRateLimit = null;
-  let initHandled = false;
-
-  // 백그라운드 작업 — 진행 표시와 강제 종료 안내용
-  let backgroundTasks = []; // background_tasks_changed 는 살아있는 작업 전체를 보내므로 통째로 교체
-  const taskProgress = new Map(); // task_id → { lastTool, toolUses }
-  let backgroundKill = null;
-
-  // 턴 사이: 남은 백그라운드 작업이 없으면 입력을 닫아 끝내고, 있으면 대기 한도 타이머를 건다
-  let idle = false;
+  // 턴 상태 — 첫 턴은 프롬프트를 넣는 순간 시작된 것으로 본다
+  let inTurn = true;
   let inputClosed = false;
+  let sentSinceResult = false; // 마지막 result 이후 넣은 메시지 — 곧 턴이 열리므로 입력을 닫지 않는다
   let closeTimer = null;
   let ceilingTimer = null;
+  let backgroundKill = null;
+  const currentState = () => (inTurn ? 'turn' : inputClosed ? 'closing' : 'idle');
+
   const clearTimers = () => {
     clearTimeout(closeTimer);
     clearTimeout(ceilingTimer);
@@ -240,73 +205,151 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
     clearTimers();
     input.close();
   };
+
+  liveQueries.set(sessionKey, {
+    abort: () => {
+      abortController.abort(); // onAskUser의 signal을 fire하여 pending 질문 reject
+      closeInput();
+      try { q.close(); } catch { /* 이미 종료됨 */ } // SDK subprocess 종료
+    },
+    send: (text) => {
+      if (currentState() !== 'idle') return false;
+      clearTimers();
+      sentSinceResult = true;
+      return input.push(text);
+    },
+    state: currentState,
+  });
+
+  let lastUsage = null;
+  let resultUsage = null;
+  let contextWindow = 1000000;
+  let lastRateLimit = null;
+  let initHandled = false;
+  let turnText = '';
+  const activities = [];
+
+  // 백그라운드 작업 — 한 번이라도 백그라운드 목록에 오른 작업 (task_id → 정보). 현황 카드는 끝난 작업도 함께 보여준다
+  const tasks = new Map();
+  const taskToolUse = new Map(); // task_id → 이 작업을 띄운 tool_use_id (서브에이전트 진행을 카드에 연결)
+  let notifiedSinceResult = [];
+  const liveTasks = () => [...tasks.values()].filter(t => t.status === 'running');
+  const emitBackground = () => onBackgroundTasks?.([...tasks.values()].map(t => ({ ...t })));
+
+  const reportProgress = () => onProgress?.(activities, lastUsage, lastRateLimit);
+  const pushActivity = (marker) => {
+    activities.push(marker);
+    if (activities.length > MAX_ACTIVITIES) activities.shift();
+  };
+
+  const startTurn = () => {
+    inTurn = true;
+    sentSinceResult = false;
+    clearTimers();
+    const notifications = notifiedSinceResult;
+    notifiedSinceResult = [];
+    onTurnStart?.({ notifications });
+  };
+
+  // 턴 사이: 남은 백그라운드 작업이 없으면 입력을 닫고, 있으면 대기 한도 타이머를 건다
   const stopAtCeiling = async () => {
     ceilingTimer = null;
-    if (!idle || inputClosed) return;
-    backgroundKill = { ceilingMs, tasks: backgroundTasks.map(t => t.description) };
-    console.log(`[Claude] Background wait ceiling (${ceilingMs}ms) reached for ${sessionKey}: stopping ${backgroundTasks.length} task(s)`);
-    for (const t of backgroundTasks) {
+    if (currentState() !== 'idle') return;
+    const remaining = liveTasks();
+    backgroundKill = { ceilingMs, tasks: remaining.map(t => t.description) };
+    console.log(`[Claude] Background wait ceiling (${ceilingMs}ms) reached for ${sessionKey}: stopping ${remaining.length} task(s)`);
+    for (const t of remaining) {
       await q.stopTask(t.id).catch(err => console.warn(`[Claude] stopTask ${t.id} failed: ${err.message}`));
     }
     closeInput();
   };
   const scheduleIdleCheck = () => {
-    if (!idle || inputClosed) return;
-    if (backgroundTasks.length === 0) {
+    if (currentState() !== 'idle' || sentSinceResult) return;
+    if (liveTasks().length === 0) {
       clearTimeout(ceilingTimer);
       ceilingTimer = null;
       clearTimeout(closeTimer);
       closeTimer = setTimeout(() => {
-        if (idle && backgroundTasks.length === 0) closeInput();
-      }, CLOSE_GRACE_MS);
+        if (currentState() === 'idle' && !sentSinceResult && liveTasks().length === 0) closeInput();
+      }, notifiedSinceResult.length ? NOTIFIED_CLOSE_GRACE_MS : CLOSE_GRACE_MS);
     } else if (ceilingMs > 0 && !ceilingTimer) {
       ceilingTimer = setTimeout(stopAtCeiling, ceilingMs);
     }
   };
-  const markBusy = () => {
-    idle = false;
-    clearTimers();
-  };
-
-  const reportProgress = () => {
-    if (!onProgress) return;
-    const tasks = backgroundTasks.map(t => ({ ...t, ...taskProgress.get(t.id) }));
-    onProgress(activities, lastUsage, lastRateLimit, tasks);
-  };
 
   try {
     for await (const msg of q) {
-      // init 이벤트 — 백그라운드 작업 완료 알림으로 턴이 이어지면 다시 오므로 한 번만 처리
-      if (msg.type === 'system' && msg.subtype === 'init') {
-        markBusy();
-        if (!initHandled) {
-          initHandled = true;
-          if (msg.session_id && !isResume) {
-            if (msg.session_id !== sessionId) {
-              sessionId = msg.session_id;
-              saveSession(sessionKey, sessionId);
+      if (msg.type === 'system') {
+        // init 이벤트 — 턴마다 다시 온다. 세션 처리는 처음 한 번만
+        if (msg.subtype === 'init') {
+          if (!initHandled) {
+            initHandled = true;
+            if (msg.session_id && !isResume) {
+              if (msg.session_id !== sessionId) {
+                sessionId = msg.session_id;
+                saveSession(sessionKey, sessionId);
+              }
+              if (onSessionReady) onSessionReady(sessionId);
             }
-            if (onSessionReady) onSessionReady(sessionId);
+          }
+          if (!inTurn) startTurn();
+        }
+
+        if (msg.subtype === 'task_started' && msg.tool_use_id) {
+          taskToolUse.set(msg.task_id, msg.tool_use_id);
+        }
+
+        // background_tasks_changed 는 살아있는 작업 전체를 보낸다 (REPLACE). 빠진 작업은 곧 task_notification 으로 결과가 온다
+        if (msg.subtype === 'background_tasks_changed') {
+          const live = new Set();
+          for (const t of msg.tasks) {
+            if (t.ambient) continue;
+            live.add(t.task_id);
+            const cur = tasks.get(t.task_id);
+            if (cur) {
+              Object.assign(cur, { type: t.task_type, description: t.description, status: 'running', endedAt: null });
+            } else {
+              tasks.set(t.task_id, { id: t.task_id, type: t.task_type, description: t.description, status: 'running', startedAt: Date.now() });
+            }
+          }
+          for (const t of tasks.values()) {
+            if (t.status === 'running' && !live.has(t.id)) Object.assign(t, { status: 'completed', endedAt: Date.now() });
+          }
+          emitBackground();
+          scheduleIdleCheck();
+        }
+
+        if (msg.subtype === 'task_progress') {
+          const info = {};
+          if (msg.last_tool_name) info.lastTool = msg.last_tool_name;
+          if (msg.usage?.tool_uses) info.toolUses = msg.usage.tool_uses;
+          if (msg.summary) info.summary = msg.summary;
+          const t = tasks.get(msg.task_id);
+          if (t) {
+            Object.assign(t, info);
+            emitBackground();
+          }
+          const toolUseId = msg.tool_use_id || taskToolUse.get(msg.task_id);
+          if (toolUseId) onSubagentProgress?.({ toolUseId, ...info });
+        }
+
+        // 서브에이전트 안에서 돈 작업도 같이 알림이 오므로, 백그라운드 목록에 올랐던 작업만 반영한다.
+        // 턴 사이에 온 알림은 다음 턴을 여는 계기라 다음 턴 머리말로 넘긴다 (턴 도중 알림은 그 턴 안에서 처리된다)
+        if (msg.subtype === 'task_notification') {
+          const t = tasks.get(msg.task_id);
+          if (t) {
+            Object.assign(t, { status: msg.status, endedAt: t.endedAt || Date.now() });
+            if (!inTurn) notifiedSinceResult.push({ description: t.description, status: msg.status });
+            emitBackground();
+            scheduleIdleCheck();
           }
         }
       }
 
-      // 백그라운드 작업 목록 / 진행
-      if (msg.type === 'system' && msg.subtype === 'background_tasks_changed') {
-        backgroundTasks = msg.tasks.filter(t => !t.ambient).map(t => ({ id: t.task_id, description: t.description }));
-        reportProgress();
-        scheduleIdleCheck();
-      }
-      if (msg.type === 'system' && msg.subtype === 'task_progress') {
-        taskProgress.set(msg.task_id, { lastTool: msg.last_tool_name, toolUses: msg.usage?.tool_uses });
-        if (backgroundTasks.some(t => t.id === msg.task_id)) reportProgress();
-      }
-
-      // assistant 메시지 — 도구 사용 추적 + 텍스트 수집
-      // 서브에이전트 메시지(parent_tool_use_id)는 진행 표시에만 쓰고 최종 응답·ctx 에서는 뺀다
+      // assistant 메시지 — 텍스트·도구 호출. 서브에이전트 메시지(parent_tool_use_id)는 진행 표시에만 쓴다
       if (msg.type === 'assistant' && msg.message?.content) {
         const fromSubagent = !!msg.parent_tool_use_id;
-        if (!fromSubagent) markBusy();
+        if (!fromSubagent && !inTurn) startTurn();
         if (msg.message.usage && !fromSubagent) {
           const u = msg.message.usage;
           lastUsage = {
@@ -316,22 +359,27 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
           };
         }
         for (const block of msg.message.content) {
-          if (block.type === 'text') {
-            if (!fromSubagent) finalResult += block.text;
+          if (block.type === 'text' && !fromSubagent) {
+            turnText += block.text;
+            onText?.(block.text);
           } else if (block.type === 'tool_use') {
-            const toolName = block.name || 'unknown';
-            const emoji = TOOL_EMOJI[toolName] || TOOL_EMOJI.default;
-            const detail = extractToolDetail(toolName, block.input || {});
-            const marker = detail ? `${emoji} ${toolName}: ${detail}` : `${emoji} ${toolName}`;
-            activities.push(fromSubagent ? `↳ ${marker}` : marker);
-            // 도구 사용 마커를 출력에 포함 (raw 출력)
-            if (!fromSubagent) finalResult += `\n${marker}\n`;
+            const { emoji, label } = describeTool(block.name || 'unknown', block.input || {});
+            pushActivity(`${fromSubagent ? '↳ ' : ''}${emoji} ${truncate(label, 60)}`);
+            if (!fromSubagent) {
+              onToolUse?.({ id: block.id, name: block.name || 'unknown', input: block.input || {}, messageId: msg.message.id });
+            }
           }
         }
-        if (lastUsage && !fromSubagent) {
-          console.log(`[Claude] Usage: ${lastUsage.inputTokens} / ${lastUsage.contextWindow} tokens`);
-        }
         reportProgress();
+      }
+
+      // 메인 스레드 도구 결과
+      if (msg.type === 'user' && !msg.parent_tool_use_id && !msg.isReplay && Array.isArray(msg.message?.content)) {
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_result') {
+            onToolResult?.({ id: block.tool_use_id, isError: !!block.is_error, text: toolResultText(block.content) });
+          }
+        }
       }
 
       // rate limit 이벤트 — 5h 사용률 추적
@@ -346,38 +394,9 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
         }
       }
 
-      // result 이벤트 — 턴 종료
-      // 백그라운드 작업이 남아 있으면 입력을 열어 둔 채 기다리고, 완료 알림마다 턴이 이어져 result 가 여러 번 올 수 있다
+      // result 이벤트 — 턴 종료. 백그라운드 작업이 남아 있으면 query 는 계속 열려 있다
       if (msg.type === 'result') {
-        if (msg.subtype === 'success') {
-          // msg.result는 마지막 assistant 턴의 텍스트만 포함할 수 있으므로,
-          // 스트리밍 중 누적된 텍스트가 더 길면 그것을 사용
-          if (msg.result) {
-            if (!finalResult || msg.result.length >= finalResult.length) {
-              finalResult = msg.result;
-            } else {
-              console.log(`[Claude] Using accumulated text (${finalResult.length} chars) over msg.result (${msg.result.length} chars)`);
-            }
-          }
-          if (msg.modelUsage) {
-            const entries = Object.entries(msg.modelUsage);
-            const mainEntry = entries.find(([k]) => !k.includes('haiku')) || entries[0];
-            if (mainEntry) {
-              const primary = mainEntry[1];
-              if (primary?.contextWindow) contextWindow = primary.contextWindow;
-              resultUsage = {
-                inputTokens: lastUsage?.inputTokens || 0,
-                outputTokens: lastUsage?.outputTokens || 0,
-                contextWindow,
-                costUSD: msg.total_cost_usd || 0,
-              };
-            }
-          }
-          // 이어지는 턴(백그라운드 완료 알림)의 텍스트가 붙지 않도록 문단을 나눈다
-          if (finalResult && !finalResult.endsWith('\n')) finalResult += '\n\n';
-          idle = true;
-          scheduleIdleCheck();
-        } else {
+        if (msg.subtype !== 'success') {
           // error result
           const errMsg = msg.error || msg.subtype || 'Unknown error';
           if (isResume && msg.subtype === 'error_during_execution') {
@@ -387,6 +406,31 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
           }
           throw new Error(errMsg);
         }
+        if (msg.modelUsage) {
+          const entries = Object.entries(msg.modelUsage);
+          const mainEntry = entries.find(([k]) => !k.includes('haiku')) || entries[0];
+          if (mainEntry) {
+            const primary = mainEntry[1];
+            if (primary?.contextWindow) contextWindow = primary.contextWindow;
+            resultUsage = {
+              inputTokens: lastUsage?.inputTokens || 0,
+              outputTokens: lastUsage?.outputTokens || 0,
+              contextWindow,
+              costUSD: msg.total_cost_usd || 0,
+            };
+          }
+        }
+        inTurn = false;
+        const text = turnText;
+        turnText = '';
+        await onTurnEnd?.({
+          text,
+          resultText: msg.result || '',
+          usage: resultUsage || lastUsage,
+          rateLimit: lastRateLimit,
+          background: [...tasks.values()].map(t => ({ ...t })),
+        });
+        scheduleIdleCheck();
       }
     }
     if (abortController.signal.aborted) throw new Error('중단됨 (사용자 요청)');
@@ -408,12 +452,11 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   } finally {
     clearTimers();
     input.close();
-    runningQueries.delete(sessionKey);
+    liveQueries.delete(sessionKey);
   }
 
-  const usage = resultUsage || lastUsage;
   if (backgroundKill) {
     console.log(`[Claude] Background tasks killed at wait ceiling for ${sessionKey}: ${backgroundKill.tasks.join(', ') || '(unknown)'}`);
   }
-  return { result: finalResult.trim(), usage, rateLimit: lastRateLimit, backgroundKill };
+  return { usage: resultUsage || lastUsage, rateLimit: lastRateLimit, backgroundKill };
 }
