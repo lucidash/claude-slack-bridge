@@ -30,7 +30,10 @@ Slack에서 Claude Code Agent SDK를 통해 Claude를 원격 제어하는 브릿
 ```
 src/
   index.js    — Express 서버, Slack 이벤트 수신 및 Claude 실행 오케스트레이션
-  claude.js   — Agent SDK query() 실행, 스트리밍 이벤트 처리, 세션 관리
+  session.js  — claude 엔진 실행 흐름 (턴별 표시, 백그라운드 대기 중 메시지 주입)
+  claude.js   — Agent SDK query() 실행 (streaming input), 턴·도구·백그라운드 작업 이벤트, 세션 관리
+  turn-view.js — Slack 표시 (턴 스트리밍 메시지 = 작업 타임라인, 백그라운드 현황 카드)
+  format.js   — 공통 포맷 (경과 시간, ctx, 도구 라벨)
   commands.js — 명령어 처리 (!new, !cd, !session, !pause, !resume, !status, !stop, !queue)
   store.js    — 세션/스레드/작업디렉토리/인박스 영속 저장 (~/.claude/slack-bridge/)
   slack.js    — Slack WebClient, 스레드 히스토리 조회
@@ -50,10 +53,17 @@ npm run dev    # 개발 (--watch)
 1. Slack 이벤트 수신 → 서명 검증 + 화이트리스트 확인
 2. 명령어(`!` prefix)면 즉시 처리, 아니면 Agent SDK `query()` 실행
 3. 세션별 lock/queue로 동시 요청 직렬화
-4. SDK 스트리밍 이벤트(`assistant`, `result`, `rate_limit_event`, 백그라운드 작업 `background_tasks_changed`·`task_*`)로 진행 상태를 Slack에 실시간 업데이트
-   - 서브에이전트 메시지(`parent_tool_use_id`)는 진행 표시에만 쓰고 최종 응답에는 넣지 않는다
-   - 메인 턴이 끝나도 백그라운드 작업이 남아 있으면 스트림이 계속되고, 완료 알림마다 턴이 이어져 `result` 가 여러 번 올 수 있다
-5. 새 세션이면 세션 ID를 스레드에 댓글로 기록
+4. `query()` 는 streaming input(입력을 브릿지가 열고 닫음)으로 실행한다
+   - string prompt 를 쓰면 SDK 가 첫 `result` 에서 stdin 을 닫고, 그러면 CLI 가 `run_in_background` 셸을 5초 만에 종료하고 이후 턴의 AskUserQuestion 도 `Stream closed` 로 실패한다
+   - 턴이 끝나도 백그라운드 작업(셸·서브에이전트)이 남아 있으면 입력을 열어 둔다. 완료 알림마다 턴이 이어져 `result` 가 여러 번 온다
+   - 남은 작업도 넣을 메시지도 없을 때 입력을 닫아 끝낸다. 대기 한도(`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`)는 브릿지가 집행한다 (`stopTask()`)
+5. Slack 표시는 턴 단위 (`turn-view.js`)
+   - 턴마다 스트리밍 메시지 하나(`chat.startStream`, timeline): 모델의 글 + 도구 호출 카드(`task_update`). 병렬 호출은 카드 하나로 묶는다
+   - `task_update` 는 같은 id 로 다시 보내면 title·status 는 교체, details·output 은 **이어 붙는다** — 바뀌는 정보(서브에이전트 진행)는 title 에 넣는다
+   - `stopStream` 시점에 진행 중인 카드는 error 로 바뀐다 — 턴을 넘기는 백그라운드 작업은 스트림이 아니라 현황 카드(`plan` 블록, `chat.update`)에서 관리한다
+   - 서브에이전트 메시지(`parent_tool_use_id`)는 진행 표시에만 쓰고 응답 글에는 넣지 않는다
+6. 백그라운드 대기 중(턴 사이) 스레드에 온 메시지는 같은 query 에 바로 넣어 다음 턴으로 처리한다. 턴 도중 온 메시지는 대기열에 두었다가 턴이 끝나면 넣는다
+7. 새 세션이면 세션 ID를 스레드에 댓글로 기록
 
 ## 개발 컨벤션
 
@@ -76,7 +86,8 @@ npm run dev    # 개발 (--watch)
 | `CLAUDE_MODEL` | Claude 모델 (기본: sonnet) |
 | `CLAUDE_ALLOWED_DIRS` | Claude CLI 허용 디렉토리 (콤마 구분) |
 | `CLAUDE_SKIP_PERMISSIONS` | 권한 프롬프트 스킵 여부 |
-| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | 메인 턴이 끝난 뒤 백그라운드 작업(서브에이전트 등)을 기다리는 최대 시간 (기본: `3600000` = 1시간, `0` = 무제한). 넘으면 CLI 가 남은 작업을 강제 종료하고, 브릿지는 최종 응답에 안내를 붙인다 |
+| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | 메인 턴이 끝난 뒤 백그라운드 작업(백그라운드 셸·서브에이전트)을 기다리는 최대 시간 (기본: `3600000` = 1시간, `0` = 무제한). 메인이 마지막으로 idle 이 된 시점부터 잰다. 넘으면 브릿지가 남은 작업을 중단하고 스레드에 안내를 남긴다 |
+| `SLACK_BRIDGE_DATA_DIR` | 상태 파일 디렉토리 (기본: `~/.claude/slack-bridge`). 테스트 하네스가 운영 데이터를 건드리지 않도록 분리할 때 사용 |
 | `CLAUDE_BIN` | `pty-claude` 엔진용 claude CLI 절대경로 (기본: `/Users/muzi/.local/bin/claude`) |
 | `CLAUDE_PTY_HOME` | `pty-claude` 엔진의 자식 프로세스에 다른 `HOME` 을 주고 싶을 때 (선택). 본 머신 인증과 분리하고 별도 계정으로 운영할 때 사용 |
 | `OPENAI_API_KEY` | STT용 OpenAI API 키 (선택) |
@@ -107,14 +118,14 @@ cron 은 모델도 작업 단위로 지정 가능:
 
 | 명령어 | 설명 |
 |---|---|
-| `!new` / `!reset` | 새 세션 시작 |
+| `!new` / `!reset` | 새 세션 시작 (진행 중인 작업·백그라운드 작업은 중단) |
 | `!wd <path>` | 스레드별 작업 디렉토리 지정 |
 | `!pwd` | 현재 작업 디렉토리 확인 |
 | `!session` | 현재 세션 ID 확인 |
 | `!session <id>` | 세션 전환 (작업 디렉토리 자동 감지) |
 | `!pause` / `!resume` | 스레드 일시정지/재개 |
-| `!status` | 진행 중인 작업 상태 확인 |
-| `!stop` | 실행 중 작업 중단 + 큐 비우기 |
+| `!status` | 진행 중인 작업 상태 확인 (백그라운드 대기 중인지 포함) |
+| `!stop` | 실행 중 작업 중단 (백그라운드 작업 포함). `!stop all` 은 대기열도 비움 |
 | `!queue` | 대기열 확인 |
 | `!sync-all` | 최근 24h 내 변경된 모든 세션 일괄 동기화 |
 | `!sync-all <duration>` | 지정 기간 내 변경 세션 일괄 동기화 (예: `6h`, `30m`) |
