@@ -5,11 +5,12 @@ import { getSession, saveSession, clearSession, getActiveToken } from './store.j
 // 실행 중인 SDK query 객체 추적 (세션별)
 const runningQueries = new Map();
 
-// string prompt(one-shot) 실행에서 CLI 는 메인 턴이 끝난 뒤에도 백그라운드 작업(서브에이전트 등)을 기다리지만,
-// 메인이 마지막으로 idle 이 된 시점부터 이 한도가 지나면 남은 작업을 강제 종료한다 (CLI 기본 10분)
-// 긴 검증 에이전트가 잘리지 않도록 브릿지 기본값은 1시간. .env 로 조정 가능 (0 = 무제한)
+// 메인 턴이 끝난 뒤 백그라운드 작업(셸·서브에이전트)을 기다리는 최대 시간. 메인이 마지막으로 idle 이 된 시점부터 잰다.
+// 브릿지는 입력을 열어 둔 채(streaming input) 기다리므로 CLI 자체 대기 한도는 적용되지 않고 이 값을 브릿지가 집행한다
+// (.env 로 조정, 0 = 무제한)
 const DEFAULT_BG_WAIT_CEILING_MS = 60 * 60 * 1000;
-const BG_CEILING_STDERR = 'Background tasks still running after';
+// 턴이 끝나고 남은 작업이 없을 때 입력을 닫기 전 잠깐 기다린다 — 결과 직후 도착한 완료 알림이 다음 턴을 열 수 있도록
+const CLOSE_GRACE_MS = 1500;
 
 /**
  * 실행 중인 Claude query를 중단
@@ -21,6 +22,37 @@ export function stopClaudeQuery(sessionKey) {
     return true;
   }
   return false;
+}
+
+/**
+ * query 에 넣는 입력 스트림. string prompt 를 쓰면 SDK 가 첫 result 에서 stdin 을 닫고,
+ * 그러면 CLI 가 백그라운드 셸을 5초 만에 종료하고 이후 턴의 AskUserQuestion 도 막힌다.
+ * 그래서 입력을 직접 열어 두고, 브릿지가 끝났다고 판단할 때 닫는다
+ */
+function createInputStream() {
+  const pending = [];
+  let wake = null;
+  let closed = false;
+  return {
+    push(text) {
+      if (closed) return false;
+      pending.push({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] }, parent_tool_use_id: null, session_id: '' });
+      wake?.();
+      return true;
+    },
+    close() {
+      closed = true;
+      wake?.();
+    },
+    messages: (async function* () {
+      while (true) {
+        while (pending.length) yield pending.shift();
+        if (closed) return;
+        await new Promise((resolve) => { wake = resolve; });
+        wake = null;
+      }
+    })(),
+  };
 }
 
 const TOOL_EMOJI = {
@@ -107,12 +139,10 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   const activeToken = getActiveToken();
   if (activeToken) cleanEnv.CLAUDE_CODE_OAUTH_TOKEN = activeToken;
 
-  cleanEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ??= String(DEFAULT_BG_WAIT_CEILING_MS);
+  const ceilingMs = Number(cleanEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ?? DEFAULT_BG_WAIT_CEILING_MS);
 
-  // CLI stderr 는 콜백을 넘기지 않으면 버려진다 — 대기 한도 초과 경고 등을 pm2 로그에 남긴다
-  let bgCeilingHit = false;
+  // CLI stderr 는 콜백을 넘기지 않으면 버려진다 — pm2 로그에 남긴다
   const stderr = (data) => {
-    if (data.includes(BG_CEILING_STDERR)) bgCeilingHit = true;
     for (const line of data.split('\n')) {
       if (line.trim()) console.error(`[Claude:stderr] ${sessionKey} ${line}`);
     }
@@ -161,8 +191,11 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
     return { behavior: 'allow', updatedInput: input };
   };
 
+  const input = createInputStream();
+  input.push(prompt);
+
   const q = query({
-    prompt,
+    prompt: input.messages,
     options: {
       ...options,
       canUseTool,
@@ -173,7 +206,8 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   runningQueries.set(sessionKey, {
     abort: () => {
       abortController.abort(); // onAskUser의 signal을 fire하여 pending 질문 reject
-      q.close()?.catch(() => {}); // SDK subprocess 종료
+      input.close();
+      try { q.close(); } catch { /* 이미 종료됨 */ } // SDK subprocess 종료
     },
   });
 
@@ -187,9 +221,52 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
 
   // 백그라운드 작업 — 진행 표시와 강제 종료 안내용
   let backgroundTasks = []; // background_tasks_changed 는 살아있는 작업 전체를 보내므로 통째로 교체
-  const seenBackground = new Map(); // task_id → description (한 번이라도 백그라운드 목록에 오른 작업)
   const taskProgress = new Map(); // task_id → { lastTool, toolUses }
-  let stoppedSinceResult = []; // 마지막 result 이후(메인 idle 중) stopped 된 백그라운드 작업
+  let backgroundKill = null;
+
+  // 턴 사이: 남은 백그라운드 작업이 없으면 입력을 닫아 끝내고, 있으면 대기 한도 타이머를 건다
+  let idle = false;
+  let inputClosed = false;
+  let closeTimer = null;
+  let ceilingTimer = null;
+  const clearTimers = () => {
+    clearTimeout(closeTimer);
+    clearTimeout(ceilingTimer);
+    closeTimer = ceilingTimer = null;
+  };
+  const closeInput = () => {
+    if (inputClosed) return;
+    inputClosed = true;
+    clearTimers();
+    input.close();
+  };
+  const stopAtCeiling = async () => {
+    ceilingTimer = null;
+    if (!idle || inputClosed) return;
+    backgroundKill = { ceilingMs, tasks: backgroundTasks.map(t => t.description) };
+    console.log(`[Claude] Background wait ceiling (${ceilingMs}ms) reached for ${sessionKey}: stopping ${backgroundTasks.length} task(s)`);
+    for (const t of backgroundTasks) {
+      await q.stopTask(t.id).catch(err => console.warn(`[Claude] stopTask ${t.id} failed: ${err.message}`));
+    }
+    closeInput();
+  };
+  const scheduleIdleCheck = () => {
+    if (!idle || inputClosed) return;
+    if (backgroundTasks.length === 0) {
+      clearTimeout(ceilingTimer);
+      ceilingTimer = null;
+      clearTimeout(closeTimer);
+      closeTimer = setTimeout(() => {
+        if (idle && backgroundTasks.length === 0) closeInput();
+      }, CLOSE_GRACE_MS);
+    } else if (ceilingMs > 0 && !ceilingTimer) {
+      ceilingTimer = setTimeout(stopAtCeiling, ceilingMs);
+    }
+  };
+  const markBusy = () => {
+    idle = false;
+    clearTimers();
+  };
 
   const reportProgress = () => {
     if (!onProgress) return;
@@ -200,36 +277,36 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
   try {
     for await (const msg of q) {
       // init 이벤트 — 백그라운드 작업 완료 알림으로 턴이 이어지면 다시 오므로 한 번만 처리
-      if (msg.type === 'system' && msg.subtype === 'init' && !initHandled) {
-        initHandled = true;
-        if (msg.session_id && !isResume) {
-          if (msg.session_id !== sessionId) {
-            sessionId = msg.session_id;
-            saveSession(sessionKey, sessionId);
+      if (msg.type === 'system' && msg.subtype === 'init') {
+        markBusy();
+        if (!initHandled) {
+          initHandled = true;
+          if (msg.session_id && !isResume) {
+            if (msg.session_id !== sessionId) {
+              sessionId = msg.session_id;
+              saveSession(sessionKey, sessionId);
+            }
+            if (onSessionReady) onSessionReady(sessionId);
           }
-          if (onSessionReady) onSessionReady(sessionId);
         }
       }
 
-      // 백그라운드 작업 목록 / 진행 / 종료
+      // 백그라운드 작업 목록 / 진행
       if (msg.type === 'system' && msg.subtype === 'background_tasks_changed') {
         backgroundTasks = msg.tasks.filter(t => !t.ambient).map(t => ({ id: t.task_id, description: t.description }));
-        for (const t of backgroundTasks) seenBackground.set(t.id, t.description);
         reportProgress();
+        scheduleIdleCheck();
       }
       if (msg.type === 'system' && msg.subtype === 'task_progress') {
         taskProgress.set(msg.task_id, { lastTool: msg.last_tool_name, toolUses: msg.usage?.tool_uses });
         if (backgroundTasks.some(t => t.id === msg.task_id)) reportProgress();
-      }
-      // 서브에이전트 안에서 돈 작업도 같이 stopped 되므로, 백그라운드 목록에 올랐던 작업만 모은다
-      if (msg.type === 'system' && msg.subtype === 'task_notification' && msg.status === 'stopped' && seenBackground.has(msg.task_id)) {
-        stoppedSinceResult.push(seenBackground.get(msg.task_id));
       }
 
       // assistant 메시지 — 도구 사용 추적 + 텍스트 수집
       // 서브에이전트 메시지(parent_tool_use_id)는 진행 표시에만 쓰고 최종 응답·ctx 에서는 뺀다
       if (msg.type === 'assistant' && msg.message?.content) {
         const fromSubagent = !!msg.parent_tool_use_id;
+        if (!fromSubagent) markBusy();
         if (msg.message.usage && !fromSubagent) {
           const u = msg.message.usage;
           lastUsage = {
@@ -269,10 +346,9 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
         }
       }
 
-      // result 이벤트 — 최종 결과
-      // 백그라운드 작업이 남아 있으면 스트림은 계속되고, 완료 알림마다 턴이 이어져 result 가 여러 번 올 수 있다
+      // result 이벤트 — 턴 종료
+      // 백그라운드 작업이 남아 있으면 입력을 열어 둔 채 기다리고, 완료 알림마다 턴이 이어져 result 가 여러 번 올 수 있다
       if (msg.type === 'result') {
-        stoppedSinceResult = [];
         if (msg.subtype === 'success') {
           // msg.result는 마지막 assistant 턴의 텍스트만 포함할 수 있으므로,
           // 스트리밍 중 누적된 텍스트가 더 길면 그것을 사용
@@ -299,6 +375,8 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
           }
           // 이어지는 턴(백그라운드 완료 알림)의 텍스트가 붙지 않도록 문단을 나눈다
           if (finalResult && !finalResult.endsWith('\n')) finalResult += '\n\n';
+          idle = true;
+          scheduleIdleCheck();
         } else {
           // error result
           const errMsg = msg.error || msg.subtype || 'Unknown error';
@@ -311,6 +389,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
         }
       }
     }
+    if (abortController.signal.aborted) throw new Error('중단됨 (사용자 요청)');
   } catch (err) {
     if (abortController.signal.aborted) {
       throw new Error('중단됨 (사용자 요청)');
@@ -327,13 +406,12 @@ export async function runClaudeCode(sessionKey, prompt, workdir, { onProgress, o
     }
     throw err;
   } finally {
+    clearTimers();
+    input.close();
     runningQueries.delete(sessionKey);
   }
 
   const usage = resultUsage || lastUsage;
-  const backgroundKill = bgCeilingHit
-    ? { ceilingMs: Number(cleanEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS), tasks: stoppedSinceResult }
-    : null;
   if (backgroundKill) {
     console.log(`[Claude] Background tasks killed at wait ceiling for ${sessionKey}: ${backgroundKill.tasks.join(', ') || '(unknown)'}`);
   }
