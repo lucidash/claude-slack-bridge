@@ -11,7 +11,8 @@ Send a DM or mention the bot, and Claude Code runs on your local machine with re
 - **Session Management** — Start new sessions, switch between sessions, sync local CLI work to Slack, split long threads
 - **Working Directory** — Global, per-thread, and per-cron working directory settings with auto-detection on session switch
 - **Per-thread Model / Effort** — Override Claude model (`opus`/`sonnet`/`haiku`) and reasoning effort per thread
-- **Live Progress** — Elapsed time, context usage (`ctx: 45k/200k`), 5h rate-limit %, and recent tool activity with emoji indicators
+- **Live Turn View** — Each turn streams into one Slack message: Claude's narration plus a task timeline (tool calls as cards going in progress → done/failed, parallel calls grouped, subagent progress summaries), ending with elapsed time, context usage (`ctx: 45k/200k`) and 5h rate-limit %
+- **Background Work** — Background shells and subagents keep running after the turn ends; a self-updating status card tracks them, completion notifications continue the session, and messages sent in the meantime go straight into the running session
 - **Thread Pause** — Freeze threads with `!pause`/`!resume`. Missed messages are automatically collected on resume
 - **Silent Mode** — Run a request quietly (`!silent <msg>`); progress is shadowed to DM, only the final result lands in the original thread
 - **Cron Automation** — Schedule recurring tasks with cron expressions, optionally with a per-job working directory
@@ -51,7 +52,8 @@ cp .env.example .env
 | `CLAUDE_MODEL` | — | `sonnet` | Default Claude model (`opus`, `sonnet`, `haiku`) |
 | `CLAUDE_ALLOWED_DIRS` | — | — | Directories Claude Code can access (comma-separated) |
 | `CLAUDE_SKIP_PERMISSIONS` | — | `false` | Skip permission prompts when `true` |
-| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | — | `3600000` | Max time to wait for background tasks (subagents etc.) after the main turn ends; `0` waits indefinitely. Remaining tasks are killed past this limit |
+| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | — | `3600000` | Max time to keep waiting for background tasks (background shells, subagents) once the main turn goes idle; `0` waits indefinitely. Past this limit the bridge stops the remaining tasks |
+| `SLACK_BRIDGE_DATA_DIR` | — | `~/.claude/slack-bridge` | State directory — override to run an isolated test instance |
 | `OPENAI_API_KEY` | — | — | OpenAI API key for STT (falls back to Google if unset) |
 
 ## Usage
@@ -115,8 +117,8 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 
 | Command | Description |
 |---------|-------------|
-| `!status` | Show progress (elapsed time, tokens, recent tool activity) |
-| `!stop` | Abort current task (queue continues) |
+| `!status` | Show progress (elapsed time, tokens, recent tool activity, background tasks) |
+| `!stop` | Abort current task including its background tasks (queue continues) |
 | `!stop all` | Abort current task **and** clear queue |
 | `!queue` | List queued messages |
 | `!queue clear` | Clear queue (running task untouched) |
@@ -160,7 +162,10 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 ```
 src/
 ├── index.js       # Express server + Socket Mode client, event handler, orchestration
-├── claude.js      # Agent SDK query() wrapper, stream parsing, tool callbacks
+├── session.js     # Claude engine flow — per-turn views, message injection while waiting on background work
+├── claude.js      # Agent SDK query() wrapper (streaming input), turn / tool / background task events
+├── turn-view.js   # Slack rendering — streamed turn message (task timeline), background status card
+├── format.js      # Shared formatting (elapsed, ctx, tool labels)
 ├── commands.js    # Command handlers (!new, !session, !wd, !cron, !watch, etc.)
 ├── cron.js        # Cron job management and scheduled execution
 ├── watch.js       # Channel watch — Haiku triage and auto-response
@@ -172,7 +177,7 @@ src/
 
 ## Data Storage
 
-Session and state data are stored as JSON files in `~/.claude/slack-bridge/`:
+Session and state data are stored as JSON files in `~/.claude/slack-bridge/` (or `SLACK_BRIDGE_DATA_DIR`):
 
 | File | Purpose |
 |------|---------|
