@@ -1,10 +1,15 @@
-import cron from 'node-cron';
+import { Cron } from 'croner';
 import { randomUUID } from 'crypto';
 import { getCrons, saveCrons, getSession, saveThread, setThreadEngine, setThreadModel } from './store.js';
 import { slack } from './slack.js';
 
-const scheduledJobs = new Map(); // id → cron.ScheduledTask
+const scheduledJobs = new Map(); // id → Cron
 let processMessageFn = null;
+
+// 맥 시계는 시간 동기화로 몇 초씩 앞뒤로 보정된다. croner 는 최대 30초마다 깨어나 예정 시각이
+// 지났는지 보므로 보정이 있어도 회차를 놓치지 않는다 (node-cron 은 깨어난 초가 어긋나면 건너뛴다).
+// domAndDow: 일·요일을 둘 다 지정한 패턴은 node-cron 처럼 둘 다 맞을 때만 실행한다
+const CRON_OPTIONS = { domAndDow: true };
 
 /**
  * 서버 시작 시 저장된 cron jobs 복원
@@ -30,7 +35,7 @@ function scheduleJob(job) {
     scheduledJobs.get(job.id).stop();
   }
 
-  const task = cron.schedule(job.schedule, () => {
+  const task = new Cron(job.schedule, CRON_OPTIONS, () => {
     executeCronJob(job);
   });
 
@@ -109,8 +114,18 @@ async function executeCronJob(job, callbacks = {}) {
   }
 }
 
+// 함수 없이 만든 Cron 은 스케줄을 걸지 않고 패턴만 파싱한다 (잘못된 패턴이면 throw)
+function isValidSchedule(schedule) {
+  try {
+    new Cron(schedule, CRON_OPTIONS);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function addCronJob({ schedule, message, channel, userId, description, workdir, engine, model }) {
-  if (!cron.validate(schedule)) {
+  if (!isValidSchedule(schedule)) {
     throw new Error(`유효하지 않은 cron 표현식: \`${schedule}\``);
   }
 
