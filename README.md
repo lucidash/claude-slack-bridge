@@ -111,7 +111,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!wd <path>` | Set thread working directory (resets session) |
 | `!pwd` | Show current working directory |
 | `!model [<opus\|sonnet\|haiku>]` | Show or override Claude model for this thread (`!model reset` to clear) |
-| `!effort [<low\|medium\|high\|max>]` | Show or override reasoning effort for this thread (`!effort reset` to clear) |
+| `!effort [<low\|medium\|high\|xhigh\|max>]` | Show or override reasoning effort for this thread (default `xhigh` on the SDK engine; `!effort reset` to clear) |
 
 ### Execution Control
 

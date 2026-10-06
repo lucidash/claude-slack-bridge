@@ -16,6 +16,9 @@ const CLOSE_GRACE_MS = 1500;
 const NOTIFIED_CLOSE_GRACE_MS = 15000;
 const MAX_ACTIVITIES = 20;
 
+// 스레드에 effort 지정이 없을 때 SDK 엔진이 쓰는 기본값 (`!effort` 안내문도 이 값을 표시한다)
+export const DEFAULT_EFFORT = 'xhigh';
+
 /**
  * 실행 중인 Claude query를 중단 (백그라운드 작업도 함께 종료된다)
  */
@@ -134,7 +137,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
 
   const options = {
     model,
-    effort: effortOverride || 'max',
+    effort: effortOverride || DEFAULT_EFFORT,
     cwd: workdir || undefined,
     additionalDirectories: allowedDirs ? allowedDirs.split(',').map(d => d.trim()) : undefined,
     systemPrompt: { type: 'preset', preset: 'claude_code' },
