@@ -1,6 +1,6 @@
 import { Cron } from 'croner';
 import { randomUUID } from 'crypto';
-import { getCrons, saveCrons, getSession, saveThread, setThreadEngine, setThreadModel } from './store.js';
+import { getCrons, saveCrons, getSession, saveThread, setThreadEngine, setThreadModel, setThreadEffort } from './store.js';
 import { slack } from './slack.js';
 
 const scheduledJobs = new Map(); // id → Cron
@@ -54,13 +54,15 @@ async function executeCronJob(job, callbacks = {}) {
 
     const sessionKey = `${job.userId}-${msg.ts}`;
 
-    // job.workdir / job.engine / job.model 이 지정되어 있으면 새 스레드에 매핑 등록
-    // (executeClaudeRequest 가 getThreadWorkdir / getThreadEngine / getThreadModel 으로 읽음)
+    // job.workdir / job.engine / job.model / job.effort 가 지정되어 있으면 새 스레드에 매핑 등록
+    // (executeClaudeRequest 가 getThreadWorkdir / getThreadEngine / getThreadModel / getThreadEffort 로 읽음)
+    // job.effort 가 없으면 스레드 지정이 비어 있어 SDK 엔진 기본값(DEFAULT_EFFORT)이 적용된다
     const threadKey = `${job.channel}-${msg.ts}`;
-    if (job.workdir || job.engine || job.model) {
+    if (job.workdir || job.engine || job.model || job.effort) {
       saveThread(threadKey, job.userId, job.workdir || null);
       if (job.engine) setThreadEngine(threadKey, job.engine);
       if (job.model) setThreadModel(threadKey, job.model);
+      if (job.effort) setThreadEffort(threadKey, job.effort);
     }
 
     // 세션 ID가 생성되면 콜백 호출 (실행 초기에 감지)
@@ -124,7 +126,7 @@ function isValidSchedule(schedule) {
   }
 }
 
-export function addCronJob({ schedule, message, channel, userId, description, workdir, engine, model }) {
+export function addCronJob({ schedule, message, channel, userId, description, workdir, engine, model, effort }) {
   if (!isValidSchedule(schedule)) {
     throw new Error(`유효하지 않은 cron 표현식: \`${schedule}\``);
   }
@@ -139,6 +141,7 @@ export function addCronJob({ schedule, message, channel, userId, description, wo
     workdir: workdir || null,
     engine: engine || null,
     model: model || null,
+    effort: effort || null,
     enabled: true,
     createdAt: new Date().toISOString(),
     lastRun: null,

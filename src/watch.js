@@ -1,8 +1,13 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { getWatch } from './store.js';
 
+// watch 에 triageModel 지정이 없을 때 판정에 쓰는 모델
+export const DEFAULT_TRIAGE_MODEL = 'haiku';
+
 /**
- * Agent SDK (Haiku)로 메시지가 trigger 조건에 해당하는지 판단
+ * Agent SDK 로 메시지가 trigger 조건에 해당하는지 판단
+ * 모델은 watchConfig.triageModel (기본 haiku), effort 는 watchConfig.triageEffort 로 지정한다.
+ * triageEffort 가 없으면 effort 옵션을 전달하지 않는다 (SDK·CLI 기본값)
  */
 export async function triageMessage(messageText, watchConfig) {
   const prompt = `다음 Slack 메시지가 아래 조건에 해당하는지 판단하세요.
@@ -21,7 +26,8 @@ ${messageText || '(빈 메시지)'}
     const q = query({
       prompt,
       options: {
-        model: 'haiku',
+        model: watchConfig.triageModel || DEFAULT_TRIAGE_MODEL,
+        ...(watchConfig.triageEffort ? { effort: watchConfig.triageEffort } : {}),
         maxTurns: 1,
         systemPrompt: '당신은 Slack 채널 메시지 분류기입니다. 도구를 사용하지 말고 JSON으로만 응답하세요.',
         cwd: process.env.CLAUDE_WATCH_TRIAGE_CWD || '/Users/muzi/projects/likey-cs',
