@@ -17,7 +17,7 @@ process.on('uncaughtException', (err) => {
 
 import { slack, fetchThreadHistory } from './slack.js';
 import { verifySlackRequest, isUserAllowed } from './security.js';
-import { handleCommand } from './commands.js';
+import { handleCommand, setThreadWorkdir } from './commands.js';
 import {
   getSession, saveThread, isActiveThread, getThreadWorkdir, appendInbox,
   getWorkdir, getInbox, clearInbox, getAllSessions,
@@ -37,6 +37,7 @@ import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
 import { startSocketMode } from './socket.js';
+import { handlePickerAction, handlePickerSubmission, applyPickedSkill, recordSkillRun } from './picker.js';
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -89,6 +90,26 @@ function dispatchEventCallback(body) {
   handleSlackEvent(event);
 }
 
+// 레포·스킬 선택창의 버튼·선택(block_actions)과 인자 입력 모달 제출(view_submission)
+function dispatchInteraction(payload) {
+  const userId = payload.user?.id;
+  if (!isUserAllowed(userId)) {
+    console.warn(`[Security] 허용되지 않은 사용자: ${userId}`);
+    return;
+  }
+  const deps = {
+    setWorkdir: setThreadWorkdir,
+    getWorkdir: (threadKey) => getThreadWorkdir(threadKey) || getWorkdir(userId),
+    runSkill: ({ channel, threadTs, text, eventTs }) => {
+      console.log(`[Picker] Run in ${channel}-${threadTs}: ${text.substring(0, 50)}`);
+      processMessage({ userMessage: text, channel, replyThreadTs: threadTs, userId, eventTs, threadTs })
+        .catch(err => console.error('[Picker] Run failed:', err.message));
+    },
+  };
+  const handle = payload.type === 'view_submission' ? handlePickerSubmission : handlePickerAction;
+  handle(payload, deps).catch(err => console.error('[Picker] Error:', err.data?.error || err.message));
+}
+
 // Slack Events API 엔드포인트 (HTTP 모드일 때만 활성)
 if (SLACK_MODE === 'http') {
   app.post('/slack/events', (req, res) => {
@@ -110,6 +131,22 @@ if (SLACK_MODE === 'http') {
 
     // Slack에게 즉시 200 응답 (3초 내 응답 필요)
     res.status(200).send('OK');
+  });
+
+  // Interactivity Request URL — 선택창 버튼·모달 (form-encoded `payload`)
+  const interactiveBody = express.urlencoded({ extended: false, verify: (req, _res, buf) => { req.rawBody = buf.toString(); } });
+  app.post('/slack/interactive', interactiveBody, (req, res) => {
+    if (!verifySlackRequest(req)) {
+      console.warn('[Security] 유효하지 않은 Slack 서명');
+      return res.status(401).send('Unauthorized');
+    }
+    // 빈 200 응답이 모달을 닫는다
+    res.status(200).send('');
+    try {
+      dispatchInteraction(JSON.parse(req.body.payload));
+    } catch (err) {
+      console.error('[Picker] Invalid interactive payload:', err.message);
+    }
   });
 }
 
@@ -258,6 +295,10 @@ async function handleSlackEvent(event) {
   } else if (isThreadSilent(effectiveTk)) {
     silent = true;
   }
+
+  // 스킬 선택창에서 고른 스킬이 있으면 이 메시지를 인자로 실행한다 (직접 `/` 로 시작했으면 그대로 둔다)
+  userMessage = applyPickedSkill(effectiveTk, userMessage);
+  recordSkillRun(getThreadWorkdir(effectiveTk) || getWorkdir(userId), userMessage);
 
   // inbox에 메시지 추가
   appendInbox({
@@ -848,7 +889,7 @@ app.listen(PORT, async () => {
     }
     try {
       // Socket Mode 로 받은 event_callback 도 HTTP 모드와 같은 핸들러로 처리한다
-      await startSocketMode({ onEvent: dispatchEventCallback });
+      await startSocketMode({ onEvent: dispatchEventCallback, onInteraction: dispatchInteraction });
     } catch (err) {
       console.error('[Socket] Failed to start:', err.message);
       process.exit(1);

@@ -87,7 +87,8 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
    - **Socket Mode** — *Socket Mode* → enable; generate an App-Level Token with `connections:write` scope; *Event Subscriptions* → enable (Request URL not required)
 4. **Subscribe to bot events**: `message.im`, `app_mention`, `message.channels` (for channel watch)
 5. **App Home** — Enable Messages Tab + "Allow users to send Slash commands and messages"
-6. Install the app to your workspace
+6. **Interactivity & Shortcuts** — enable (for the `!wd` / `!skills` pickers). Socket Mode needs no Request URL; HTTP mode uses `https://<your-tunnel>/slack/interactive`
+7. Install the app to your workspace
 
 ## Commands
 
@@ -108,8 +109,10 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 
 | Command | Description |
 |---------|-------------|
+| `!wd` | Repo picker — buttons for frequently used repos, a searchable list for the rest; picking one shows the skill picker |
 | `!wd <path>` | Set thread working directory (resets session) |
 | `!pwd` | Show current working directory |
+| `!skills` | Skill picker for the thread's working directory. After picking a skill, the next message is sent as `/<skill> <message>`; the *입력창 열기* (open input) button takes the arguments in a modal |
 | `!model [<opus\|sonnet\|haiku>]` | Show or override Claude model for this thread (`!model reset` to clear) |
 | `!effort [<low\|medium\|high\|xhigh\|max>]` | Show or override reasoning effort for this thread (default `xhigh` on the SDK engine; `!effort reset` to clear) |
 
@@ -165,6 +168,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 src/
 ├── index.js       # Express server, event handler, orchestration
 ├── socket.js      # Socket Mode client — replaced when it stays disconnected for 2 minutes
+├── picker.js      # Repo / skill pickers (!wd, !skills) — skill catalog, buttons, argument modal
 ├── session.js     # Claude engine flow — per-turn views, message injection while waiting on background work
 ├── claude.js      # Agent SDK query() wrapper (streaming input), turn / tool / background task events
 ├── turn-view.js   # Slack rendering — streamed turn message (task timeline), background status card
@@ -194,18 +198,20 @@ Session and state data are stored as JSON files in `~/.claude/slack-bridge/` (or
 | `accounts.json` | Registered Claude OAuth accounts |
 | `sync-points.json` | Last sync point per session |
 | `inbox.json` | Incoming message audit log |
+| `skill-usage.json` | Skill run counts per repo (orders the skill picker buttons) |
 
 ## API Endpoints
 
 | Method | Path | Mode | Description |
 |--------|------|------|-------------|
 | POST | `/slack/events` | HTTP only | Slack event webhook |
+| POST | `/slack/interactive` | HTTP only | Picker buttons and argument modal (Interactivity Request URL) |
 | GET | `/health` | both | Health check |
 | GET | `/sessions` | both | List active sessions |
 | GET | `/inbox` | both | Incoming message log |
 | DELETE | `/inbox` | both | Clear inbox |
 
-In Socket mode, `/slack/events` is not registered; events arrive over the Slack WebSocket.
+In Socket mode, `/slack/events` and `/slack/interactive` are not registered; events and interactions arrive over the Slack WebSocket.
 
 ## License
 

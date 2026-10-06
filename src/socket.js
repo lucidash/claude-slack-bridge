@@ -14,11 +14,13 @@ const CHECK_INTERVAL_MS = 30 * 1000;
  * Socket Mode 연결을 시작하고, 연결이 멈추면 새 클라이언트로 교체한다
  * @param {object} opts
  * @param {(body: object) => void} opts.onEvent - 수신한 event_callback 의 body (ack 는 여기서 처리한다)
+ * @param {(payload: object) => void} [opts.onInteraction] - 버튼·선택창(block_actions)과 모달 제출(view_submission) payload
  * @param {() => SocketModeClient} [opts.createClient] - 기본은 SLACK_APP_TOKEN 으로 만든 SocketModeClient
  * @returns {Promise<void>} 첫 연결이 끝나면 resolve. 첫 연결 실패는 그대로 reject 한다
  */
 export async function startSocketMode({
   onEvent,
+  onInteraction = () => {},
   createClient = () => new SocketModeClient({ appToken: process.env.SLACK_APP_TOKEN }),
   stallMs = STALL_MS,
   checkIntervalMs = CHECK_INTERVAL_MS,
@@ -36,6 +38,8 @@ export async function startSocketMode({
         console.warn('[Socket] ack failed:', err.message);
       }
       if (body?.type === 'event_callback') onEvent(body);
+      // 빈 ack 가 view_submission 의 모달을 닫는다
+      else if (body?.type === 'block_actions' || body?.type === 'view_submission') onInteraction(body);
     });
     client.on('connected', () => {
       if (client !== current) return;
