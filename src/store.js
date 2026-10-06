@@ -14,10 +14,11 @@ const SYNC_POINTS_FILE = join(BRIDGE_DIR, 'sync-points.json');
 const WATCHES_FILE = join(BRIDGE_DIR, 'watches.json');
 const PROCESSING_FILE = join(BRIDGE_DIR, 'processing.json');
 const ACCOUNTS_FILE = join(BRIDGE_DIR, 'accounts.json');
+const SKILL_USAGE_FILE = join(BRIDGE_DIR, 'skill-usage.json');
 
 // 디렉토리 및 파일 초기화
 if (!existsSync(BRIDGE_DIR)) mkdirSync(BRIDGE_DIR, { recursive: true });
-for (const file of [SESSIONS_FILE, THREADS_FILE, WORKDIRS_FILE, PAUSED_FILE, WATCHES_FILE, PROCESSING_FILE]) {
+for (const file of [SESSIONS_FILE, THREADS_FILE, WORKDIRS_FILE, PAUSED_FILE, WATCHES_FILE, PROCESSING_FILE, SKILL_USAGE_FILE]) {
   if (!existsSync(file)) writeFileSync(file, JSON.stringify({}, null, 2));
 }
 if (!existsSync(CRONS_FILE)) {
@@ -366,6 +367,18 @@ export function saveCrons(jobs) {
 
 export function getAllThreads() {
   return readJson(THREADS_FILE);
+}
+
+// 스킬 사용 횟수 (레포 이름 → 스킬 이름 → 횟수) — 스킬 선택창의 버튼 순서에 쓴다
+export function getSkillUsage() {
+  return readJson(SKILL_USAGE_FILE);
+}
+
+export function recordSkillUsage(repo, skill) {
+  const usage = readJson(SKILL_USAGE_FILE);
+  usage[repo] ??= {};
+  usage[repo][skill] = (usage[repo][skill] || 0) + 1;
+  writeJson(SKILL_USAGE_FILE, usage);
 }
 
 // Channel Watches

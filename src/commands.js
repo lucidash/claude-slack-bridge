@@ -6,6 +6,7 @@ import { stopClaudeQuery, getClaudeQueryState, DEFAULT_EFFORT, VALID_EFFORTS } f
 import { stopClaudePtyQuery } from './claude-pty.js';
 import { formatBackgroundTasks } from './format.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
+import { repoPickerBlocks, skillPickerBlocks, workdirBlock } from './picker.js';
 
 // !model / !cron add --model 에서 공통으로 쓰는 허용 모델 목록
 const VALID_MODELS = ['sonnet', 'opus', 'haiku',
@@ -30,6 +31,16 @@ function stopLiveQuery(sessionKey) {
 }
 
 /**
+ * 스레드 작업 디렉토리를 바꾸고 세션을 초기화한다 (`!wd <path>`, 레포 선택창). 중단한 작업이 있으면 안내 문구를 돌려준다
+ */
+export function setThreadWorkdir({ threadKey, sessionKey, userId, dir }) {
+  saveThread(threadKey, userId, dir);
+  const stopped = stopLiveQuery(sessionKey);
+  clearSession(sessionKey);
+  return stopped;
+}
+
+/**
  * 특수 명령어 처리. 처리했으면 true (또는 resume 객체), 아니면 false 반환.
  */
 const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
@@ -42,9 +53,11 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!sync-all\` — 최근 24h 내 변경된 모든 세션 일괄 동기화
 \`!sync-all <duration>\` — 지정 기간 내 변경 세션 동기화 (예: \`6h\`, \`30m\`)
 
-*작업 디렉토리*
+*작업 디렉토리·스킬*
+\`!wd\` — 레포 선택창 (고르면 스킬 선택창이 이어서 나옴)
 \`!wd <path>\` — 이 스레드의 작업 디렉토리 지정
 \`!pwd\` — 현재 작업 디렉토리 확인
+\`!skills\` — 스킬 선택창. 스킬을 고른 뒤 다음 메시지로 인자를 보내면 \`/스킬 인자\` 로 실행
 
 *엔진*
 \`!engine\` — 현재 엔진 확인 (claude / pty-claude)
@@ -161,28 +174,44 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     return true;
   }
 
+  // wd — 레포 선택창
+  if (['!wd', '/wd'].includes(msg)) {
+    await slack.chat.postMessage({ channel, text: '작업할 레포를 고르세요', blocks: repoPickerBlocks(), thread_ts: replyThreadTs });
+    return true;
+  }
+
+  // skills — 스킬 선택창 (이 스레드의 작업 디렉토리 기준)
+  if (['!skills', '!skill'].includes(msg)) {
+    const workdir = getThreadWorkdir(threadKey || `${channel}-${replyThreadTs}`) || getWorkdir(userId);
+    await slack.chat.postMessage({ channel, text: '스킬을 고르세요', blocks: skillPickerBlocks(workdir), thread_ts: replyThreadTs });
+    return true;
+  }
+
   // wd <path> — 스레드별 작업 디렉토리 지정 (스레드 시작 시에만)
   const wdMatch = userMessage.match(/^[!\/]wd\s+(.+)$/i);
   if (wdMatch) {
     const dir = wdMatch[1].trim().replace(/^~/, homedir());
+    let isDir = false;
     try {
-      if (!statSync(dir).isDirectory()) throw new Error('Not a directory');
-      const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
-      saveThread(effectiveThreadKey, userId, dir);
-      const stopped = stopLiveQuery(sessionKey);
-      clearSession(sessionKey);
-      await slack.chat.postMessage({
-        channel,
-        text: `📂 이 스레드의 작업 디렉토리: \`${dir}\`${stopped}`,
-        thread_ts: replyThreadTs,
-      });
-    } catch {
+      isDir = statSync(dir).isDirectory();
+    } catch { /* 없는 경로 */ }
+    if (!isDir) {
       await slack.chat.postMessage({
         channel,
         text: `❌ 디렉토리를 찾을 수 없습니다: \`${dir}\``,
         thread_ts: replyThreadTs,
       });
+      return true;
     }
+    const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
+    const stopped = setThreadWorkdir({ threadKey: effectiveThreadKey, sessionKey, userId, dir });
+    // 바로 스킬을 고를 수 있도록 스킬 선택창을 같이 보여준다
+    await slack.chat.postMessage({
+      channel,
+      text: `📂 이 스레드의 작업 디렉토리: \`${dir}\`${stopped}`,
+      blocks: [workdirBlock(dir, stopped), ...skillPickerBlocks(dir)],
+      thread_ts: replyThreadTs,
+    });
     return true;
   }
 

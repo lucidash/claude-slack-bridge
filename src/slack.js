@@ -8,6 +8,16 @@ if (!SLACK_BOT_TOKEN) {
 
 export const slack = new WebClient(SLACK_BOT_TOKEN);
 
+// 레포·스킬 선택창 메시지의 block_id 접두사. 스레드 히스토리에서 뺄 때 쓴다
+export const PICKER_BLOCK_PREFIX = 'picker:';
+
+// 브릿지 명령(`!` 로 시작, `!silent` 제외)과 선택창 메시지는 대화 맥락이 아니라 히스토리에서 뺀다.
+// 선택창으로 시작한 스레드는 히스토리가 비므로 `/스킬 인자` 요청이 맨 앞에 그대로 전달되어 스킬로 바로 실행된다
+function isBridgeControlMessage(msg) {
+  if (msg.bot_id) return !!msg.blocks?.some(b => b.block_id?.startsWith(PICKER_BLOCK_PREFIX));
+  return /^!(?!silent\s)/i.test((msg.text || '').replace(/<@[A-Z0-9]+>\s*/g, '').trim());
+}
+
 /**
  * 스레드 히스토리 가져오기 (봇 호출 이전 대화 내용)
  */
@@ -20,7 +30,8 @@ export async function fetchThreadHistory(channel, threadTs) {
     });
     if (!result.messages || result.messages.length <= 1) return '';
 
-    const history = result.messages.slice(0, -1);
+    const history = result.messages.slice(0, -1).filter(msg => !isBridgeControlMessage(msg));
+    if (history.length === 0) return '';
     const lines = history.map(msg => {
       const role = msg.bot_id ? '봇' : '사용자';
       // text + attachments 내용 추출 (봇 메시지는 attachments에 주요 내용이 있을 수 있음)
