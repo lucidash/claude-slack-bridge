@@ -1,6 +1,5 @@
 import 'dotenv/config';
 import express from 'express';
-import { SocketModeClient } from '@slack/socket-mode';
 
 // Agent SDK가 spawn한 claude CLI 자식 프로세스가 같은 process group에서 실행되므로
 // CLI 종료 시 SIGINT가 부모 프로세스로 전파될 수 있음 → 서버 크래시 방지
@@ -37,6 +36,7 @@ import { formatElapsed, formatCtx, formatRateLimit } from './format.js';
 import { findMediaFile, transcribe } from './stt.js';
 import { initCrons } from './cron.js';
 import { triageMessage, matchesSender, getActiveWatch } from './watch.js';
+import { startSocketMode } from './socket.js';
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -812,36 +812,6 @@ async function markStaleBackgroundCard(channel, ts, threadTs) {
   await slack.chat.update({ channel, ts, text: title, blocks: stopped });
 }
 
-// ── Socket Mode 시작 ───────────────────────────────────────────
-
-async function startSocketMode() {
-  if (!process.env.SLACK_APP_TOKEN) {
-    console.error('[Error] SLACK_MODE=socket 인데 SLACK_APP_TOKEN 이 없습니다.');
-    console.error('        Slack App 설정에서 App-Level Token (xapp-, connections:write) 을 발급하세요.');
-    process.exit(1);
-  }
-
-  const socket = new SocketModeClient({ appToken: process.env.SLACK_APP_TOKEN });
-
-  // 모든 Slack 이벤트를 단일 핸들러로 라우팅 — body.type 으로 분기
-  socket.on('slack_event', async ({ ack, body }) => {
-    try {
-      await ack();
-    } catch (err) {
-      console.warn('[Socket] ack failed:', err.message);
-    }
-    if (body?.type === 'event_callback') {
-      dispatchEventCallback(body);
-    }
-  });
-
-  socket.on('connected', () => console.log('[Socket] Connected to Slack'));
-  socket.on('disconnected', () => console.warn('[Socket] Disconnected from Slack'));
-  socket.on('error', (err) => console.error('[Socket] Error:', err.message));
-
-  await socket.start();
-}
-
 // ── 서버 시작 ──────────────────────────────────────────────────
 
 app.listen(PORT, async () => {
@@ -871,8 +841,14 @@ app.listen(PORT, async () => {
   initCrons(processMessage);
 
   if (SLACK_MODE === 'socket') {
+    if (!process.env.SLACK_APP_TOKEN) {
+      console.error('[Error] SLACK_MODE=socket 인데 SLACK_APP_TOKEN 이 없습니다.');
+      console.error('        Slack App 설정에서 App-Level Token (xapp-, connections:write) 을 발급하세요.');
+      process.exit(1);
+    }
     try {
-      await startSocketMode();
+      // Socket Mode 로 받은 event_callback 도 HTTP 모드와 같은 핸들러로 처리한다
+      await startSocketMode({ onEvent: dispatchEventCallback });
     } catch (err) {
       console.error('[Socket] Failed to start:', err.message);
       process.exit(1);
