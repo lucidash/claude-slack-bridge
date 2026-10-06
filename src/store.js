@@ -397,6 +397,7 @@ export function removeWatch(channelId) {
 /**
  * 진행 중 표시 메시지 기록 — 재시작 시 정리용
  * kind: 없음(텍스트 상태 메시지) | 'stream'(스트리밍 중인 턴 메시지) | 'bgcard'(백그라운드 현황 카드)
+ *       | 'reaction'(백그라운드 작업이 끝날 때까지 ⏳ 를 유지하는 요청 메시지. ts 는 요청 메시지의 ts)
  */
 export function saveProcessing(key, { channel, ts, threadTs, kind }) {
   const data = readJson(PROCESSING_FILE);

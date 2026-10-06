@@ -31,7 +31,7 @@ import {
   saveProcessing, clearProcessing, getStaleProcessing,
   getSessionPrUrl, getThreadModel, getThreadEffort, getThreadEngine, setThreadEngine,
 } from './store.js';
-import { runClaudeSession } from './session.js';
+import { runClaudeSession, WORKING_REACTION } from './session.js';
 import { runClaudeViaPty } from './claude-pty.js';
 import { formatElapsed, formatCtx, formatRateLimit } from './format.js';
 import { findMediaFile, transcribe } from './stt.js';
@@ -847,7 +847,7 @@ async function startSocketMode() {
 app.listen(PORT, async () => {
   console.log(`[Server] Claude Slack Bridge running on port ${PORT} (mode: ${SLACK_MODE})`);
 
-  // 서버 재시작 시 stale "처리 중" 메시지 정리 (스트리밍 중이던 턴 메시지, 백그라운드 현황 카드 포함)
+  // 서버 재시작 시 stale "처리 중" 메시지 정리 (스트리밍 중이던 턴 메시지, 백그라운드 현황 카드, 요청 메시지의 ⏳ 포함)
   const stale = getStaleProcessing();
   for (const [key, { channel, ts, threadTs, kind }] of stale) {
     try {
@@ -855,6 +855,9 @@ app.listen(PORT, async () => {
         await slack.chat.stopStream({ channel, ts, blocks: [{ type: 'context', elements: [{ type: 'mrkdwn', text: '⚠️ 서버 재시작으로 중단됐습니다. 다시 요청해주세요.' }] }] });
       } else if (kind === 'bgcard') {
         await markStaleBackgroundCard(channel, ts, threadTs);
+      } else if (kind === 'reaction') {
+        // 백그라운드 작업이 끝날 때까지 유지하던 요청 메시지의 ⏳ — 재시작으로 끊겼으므로 제거한다
+        await slack.reactions.remove({ channel, name: WORKING_REACTION, timestamp: ts });
       } else {
         await slack.chat.update({ channel, ts, text: '⚠️ 서버 재시작으로 작업이 중단되었습니다. 다시 요청해주세요.' });
       }
