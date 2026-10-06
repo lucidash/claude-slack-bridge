@@ -3,10 +3,11 @@
 import { slack } from './slack.js';
 import { runClaudeCode, sendToClaudeQuery, getClaudeQueryState } from './claude.js';
 import { TurnView, NullView, BackgroundCard, NullCard, resolveRecipient, splitMarkdown } from './turn-view.js';
-import { getSession, getSessionPrUrl } from './store.js';
+import { getSession, getSessionPrUrl, saveProcessing, clearProcessing } from './store.js';
 import { formatElapsed, formatCtx, formatRateLimit, truncate } from './format.js';
 
-const WORKING_REACTION = 'hourglass_flowing_sand';
+// 처리 중인 요청 메시지에 다는 리액션 (index.js 의 재시작 정리도 이 이름으로 제거한다)
+export const WORKING_REACTION = 'hourglass_flowing_sand';
 const QUEUED_REACTION = 'inbox_tray';
 const STATUS_LABEL = { completed: '완료', failed: '실패', stopped: '중단' };
 
@@ -31,7 +32,9 @@ function turnFooter({ sessionKey, elapsedMs, usage, rateLimit, liveCount }) {
   const prUrl = sid ? getSessionPrUrl(sid) : null;
   const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
   const bg = liveCount ? ` · 🔄 백그라운드 ${liveCount}개 진행 중` : '';
-  return `✅ 처리완료 (${formatElapsed(elapsedMs)}${formatCtx(usage)}${formatRateLimit(rateLimit)}${prInfo})${bg}`;
+  // 백그라운드 작업이 남아 있으면 요청은 아직 끝나지 않았으므로 "처리완료" 대신 "응답 완료"로 표시한다 (요청 메시지의 ⏳ 도 유지된다)
+  const label = liveCount ? '응답 완료' : '처리완료';
+  return `✅ ${label} (${formatElapsed(elapsedMs)}${formatCtx(usage)}${formatRateLimit(rateLimit)}${prInfo})${bg}`;
 }
 
 async function postMarkdown(channel, threadTs, text) {
@@ -75,6 +78,22 @@ export async function runClaudeSession({ sessionKey, lock, item, prompt, workdir
     react(trigger, WORKING_REACTION, true);
     lock.currentMessage = preview(it.userMessage);
     return { view: newView(), trigger };
+  };
+
+  // 턴이 끝나도 백그라운드 작업이 남아 있으면 요청은 아직 끝나지 않았다 — 그동안 요청 메시지 하나에 ⏳ 를 유지한다.
+  // 대기 중 보낸 메시지가 쌓여도 ⏳ 가 늘어나지 않도록 가장 먼저 남은 메시지 하나만 유지하고, 나머지는 자기 턴이 끝날 때 제거한다.
+  // 재시작으로 중단되면 index.js 가 processing.json 의 'reaction' 항목으로 제거한다
+  let held = null;
+  const holdKey = `${sessionKey}#hold`;
+  const hold = (trigger) => {
+    held = trigger;
+    saveProcessing(holdKey, { channel: trigger.channel, ts: trigger.ts, kind: 'reaction' });
+  };
+  const releaseHeld = () => {
+    if (!held) return;
+    react(held, WORKING_REACTION, false);
+    held = null;
+    clearProcessing(holdKey);
   };
 
   let turn = userTurn(item, { first: true }); // 진행 중인 턴
@@ -140,7 +159,13 @@ export async function runClaudeSession({ sessionKey, lock, item, prompt, workdir
         footer: turnFooter({ sessionKey, elapsedMs: Date.now() - turnStartedAt, usage, rateLimit, liveCount }),
         fallbackText: text.trim() ? null : resultText,
       });
-      react(trigger, WORKING_REACTION, false);
+      if (liveCount && trigger && !held) {
+        hold(trigger);
+      } else {
+        react(trigger, WORKING_REACTION, false);
+        // 완료 알림으로 열린 턴은 trigger 가 없으므로, 남은 작업이 없어지는 턴에서 유지하던 ⏳ 를 제거한다
+        if (!liveCount) releaseHeld();
+      }
       // silent: 원본 스레드에는 응답 글만 남긴다 (과정은 로그 채널에)
       const answer = (text.trim() || resultText || '').trim();
       if (silent && answer) {
@@ -179,6 +204,8 @@ export async function runClaudeSession({ sessionKey, lock, item, prompt, workdir
     await bgCard.finish(aborted ? '🛑 중단됨 — 백그라운드 작업도 함께 종료' : '❌ 오류로 중단됨');
     throw err;
   } finally {
+    // 정상 종료·대기 한도 초과·오류·!stop 모두 여기서 유지하던 ⏳ 를 제거한다
+    releaseHeld();
     lock.live = null;
   }
 }
