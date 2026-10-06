@@ -163,7 +163,8 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 
 ```
 src/
-├── index.js       # Express server + Socket Mode client, event handler, orchestration
+├── index.js       # Express server, event handler, orchestration
+├── socket.js      # Socket Mode client — replaced when it stays disconnected for 2 minutes
 ├── session.js     # Claude engine flow — per-turn views, message injection while waiting on background work
 ├── claude.js      # Agent SDK query() wrapper (streaming input), turn / tool / background task events
 ├── turn-view.js   # Slack rendering — streamed turn message (task timeline), background status card

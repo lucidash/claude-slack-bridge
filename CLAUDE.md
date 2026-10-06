@@ -30,6 +30,7 @@ Slack에서 Claude Code Agent SDK를 통해 Claude를 원격 제어하는 브릿
 ```
 src/
   index.js    — Express 서버, Slack 이벤트 수신 및 Claude 실행 오케스트레이션
+  socket.js   — Socket Mode 연결, 2분 넘게 연결되지 않으면 클라이언트 교체 (라이브러리 재연결이 멈추는 경우 대비)
   session.js  — claude 엔진 실행 흐름 (턴별 표시, 백그라운드 대기 중 메시지 주입)
   claude.js   — Agent SDK query() 실행 (streaming input), 턴·도구·백그라운드 작업 이벤트, 세션 관리
   turn-view.js — Slack 표시 (턴 스트리밍 메시지 = 작업 타임라인, 백그라운드 현황 카드)
