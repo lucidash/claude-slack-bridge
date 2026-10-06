@@ -112,7 +112,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!wd` | Repo picker — buttons for frequently used repos, a searchable list for the rest; picking one shows the skill picker |
 | `!wd <path>` | Set thread working directory (resets session) |
 | `!pwd` | Show current working directory |
-| `!skills` | Skill picker for the thread's working directory. After picking a skill, the next message is sent as `/<skill> <message>`; the *입력창 열기* (open input) button takes the arguments in a modal |
+| `!skills` / `!sk` | Skill picker for the thread's working directory. After picking a skill, the next message is sent as `/<skill> <message>`; the *입력창 열기* (open input) button takes the arguments in a modal, where picking another skill appends ` /<skill> ` to the input (e.g. `/open-pr on /wt 해줘`) |
 | `!model [<opus\|sonnet\|haiku>]` | Show or override Claude model for this thread (`!model reset` to clear) |
 | `!effort [<low\|medium\|high\|xhigh\|max>]` | Show or override reasoning effort for this thread (default `xhigh` on the SDK engine; `!effort reset` to clear) |
 
@@ -168,7 +168,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 src/
 ├── index.js       # Express server, event handler, orchestration
 ├── socket.js      # Socket Mode client — replaced when it stays disconnected for 2 minutes
-├── picker.js      # Repo / skill pickers (!wd, !skills) — skill catalog, buttons, argument modal
+├── picker.js      # Repo / skill pickers (!wd, !skills) — skill catalog, buttons, argument modal (appends other skills)
 ├── session.js     # Claude engine flow — per-turn views, message injection while waiting on background work
 ├── claude.js      # Agent SDK query() wrapper (streaming input), turn / tool / background task events
 ├── turn-view.js   # Slack rendering — streamed turn message (task timeline), background status card

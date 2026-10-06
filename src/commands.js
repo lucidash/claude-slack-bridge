@@ -57,7 +57,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!wd\` — 레포 선택창 (고르면 스킬 선택창이 이어서 나옴)
 \`!wd <path>\` — 이 스레드의 작업 디렉토리 지정
 \`!pwd\` — 현재 작업 디렉토리 확인
-\`!skills\` — 스킬 선택창. 스킬을 고른 뒤 다음 메시지로 인자를 보내면 \`/스킬 인자\` 로 실행
+\`!skills\` / \`!sk\` — 스킬 선택창. 스킬을 고른 뒤 다음 메시지로 인자를 보내면 \`/스킬 인자\` 로 실행. [입력창 열기] 에서 다른 스킬을 고르면 입력란 끝에 \`/스킬\` 을 추가 (여러 스킬 이어 쓰기)
 
 *엔진*
 \`!engine\` — 현재 엔진 확인 (claude / pty-claude)
@@ -181,7 +181,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   }
 
   // skills — 스킬 선택창 (이 스레드의 작업 디렉토리 기준)
-  if (['!skills', '!skill'].includes(msg)) {
+  if (['!skills', '!skill', '!sk'].includes(msg)) {
     const workdir = getThreadWorkdir(threadKey || `${channel}-${replyThreadTs}`) || getWorkdir(userId);
     await slack.chat.postMessage({ channel, text: '스킬을 고르세요', blocks: skillPickerBlocks(workdir), thread_ts: replyThreadTs });
     return true;
