@@ -2,7 +2,7 @@ import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
 import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getThreadEngine, setThreadEngine, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
-import { stopClaudeQuery, getClaudeQueryState, DEFAULT_EFFORT } from './claude.js';
+import { stopClaudeQuery, getClaudeQueryState, DEFAULT_EFFORT, VALID_EFFORTS } from './claude.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
 import { formatBackgroundTasks } from './format.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
@@ -75,7 +75,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 
 *Cron*
 \`!cron\` — 등록된 cron 목록
-\`!cron add "schedule" message [--workdir <path>] [--engine <claude|pty-claude>] [--model <sonnet|opus|haiku>] [-- 설명]\` — cron 등록
+\`!cron add "schedule" message [--workdir <path>] [--engine <claude|pty-claude>] [--model <sonnet|opus|haiku>] [--effort <low|medium|high|xhigh|max>] [-- 설명]\` — cron 등록 (--effort 를 생략하면 기본값 적용)
 \`!cron remove <id>\` — cron 삭제
 \`!cron pause <id>\` / \`!cron resume <id>\` — 일시정지/재개
 \`!cron run <id>\` — 즉시 실행
@@ -84,6 +84,8 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 *Channel Watch*
 \`!watch <channel_id>\` — 채널 watching 등록 (멀티라인으로 sender/trigger/action 설정)
 \`!watch-set <channel_id> <field> <value>\` — watch 설정 개별 수정
+\`!watch-set <channel_id> triageModel <sonnet|opus|haiku|reset>\` — 판정에 쓰는 모델 (기본 haiku)
+\`!watch-set <channel_id> triageEffort <low|medium|high|xhigh|max|reset>\` — 판정 effort (지정하지 않으면 SDK 기본값)
 \`!unwatch <channel_id>\` — watching 해제
 \`!watches\` — 전체 watch 목록
 
@@ -311,7 +313,6 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   const effortMatch = userMessage.match(/^[!\/]effort(?:\s+(.+))?$/i);
   if (effortMatch) {
     const effectiveThreadKey = threadKey || `${channel}-${replyThreadTs}`;
-    const VALID_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
     const arg = effortMatch[1]?.trim().toLowerCase();
 
     if (!arg || arg === 'current') {
@@ -807,13 +808,13 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     const args = (cronMatch[1] || '').trim();
     const sub = args.split(/\s+/)[0]?.toLowerCase();
 
-    // !cron add "schedule" message [--workdir <path>] [--engine <engine>] [--model <model>] [-- description]
+    // !cron add "schedule" message [--workdir <path>] [--engine <engine>] [--model <model>] [--effort <effort>] [-- description]
     if (sub === 'add') {
       const addMatch = args.match(/^add\s+"([^"]+)"\s+(.+)$/i);
       if (!addMatch) {
         await slack.chat.postMessage({
           channel,
-          text: '사용법: `!cron add "0 9 * * 1-5" /scrum [--workdir ~/projects/likey-backend] [--engine claude] [--model sonnet] [-- 매일 아침 스크럼]`',
+          text: '사용법: `!cron add "0 9 * * 1-5" /scrum [--workdir ~/projects/likey-backend] [--engine claude] [--model sonnet] [--effort high] [-- 매일 아침 스크럼]`',
           thread_ts: replyThreadTs,
         });
         return true;
@@ -821,7 +822,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       const schedule = addMatch[1];
       let message = addMatch[2];
 
-      // --workdir / --engine / --model 추출 (description 의 `--` 보다 먼저 처리)
+      // --workdir / --engine / --model / --effort 추출 (description 의 `--` 보다 먼저 처리)
       let workdir = null;
       const wdMatch = message.match(/\s+--workdir\s+(\S+)/);
       if (wdMatch) {
@@ -860,6 +861,21 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         }
       }
 
+      let effort = null;
+      const effMatch = message.match(/\s+--effort\s+(\S+)/);
+      if (effMatch) {
+        effort = effMatch[1].toLowerCase();
+        message = message.replace(/\s+--effort\s+\S+/, '');
+        if (!VALID_EFFORTS.includes(effort)) {
+          await slack.chat.postMessage({
+            channel,
+            text: `❌ 알 수 없는 effort: \`${effort}\`\n사용 가능: ${VALID_EFFORTS.map(e => `\`${e}\``).join(', ')}`,
+            thread_ts: replyThreadTs,
+          });
+          return true;
+        }
+      }
+
       // -- description split
       let description = null;
       const descSplit = message.match(/^(.+?)\s+--\s+(.+)$/);
@@ -870,13 +886,14 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         message = message.trim();
       }
       try {
-        const job = addCronJob({ schedule, message, channel, userId, description, workdir, engine, model });
+        const job = addCronJob({ schedule, message, channel, userId, description, workdir, engine, model, effort });
         const wdLine = job.workdir ? `\n작업 디렉토리: \`${job.workdir}\`` : '';
         const engLine = job.engine ? `\n엔진: \`${job.engine}\`` : '';
         const mdlLine = job.model ? `\n모델: \`${job.model}\`` : '';
+        const effLine = job.effort ? `\neffort: \`${job.effort}\`` : '';
         await slack.chat.postMessage({
           channel,
-          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`${wdLine}${engLine}${mdlLine}\n설명: ${job.description}`,
+          text: `✅ Cron 등록 완료\nID: \`${job.id}\`\n스케줄: \`${job.schedule}\`\n명령: \`${job.message}\`${wdLine}${engLine}${mdlLine}${effLine}\n설명: ${job.description}`,
           thread_ts: replyThreadTs,
         });
       } catch (err) {
@@ -1020,8 +1037,9 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         const wdInfo = j.workdir ? ` | wd: \`${j.workdir}\`` : '';
         const engInfo = j.engine ? ` | engine: \`${j.engine}\`` : '';
         const mdlInfo = j.model ? ` | model: \`${j.model}\`` : '';
+        const effInfo = j.effort ? ` | effort: \`${j.effort}\`` : '';
         lines.push(`${status} \`${j.id}\` | \`${j.schedule}\` | ${j.description}`);
-        lines.push(`    명령: \`${j.message}\`${wdInfo}${engInfo}${mdlInfo} | 마지막 실행: ${lastRun}`);
+        lines.push(`    명령: \`${j.message}\`${wdInfo}${engInfo}${mdlInfo}${effInfo} | 마지막 실행: ${lastRun}`);
       }
       await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
       return true;
@@ -1049,6 +1067,8 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       lines.push(`    action: ${w.action || '(미설정)'}`);
       if (w.anchorChannel) lines.push(`    anchor: \`${w.anchorChannel}\``);
       if (w.engine) lines.push(`    engine: \`${w.engine}\``);
+      if (w.triageModel) lines.push(`    triageModel: \`${w.triageModel}\``);
+      if (w.triageEffort) lines.push(`    triageEffort: \`${w.triageEffort}\``);
     }
     await slack.chat.postMessage({ channel, text: lines.join('\n'), thread_ts: replyThreadTs });
     return true;
@@ -1070,9 +1090,10 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
   }
 
   // watch-set <channel_id> <field> <value>
-  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName|anchorChannel|engine)\s+([\s\S]+)$/i);
+  const watchSetMatch = userMessage.match(/^[!\/]watch-set\s+(\S+)\s+(sender|trigger|action|enabled|channelName|anchorChannel|engine|triageModel|triageEffort)\s+([\s\S]+)$/i);
   if (watchSetMatch) {
-    const [, chId, field, rawValue] = watchSetMatch;
+    const [, chId, rawField, rawValue] = watchSetMatch;
+    let field = rawField;
     const existing = getWatch(chId);
     if (!existing) {
       await slack.chat.postMessage({
@@ -1106,14 +1127,33 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       } else {
         update.engine = v;
       }
+    } else if (/^triage(model|effort)$/i.test(field)) {
+      // 판정(triage)에 쓰는 모델·effort — 지정하지 않으면 기본값(haiku, SDK 기본 effort)을 쓴다
+      const isModel = field.toLowerCase() === 'triagemodel';
+      field = isModel ? 'triageModel' : 'triageEffort';
+      const allowed = isModel ? VALID_MODELS : VALID_EFFORTS;
+      const v = value.toLowerCase();
+      if (v === 'reset' || v === 'default' || v === 'null') {
+        update[field] = null;
+      } else if (!allowed.includes(v)) {
+        await slack.chat.postMessage({
+          channel,
+          text: `❌ 알 수 없는 ${isModel ? '모델' : 'effort'}: \`${value}\`\n사용 가능: ${(isModel ? ['sonnet', 'opus', 'haiku'] : VALID_EFFORTS).map(a => `\`${a}\``).join(', ')} (또는 \`reset\`)`,
+          thread_ts: replyThreadTs,
+        });
+        return true;
+      } else {
+        update[field] = v;
+      }
     } else {
       update[field] = value;
     }
 
     saveWatch(chId, update);
+    const shownValue = update[field] === null ? '기본값' : JSON.stringify(update[field] ?? update.senders);
     await slack.chat.postMessage({
       channel,
-      text: `✅ Watch 설정 업데이트: \`${chId}\` ${field} → ${JSON.stringify(update[field] ?? update.senders)}`,
+      text: `✅ Watch 설정 업데이트: \`${chId}\` ${field} → ${shownValue}`,
       thread_ts: replyThreadTs,
     });
     return true;

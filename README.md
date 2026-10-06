@@ -132,7 +132,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | Command | Description |
 |---------|-------------|
 | `!cron` / `!cron list` | List all jobs |
-| `!cron add "<schedule>" <message> [--workdir <path>] [--engine <claude\|pty-claude>] [--model <sonnet\|opus\|haiku>] [-- <desc>]` | Register a scheduled job (optional workdir / engine / model + description) |
+| `!cron add "<schedule>" <message> [--workdir <path>] [--engine <claude\|pty-claude>] [--model <sonnet\|opus\|haiku>] [--effort <low\|medium\|high\|xhigh\|max>] [-- <desc>]` | Register a scheduled job (optional workdir / engine / model / effort + description; without `--effort` the default applies) |
 | `!cron pause <id>` / `!cron resume <id>` | Toggle job |
 | `!cron run <id>` | Execute immediately |
 | `!cron remove <id>` | Delete job |
@@ -143,7 +143,9 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | Command | Description |
 |---------|-------------|
 | `!watch <channel_id>` | Register a channel watch (multi-line `sender:` / `trigger:` / `action:` body) |
-| `!watch-set <channel_id> <field> <value>` | Edit a single field (`sender`, `trigger`, `action`, `enabled`, `channelName`, `anchorChannel`) |
+| `!watch-set <channel_id> <field> <value>` | Edit a single field (`sender`, `trigger`, `action`, `enabled`, `channelName`, `anchorChannel`, `engine`, `triageModel`, `triageEffort`) |
+| `!watch-set <channel_id> triageModel <sonnet\|opus\|haiku\|reset>` | Model used to decide whether a message matches the trigger (default `haiku`) |
+| `!watch-set <channel_id> triageEffort <low\|medium\|high\|xhigh\|max\|reset>` | Reasoning effort of that decision call (unset = SDK default, same as before) |
 | `!watches` | List all watches |
 | `!unwatch <channel_id>` | Remove a watch |
 

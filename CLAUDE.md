@@ -116,6 +116,15 @@ cron 은 모델도 작업 단위로 지정 가능:
 - `!cron add "<schedule>" <msg> --model sonnet -- <설명>` — 해당 cron 이 만든 스레드에 `!model` 과 동일하게 적용
 - 지정 안 하면 `CLAUDE_MODEL` 기본값 사용
 
+cron 은 effort 도 작업 단위로 지정 가능:
+- `!cron add "<schedule>" <msg> --effort high -- <설명>` — 해당 cron 이 만든 스레드에 `!effort` 와 동일하게 적용 (`low`·`medium`·`high`·`xhigh`·`max`)
+- 지정 안 하면 SDK 엔진 기본값 `xhigh` (`DEFAULT_EFFORT`). `pty-claude` 는 claude CLI 기본값
+
+watch 는 새 메시지가 trigger 에 해당하는지 판정하는 호출(`watch.js` 의 `triageMessage`)의 모델·effort 를 채널 단위로 지정 가능:
+- `!watch-set <channel_id> triageModel sonnet` — 판정 모델 (지정 안 하면 `haiku`)
+- `!watch-set <channel_id> triageEffort low` — 판정 effort (지정 안 하면 `effort` 옵션을 전달하지 않아 SDK 기본값)
+- 둘 다 `reset` 으로 해제. 판정 호출은 항상 SDK 로 실행되므로 `engine` 설정과 무관하다. watch 가 만든 스레드의 모델·effort 는 별개이며 이 설정의 대상이 아니다
+
 ## 주요 명령어
 
 | 명령어 | 설명 |
