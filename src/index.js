@@ -855,7 +855,14 @@ async function markStaleBackgroundCard(channel, ts, threadTs) {
 
 // ── 서버 시작 ──────────────────────────────────────────────────
 
-app.listen(PORT, async () => {
+app.listen(PORT, async (err) => {
+  // Express 5 는 listen 오류(포트 충돌 등)를 콜백 인자로 전달한다. 같은 포트에서 브릿지가 이미 실행 중이면 여기서 종료한다
+  // — 계속 진행하면 같은 앱 토큰으로 Socket Mode 에 연결하고 cron 을 중복 실행하며, 실행 중인 작업을 stale 로 정리한다
+  if (err) {
+    console.error(`[Server] Failed to listen on port ${PORT}: ${err.message}`);
+    process.exit(1);
+  }
+
   console.log(`[Server] Claude Slack Bridge running on port ${PORT} (mode: ${SLACK_MODE})`);
 
   // 서버 재시작 시 stale "처리 중" 메시지 정리 (스트리밍 중이던 턴 메시지, 백그라운드 현황 카드, 요청 메시지의 ⏳ 포함)
