@@ -35,8 +35,8 @@ src/
   session.js  — claude 엔진 실행 흐름 (턴별 표시, 백그라운드 대기 중 메시지 주입)
   claude.js   — Agent SDK query() 실행 (streaming input), 턴·도구·백그라운드 작업 이벤트, 세션 관리
   turn-view.js — Slack 표시 (턴 스트리밍 메시지 = 작업 타임라인, 백그라운드 현황 카드)
-  format.js   — 공통 포맷 (경과 시간, ctx, 도구 라벨)
-  commands.js — 명령어 처리 (!new, !cd, !session, !pause, !resume, !status, !stop, !queue)
+  format.js   — 공통 포맷 (경과 시간, ctx, 사용 한도, 도구 라벨)
+  commands.js — 명령어 처리 (!new, !cd, !session, !pause, !resume, !status, !stop, !queue, !usage)
   store.js    — 세션/스레드/작업디렉토리/인박스 영속 저장 (~/.claude/slack-bridge/)
   slack.js    — Slack WebClient, 스레드 히스토리 조회
   security.js — Slack 서명 검증, 사용자 화이트리스트
@@ -75,6 +75,9 @@ npm run dev    # 개발 (--watch)
    - 스킬을 고르면 스레드에 기억해 두었다가(메모리, 1시간) 다음 메시지 앞에 `/스킬 ` 을 붙인다. [입력창 열기] 는 모달로, [바로 실행] 은 인자 없이 실행한다
    - 스킬 목록은 `~/.claude/skills`·`~/.claude/commands` 와 작업 디렉토리의 `.claude/skills`·`.claude/commands` 를 읽는다 (플러그인 스킬 제외). 버튼 순서는 `skill-usage.json` 의 레포별 실행 횟수
    - 스레드 히스토리에서 브릿지 명령(`!`, `!silent` 제외)과 선택창 메시지(block_id `picker:`)를 뺀다. 선택창으로 시작한 스레드는 히스토리가 비어 `/스킬 인자` 가 맨 앞에 그대로 전달되고, CLI 가 스킬로 바로 실행한다 (앞에 다른 글이 붙으면 모델이 Skill 도구를 골라야 한다)
+9. 사용 한도 (턴 푸터 `5h: 3% 4h12m | 7d: 75%`, `!usage`)
+   - `rate_limit_event` 의 `unifiedWindows`(5h·7d 창별 사용률·리셋 시각)를 읽는다. CLI 가 응답 헤더(`anthropic-ratelimit-unified-*`)에서 읽은 값을 담는 내부 필드라 SDK 타입에는 없다. 이벤트의 `rateLimitType`·`utilization` 은 경고 대상 창 하나뿐이라(7d 경고면 7d 값) 그것만으로는 5h 를 알 수 없다
+   - `!usage` 는 haiku 로 짧게 한 번 요청해 이 이벤트를 받는다 (thinking 끔, 도구·설정·세션 저장 없음, 2~3초). `claude setup-token` 토큰에는 usage API(`/api/oauth/usage`, SDK `usage_EXPERIMENTAL…`)에 필요한 `user:profile` 권한이 없어서다. 5시간 창이 시작되기 전이면 이 요청으로 시작된다
 
 ## 개발 컨벤션
 
@@ -152,3 +155,4 @@ watch 는 새 메시지가 trigger 에 해당하는지 판정하는 호출(`watc
 | `!sync-all` | 최근 24h 내 변경된 모든 세션 일괄 동기화 |
 | `!sync-all <duration>` | 지정 기간 내 변경 세션 일괄 동기화 (예: `6h`, `30m`) |
 | `!engine` / `!engine <claude\|pty-claude>` | 스레드 AI 엔진 확인/변경 |
+| `!usage` / `!usage <계정>` | 5h·7d 사용 한도 확인 (사용률, 리셋까지 남은 시간). 인자가 없으면 활성 계정, 활성 계정이 없으면 머신 기본 로그인 |

@@ -11,13 +11,13 @@ Send a DM or mention the bot, and Claude Code runs on your local machine with re
 - **Session Management** — Start new sessions, switch between sessions, sync local CLI work to Slack, split long threads
 - **Working Directory** — Global, per-thread, and per-cron working directory settings with auto-detection on session switch
 - **Per-thread Model / Effort** — Override Claude model (`opus`/`sonnet`/`haiku`) and reasoning effort per thread
-- **Live Turn View** — Each turn streams into one Slack message: Claude's narration plus a task timeline (tool calls as cards going in progress → done/failed, parallel calls grouped, subagent progress summaries), ending with elapsed time, context usage (`ctx: 45k/200k`) and 5h rate-limit %
+- **Live Turn View** — Each turn streams into one Slack message: Claude's narration plus a task timeline (tool calls as cards going in progress → done/failed, parallel calls grouped, subagent progress summaries), ending with elapsed time, context usage (`ctx: 45k/200k`) and 5h / 7d rate-limit %
 - **Background Work** — Background shells and subagents keep running after the turn ends; a self-updating status card tracks them, completion notifications continue the session, and messages sent in the meantime go straight into the running session
 - **Thread Pause** — Freeze threads with `!pause`/`!resume`. Missed messages are automatically collected on resume
 - **Silent Mode** — Run a request quietly (`!silent <msg>`); progress is shadowed to DM, only the final result lands in the original thread
 - **Cron Automation** — Schedule recurring tasks with cron expressions, optionally with a per-job working directory
 - **Channel Watch** — Triage messages in any channel with Haiku and auto-respond to matching ones (`!watch`)
-- **Account Switching** — Register multiple Claude OAuth tokens and hot-swap between them (`!account switch`)
+- **Account Switching** — Register multiple Claude OAuth tokens and hot-swap between them (`!account switch`); check an account's 5h / 7d usage with `!usage`
 - **Question Relay** — Claude's `AskUserQuestion` presented as numbered choices in Slack, with answers forwarded back
 - **Voice Input** — Auto STT transcription on audio/video file upload (OpenAI with Google fallback)
 - **Security** — Slack request signature verification + user whitelist
@@ -161,6 +161,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!account add <name> <token>` | Register an account (DM only; token from `claude setup-token`) |
 | `!account switch <name>` | Switch active account (applies to next request) |
 | `!account remove <name>` | Remove an account |
+| `!usage` / `!usage <name>` | 5h / 7d usage limits (% used, time until reset) of the active account, or of the named one. Sends one short Haiku request and reads the rate-limit headers, since `claude setup-token` tokens can't call the usage API |
 
 ## Project Structure
 
@@ -172,7 +173,7 @@ src/
 ├── session.js     # Claude engine flow — per-turn views, message injection while waiting on background work
 ├── claude.js      # Agent SDK query() wrapper (streaming input), turn / tool / background task events
 ├── turn-view.js   # Slack rendering — streamed turn message (task timeline), background status card
-├── format.js      # Shared formatting (elapsed, ctx, tool labels)
+├── format.js      # Shared formatting (elapsed, ctx, rate limits, tool labels)
 ├── commands.js    # Command handlers (!new, !session, !wd, !cron, !watch, etc.)
 ├── cron.js        # Cron job management and scheduled execution
 ├── watch.js       # Channel watch — Haiku triage and auto-response
