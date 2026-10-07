@@ -4,10 +4,11 @@ import { join, basename, resolve } from 'path';
 import { slack, PICKER_BLOCK_PREFIX } from './slack.js';
 import { getSkillUsage, recordSkillUsage } from './store.js';
 
-// 레포·스킬 선택창. `!wd` 는 레포 선택창을, `!skills` 는 스킬 선택창을 스레드에 올린다.
+// 레포·스킬 선택창. `!wd` 는 레포 선택창을, `!skills`(`!sk`) 는 스킬 선택창을 스레드에 올린다.
 // 버튼이나 선택창을 누르면 같은 메시지를 다음 단계로 바꾼다 (레포 → 스킬 → 인자 입력).
 // 스킬을 고르면 그 스레드의 다음 메시지 앞에 `/스킬 ` 을 붙여 실행하므로, 모바일에서도 인자만 붙여넣으면 된다.
-// [입력창 열기] 를 누르면 모달에서 인자를 받는다
+// [입력창 열기] 를 누르면 모달에서 인자를 받는다. 모달에서 다른 스킬을 고르면 입력란 끝에 `/스킬 ` 을 추가해
+// `/open-pr on /wt 해줘` 처럼 여러 스킬을 이어 쓸 수 있다 (Slack 에는 앱이 사용자의 메시지 입력창에 글을 입력하는 API 가 없다)
 
 const PROJECTS_DIR = join(homedir(), 'projects');
 const CLAUDE_DIR = join(homedir(), '.claude');
@@ -199,6 +200,8 @@ export function repoPickerBlocks() {
   return blocks;
 }
 
+const skillOptions = (skills) => skills.map(s => [s.description ? `${s.name} — ${s.description}` : s.name, s.name]);
+
 export function skillPickerBlocks(workdir) {
   const skills = listSkills(workdir);
   if (skills.length === 0) return [section('skill-title', '🧰 이 작업 디렉토리에서 쓸 수 있는 스킬이 없습니다')];
@@ -207,8 +210,7 @@ export function skillPickerBlocks(workdir) {
   return [
     section('skill-title', `🧰 스킬을 고르세요 (\`${repoName(workdir)}\`)`),
     actions('skill-buttons', top.map(s => button(`picker_skill:${s.name}`, s.name, s.name))),
-    actions('skill-all', [select('picker_skill_select', `전체 스킬 (${skills.length}개)`,
-      skills.map(s => [s.description ? `${s.name} — ${s.description}` : s.name, s.name]))]),
+    actions('skill-all', [select('picker_skill_select', `전체 스킬 (${skills.length}개)`, skillOptions(skills))]),
   ];
 }
 
@@ -234,7 +236,19 @@ function ranBlocks(label, wdBlocks, note = '') {
   return [...wdBlocks, section('skill-ran', `▶ \`${esc(truncate(label, 200))}\`${note}`)];
 }
 
-function argsModal(skill, meta) {
+// 인자 입력란의 block_id. 모달에서 스킬을 추가할 때마다(rev) 새 id 를 지정한다 — block_id 가 같으면 views.update 뒤에도
+// Slack 이 사용자가 입력해 둔 값을 유지해서 initial_value 가 적용되지 않는다. rev 0 은 이전 버전 모달과 같은 `args`
+const argsBlockId = (rev) => (rev ? `args-${rev}` : 'args');
+
+/**
+ * 인자 입력 모달. 아래의 스킬 버튼·선택창으로 다른 스킬을 고르면 입력란 끝에 `/스킬 ` 을 추가한다 (insertSkill)
+ * @param {object} meta - private_metadata. `rev` 는 스킬을 추가한 횟수
+ * @param {string} [text] - 입력란에 채울 값
+ */
+function argsModal(skill, workdir, meta, text = '') {
+  const others = listSkills(workdir).filter(s => s.name !== skill.name);
+  const top = rankSkills(others, repoName(workdir)).slice(0, SKILL_BUTTON_COUNT);
+  const rev = meta.rev || 0;
   return {
     type: 'modal',
     callback_id: 'picker_skill_args',
@@ -246,18 +260,45 @@ function argsModal(skill, meta) {
       ...(skill.description ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: esc(truncate(skill.description, 300)) }] }] : []),
       {
         type: 'input',
-        block_id: 'args',
+        block_id: argsBlockId(rev),
         optional: true,
         label: { type: 'plain_text', text: '인자' },
+        ...(others.length && { hint: { type: 'plain_text', text: '아래에서 고른 스킬은 입력란 끝에 /스킬이름 형태로 추가됩니다' } }),
         element: {
           type: 'plain_text_input',
           action_id: 'value',
           multiline: true,
+          ...(text && { initial_value: text }),
           placeholder: { type: 'plain_text', text: truncate(skill.argumentHint || '요청 내용', MAX_PLACEHOLDER) },
         },
       },
+      ...(others.length ? [
+        { type: 'actions', block_id: 'insert-buttons', elements: top.map(s => button(`picker_insert:${s.name}`, `/${s.name}`, s.name)) },
+        // 선택창도 같은 이유로 block_id 가 같으면 고른 항목이 표시된 채 남으므로, 추가할 때마다 block_id 를 바꿔 선택을 해제한다
+        { type: 'actions', block_id: `insert-all-${rev}`, elements: [select('picker_insert_select', `스킬 추가 (전체 ${others.length}개)`, skillOptions(others))] },
+      ] : []),
     ],
   };
+}
+
+/**
+ * 모달의 스킬 버튼·선택창 (block_actions). 고른 스킬을 입력란 끝에 추가한다.
+ * 앞 글과는 공백으로 구분하고 뒤에도 공백을 추가해서 바로 이어서 입력할 수 있게 한다
+ */
+async function insertSkill(payload, action, getWorkdir) {
+  const view = payload.view;
+  const meta = JSON.parse(view?.private_metadata || '{}');
+  if (!meta.channel || !meta.threadTs) return;
+  const workdir = getWorkdir(`${meta.channel}-${meta.threadTs}`);
+  const skills = listSkills(workdir);
+  const skill = skills.find(s => s.name === meta.skill);
+  const name = action.selected_option?.value ?? action.value;
+  if (!skill || !skills.some(s => s.name === name)) return;
+  const rev = meta.rev || 0;
+  const current = view.state?.values?.[argsBlockId(rev)]?.value?.value || '';
+  const text = `${current}${current && !/\s$/.test(current) ? ' ' : ''}/${name} `;
+  // hash 는 연달아 누른 두 번째 추가가 첫 번째 결과를 덮어쓰지 않게 한다 (hash_conflict 로 실패)
+  await slack.views.update({ view_id: view.id, hash: view.hash, view: argsModal(skill, workdir, { ...meta, rev: rev + 1 }, text) });
 }
 
 // ── 처리 ────────────────────────────────────────────────────────
@@ -288,7 +329,7 @@ async function runPicked({ channel, threadTs, messageTs, userId, skill, args, wd
 }
 
 /**
- * 선택창의 버튼·선택 처리 (block_actions)
+ * 선택창의 버튼·선택 처리 (block_actions). 인자 입력 모달 안의 스킬 버튼·선택창도 이 함수로 전달된다
  * @param {object} payload
  * @param {object} deps
  * @param {(o: { threadKey: string, sessionKey: string, userId: string, dir: string }) => string} deps.setWorkdir - 스레드 작업 디렉토리 지정. 중단한 작업 안내 문구를 돌려준다
@@ -299,6 +340,10 @@ export async function handlePickerAction(payload, { setWorkdir, getWorkdir, runS
   const action = payload.actions?.[0];
   const actionId = action?.action_id || '';
   if (!actionId.startsWith('picker_')) return;
+  if (actionId.startsWith('picker_insert')) {
+    await insertSkill(payload, action, getWorkdir);
+    return;
+  }
 
   const channel = payload.container?.channel_id || payload.channel?.id;
   const messageTs = payload.container?.message_ts || payload.message?.ts;
@@ -334,7 +379,7 @@ export async function handlePickerAction(payload, { setWorkdir, getWorkdir, runS
   } else if (actionId === 'picker_skill_modal') {
     await slack.views.open({
       trigger_id: payload.trigger_id,
-      view: argsModal(skill, { channel, threadTs, messageTs, skill: skill.name, wd: wdBlocks[0]?.text?.text || '' }),
+      view: argsModal(skill, workdir, { channel, threadTs, messageTs, skill: skill.name, wd: wdBlocks[0]?.text?.text || '' }),
     });
   } else if (actionId === 'picker_skill_run') {
     await runPicked({ channel, threadTs, messageTs, userId, skill: skill.name, args: '', wdBlocks, workdir }, runSkill);
@@ -346,9 +391,9 @@ export async function handlePickerAction(payload, { setWorkdir, getWorkdir, runS
  */
 export async function handlePickerSubmission(payload, { getWorkdir, runSkill }) {
   if (payload.view?.callback_id !== 'picker_skill_args') return;
-  const { channel, threadTs, messageTs, skill, wd } = JSON.parse(payload.view.private_metadata || '{}');
+  const { channel, threadTs, messageTs, skill, wd, rev } = JSON.parse(payload.view.private_metadata || '{}');
   if (!channel || !threadTs || !skill) return;
-  const args = payload.view.state?.values?.args?.value?.value?.trim() || '';
+  const args = payload.view.state?.values?.[argsBlockId(rev)]?.value?.value?.trim() || '';
   const wdBlocks = wd ? [section('wd', wd)] : [];
   await runPicked({
     channel, threadTs, messageTs, userId: payload.user?.id, skill, args, wdBlocks,
