@@ -2,9 +2,9 @@ import { statSync } from 'fs';
 import { homedir } from 'os';
 import { slack, fetchThreadHistorySince } from './slack.js';
 import { clearSession, getSession, getWorkdir, saveSession, saveThread, isActiveThread, getThreadWorkdir, pauseThread, resumeThread, findSessionWorkdir, readSessionSummary, getSyncPoint, saveSyncPoint, getAllSessions, getAllThreads, findSessionFile, archiveThread, getWatches, getWatch, saveWatch, removeWatch, getSessionPrUrl, getThreadModel, setThreadModel, getThreadEffort, setThreadEffort, getThreadEngine, setThreadEngine, getAccounts, addAccount, removeAccount, setCurrentAccount } from './store.js';
-import { stopClaudeQuery, getClaudeQueryState, DEFAULT_EFFORT, VALID_EFFORTS } from './claude.js';
+import { stopClaudeQuery, getClaudeQueryState, fetchRateLimits, DEFAULT_EFFORT, VALID_EFFORTS } from './claude.js';
 import { stopClaudePtyQuery } from './claude-pty.js';
-import { formatBackgroundTasks } from './format.js';
+import { formatBackgroundTasks, formatRateLimit, formatUsageLines } from './format.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 import { repoPickerBlocks, skillPickerBlocks, workdirBlock } from './picker.js';
 
@@ -108,6 +108,8 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!account add <name> <token>\` — 계정 등록 (DM에서만, token은 \`claude setup-token\`으로 생성)
 \`!account switch <name>\` — 활성 계정 전환 (다음 요청부터 적용)
 \`!account remove <name>\` — 계정 삭제
+\`!usage\` — 활성 계정의 5h·7d 사용 한도 (사용률, 리셋까지 남은 시간)
+\`!usage <name>\` — 등록된 다른 계정의 사용 한도
 
 *기타*
 \`!silent <메시지>\` — 조용히 실행 (처리 과정 표시 없이 결과만 게시)
@@ -450,8 +452,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     }
     const elapsed = lock.startTime ? formatElapsed(Date.now() - lock.startTime) : '?';
     const ctxInfo = lock.lastUsage ? formatCtx(lock.lastUsage) : '';
-    const rl = lock.lastRateLimit;
-    const rlInfo = rl?.pct != null ? ` | 5h: ${rl.pct}%` : '';
+    const rlInfo = formatRateLimit(lock.lastRateLimit);
     const sid = getSession(sessionKey);
     const prUrl = sid ? getSessionPrUrl(sid) : null;
     const prInfo = prUrl ? ` | <${prUrl}|PR>` : '';
@@ -1245,6 +1246,31 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     }
 
     await slack.chat.postMessage({ channel, text: report.join('\n'), thread_ts: replyThreadTs });
+    return true;
+  }
+
+  // usage — 계정의 5h·7d 사용 한도 (인자가 없으면 활성 계정, 활성 계정도 없으면 머신 기본 로그인)
+  const usageMatch = userMessage.match(/^[!\/]usage(?:\s+(\S+))?$/i);
+  if (usageMatch) {
+    const data = getAccounts();
+    const name = usageMatch[1] || data.current;
+    if (name && !data.accounts[name]) {
+      await slack.chat.postMessage({
+        channel,
+        text: `❌ \`${name}\` 계정을 찾을 수 없습니다. \`!account list\` 로 확인하세요.`,
+        thread_ts: replyThreadTs,
+      });
+      return true;
+    }
+    const label = name ? `\`${name}\`` : '머신 기본 로그인';
+    let text;
+    try {
+      const windows = await fetchRateLimits(name ? data.accounts[name].token : null);
+      text = [`📊 Claude 사용 한도 — ${label}`, ...formatUsageLines(windows)].join('\n');
+    } catch (err) {
+      text = `❌ ${label} 사용 한도를 조회하지 못했습니다: ${err.message}`;
+    }
+    await slack.chat.postMessage({ channel, text, thread_ts: replyThreadTs });
     return true;
   }
 

@@ -20,18 +20,49 @@ export function formatCtx(usage) {
   return ` | ctx: ${ctx}`;
 }
 
+// 표시하는 사용 한도 창 — rate_limit_event 의 rateLimitType → 표시 이름
+export const RATE_LIMIT_WINDOWS = { five_hour: '5h', seven_day: '7d' };
+
+// 사용 한도 창이 리셋되기까지 남은 시간 (2d3h · 4h12m · 35m). resetsAt 은 epoch 초, 없거나 지났으면 빈 문자열
+export function formatResetIn(resetsAt, now = Date.now()) {
+  const sec = resetsAt ? Math.floor(resetsAt - now / 1000) : 0;
+  if (sec <= 0) return '';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}d${h}h`;
+  return h > 0 ? `${h}h${m}m` : `${m}m`;
+}
+
+// 턴 푸터·진행 표시용 사용 한도 (rl 은 claude.js rateLimitWindows() 형식). 5h 는 리셋까지 남은 시간도 붙인다
 export function formatRateLimit(rl) {
-  if (!rl || rl.pct == null) return '';
-  let reset = '';
-  if (rl.resetsAt) {
-    const remaining = Math.max(0, rl.resetsAt - Math.floor(Date.now() / 1000));
-    if (remaining > 0) {
-      const h = Math.floor(remaining / 3600);
-      const m = Math.floor((remaining % 3600) / 60);
-      reset = h > 0 ? ` ${h}h${m}m` : ` ${m}m`;
-    }
+  let out = '';
+  if (rl?.five_hour) {
+    const reset = formatResetIn(rl.five_hour.resetsAt);
+    out += ` | 5h: ${rl.five_hour.pct}%${reset ? ` ${reset}` : ''}`;
   }
-  return ` | 5h: ${rl.pct}%${reset}`;
+  if (rl?.seven_day) out += ` | 7d: ${rl.seven_day.pct}%`;
+  return out;
+}
+
+// 리셋 시각 (서버 로컬 시간) — 오늘이면 HH:MM, 아니면 M/D(요일) HH:MM
+function formatResetAt(resetsAt, now = new Date()) {
+  const d = new Date(resetsAt * 1000);
+  const hhmm = d.toTimeString().slice(0, 5);
+  if (d.toDateString() === now.toDateString()) return hhmm;
+  return `${d.getMonth() + 1}/${d.getDate()}(${'일월화수목금토'[d.getDay()]}) ${hhmm}`;
+}
+
+/** `!usage` 본문 — 창마다 한 줄 (막대 · 사용률 · 리셋까지 남은 시간과 시각) */
+export function formatUsageLines(windows) {
+  return Object.entries(RATE_LIMIT_WINDOWS).filter(([type]) => windows[type]).map(([type, label]) => {
+    const { pct, resetsAt } = windows[type];
+    // 내림 — 막대가 꽉 차면 한도에 닿은 것
+    const filled = Math.min(10, Math.max(0, Math.floor(pct / 10)));
+    const reset = formatResetIn(resetsAt);
+    const resetInfo = reset ? ` · ${reset} 뒤 리셋 (${formatResetAt(resetsAt)})` : '';
+    return `${label}  ${'█'.repeat(filled)}${'░'.repeat(10 - filled)}  ${pct}%${resetInfo}`;
+  });
 }
 
 // HH:MM:SS (서버 로컬 시간)

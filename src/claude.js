@@ -1,7 +1,8 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { randomUUID } from 'crypto';
+import { tmpdir } from 'os';
 import { getSession, saveSession, clearSession, getActiveToken } from './store.js';
-import { describeTool, truncate } from './format.js';
+import { describeTool, truncate, RATE_LIMIT_WINDOWS } from './format.js';
 
 // 실행 중인 SDK query (세션별) — 중단·메시지 주입·상태 확인용
 const liveQueries = new Map();
@@ -15,6 +16,8 @@ const DEFAULT_BG_WAIT_CEILING_MS = 60 * 60 * 1000;
 const CLOSE_GRACE_MS = 1500;
 const NOTIFIED_CLOSE_GRACE_MS = 15000;
 const MAX_ACTIVITIES = 20;
+// `!usage` 조회 요청이 사용 한도 정보를 돌려주길 기다리는 최대 시간
+const USAGE_PROBE_TIMEOUT_MS = 30000;
 
 // 스레드에 effort 지정이 없을 때 SDK 엔진이 쓰는 기본값 (`!effort` 안내문도 이 값을 표시한다)
 export const DEFAULT_EFFORT = 'xhigh';
@@ -86,6 +89,32 @@ function toolResultText(content) {
 }
 
 /**
+ * CLI 에 넘길 환경변수. CLAUDECODE 를 지워 nested session 으로 보지 않게 하고,
+ * 계정 토큰이 있으면 CLAUDE_CODE_OAUTH_TOKEN 을 덮어쓴다 (없으면 머신 기본 로그인)
+ */
+function claudeEnv(token) {
+  const { CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, ...env } = process.env;
+  if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token;
+  return env;
+}
+
+/**
+ * rate_limit_event 에서 창별 사용률을 꺼낸다 — { five_hour?: { pct, resetsAt }, seven_day?: ... } (resetsAt 은 epoch 초). 아는 창이 없으면 null
+ * unifiedWindows 는 CLI 가 응답 헤더(anthropic-ratelimit-unified-5h·7d-*)에서 읽은 창별 값으로, SDK 타입에는 없는 내부 필드다.
+ * 이 필드가 없으면 경고 대상인 창 하나(rateLimitType·utilization)만 쓴다
+ */
+function rateLimitWindows(info) {
+  const windows = {};
+  const add = (type, utilization, resetsAt) => {
+    if (!Object.hasOwn(RATE_LIMIT_WINDOWS, type) || utilization == null) return;
+    windows[type] = { pct: Math.round(utilization * 100), resetsAt: resetsAt ?? null };
+  };
+  for (const [type, w] of Object.entries(info.unifiedWindows || {})) add(type, w?.utilization, w?.resetsAt);
+  if (!windows[info.rateLimitType]) add(info.rateLimitType, info.utilization, info.resetsAt);
+  return Object.keys(windows).length ? windows : null;
+}
+
+/**
  * Claude Code를 Agent SDK로 실행한다. 턴이 끝나도 백그라운드 작업이 남아 있으면 query 를 열어 두고,
  * 작업 완료 알림이나 sendToClaudeQuery() 로 넣은 메시지마다 턴이 이어진다
  *
@@ -121,13 +150,8 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
   // SDK options 구성
   // systemPrompt: preset을 사용해야 CLI가 ~/.claude/settings.json (language, skills 등)을 정상 로드함
   // systemPrompt를 생략하면 SDK가 빈 문자열("")을 전달하여 기본 시스템 프롬프트가 무시됨
-  // CLAUDECODE 환경변수 제거 (nested session 방지)
-  const { CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, ...cleanEnv } = process.env;
-
-  // 활성 계정 토큰이 있으면 CLAUDE_CODE_OAUTH_TOKEN 오버라이드
-  // 없으면 기존 동작(머신 기본 로그인) 유지
-  const activeToken = getActiveToken();
-  if (activeToken) cleanEnv.CLAUDE_CODE_OAUTH_TOKEN = activeToken;
+  // 활성 계정 토큰이 있으면 그 계정으로, 없으면 머신 기본 로그인으로 실행한다
+  const cleanEnv = claudeEnv(getActiveToken());
 
   const ceilingMs = Number(cleanEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ?? DEFAULT_BG_WAIT_CEILING_MS);
 
@@ -388,16 +412,9 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
         }
       }
 
-      // rate limit 이벤트 — 5h 사용률 추적
+      // rate limit 이벤트 — 5h·7d 사용률 추적
       if (msg.type === 'rate_limit_event' && msg.rate_limit_info) {
-        const rl = msg.rate_limit_info;
-        if (rl.utilization != null) {
-          lastRateLimit = {
-            pct: Math.round(rl.utilization * 100),
-            resetsAt: rl.resetsAt || null,
-            type: rl.rateLimitType || null,
-          };
-        }
+        lastRateLimit = rateLimitWindows(msg.rate_limit_info) || lastRateLimit;
       }
 
       // result 이벤트 — 턴 종료. 백그라운드 작업이 남아 있으면 query 는 계속 열려 있다
@@ -465,4 +482,49 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
     console.log(`[Claude] Background tasks killed at wait ceiling for ${sessionKey}: ${backgroundKill.tasks.join(', ') || '(unknown)'}`);
   }
   return { usage: resultUsage || lastUsage, rateLimit: lastRateLimit, backgroundKill };
+}
+
+/**
+ * 계정의 5h·7d 사용률을 지금 조회한다 (`!usage`). token 이 없으면 머신 기본 로그인
+ * `claude setup-token` 토큰에는 usage API 에 필요한 user:profile 권한이 없어서, haiku 로 짧게 한 번 요청하고
+ * 그 응답 헤더로 CLI 가 보내는 rate_limit_event 를 읽는다 (5시간 창이 시작되기 전이면 이 요청으로 시작된다)
+ * @param {string|null} token
+ * @returns {Promise<object>} rateLimitWindows() 형식. 조회하지 못하면 에러를 던진다
+ */
+export async function fetchRateLimits(token) {
+  const q = query({
+    prompt: 'quota',
+    options: {
+      model: 'haiku',
+      systemPrompt: 'Reply with one word.',
+      thinking: { type: 'disabled' },
+      maxTurns: 1,
+      tools: [],
+      settingSources: [],
+      persistSession: false,
+      cwd: tmpdir(),
+      env: claudeEnv(token),
+    },
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { q.close(); } catch { /* 이미 종료됨 */ }
+  }, USAGE_PROBE_TIMEOUT_MS);
+  let error = null;
+  try {
+    for await (const msg of q) {
+      if (msg.type === 'rate_limit_event' && msg.rate_limit_info) {
+        const windows = rateLimitWindows(msg.rate_limit_info);
+        if (windows) return windows;
+      }
+      if (msg.type === 'result' && msg.is_error) error = msg.errors?.join(', ') || msg.result || msg.subtype;
+    }
+  } catch (err) {
+    if (!timedOut) throw err;
+  } finally {
+    clearTimeout(timer);
+    try { q.close(); } catch { /* 이미 종료됨 */ }
+  }
+  throw new Error(timedOut ? `${USAGE_PROBE_TIMEOUT_MS / 1000}초 안에 응답이 없습니다` : error || '응답에 사용 한도 정보가 없습니다');
 }
