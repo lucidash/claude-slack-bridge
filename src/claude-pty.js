@@ -22,6 +22,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import xtermPkg from '@xterm/headless';
 import { getSession, saveSession, clearSession, getActiveToken } from './store.js';
+import { assertSessionNotHeld } from './live-sessions.js';
 
 function findJsonlForSid(sid) {
   try {
@@ -129,6 +130,8 @@ export async function runClaudeViaPty(sessionKey, prompt, workdir, callbacks = {
     clearSession(sessionKey);
     existingSid = null;
   }
+  // 다른 프로세스(로컬 터미널 등)가 열어 둔 세션은 이어받지 않는다
+  if (existingSid) assertSessionNotHeld(existingSid);
 
   const args = ['--dangerously-skip-permissions'];
   if (existingSid) args.unshift('--resume', existingSid);

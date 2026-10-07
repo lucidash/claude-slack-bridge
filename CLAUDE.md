@@ -34,6 +34,7 @@ src/
   picker.js   — 레포·스킬 선택창 (!wd, !skills): 스킬 목록, 버튼·선택창, 인자 입력 모달
   session.js  — claude 엔진 실행 흐름 (턴별 표시, 백그라운드 대기 중 메시지 주입)
   claude.js   — Agent SDK query() 실행 (streaming input), 턴·도구·백그라운드 작업 이벤트, 세션 관리
+  live-sessions.js — 다른 프로세스(로컬 터미널 등)가 열어 둔 세션 확인·종료 (~/.claude/sessions)
   turn-view.js — Slack 표시 (턴 스트리밍 메시지 = 작업 타임라인, 백그라운드 현황 카드)
   format.js   — 공통 포맷 (경과 시간, ctx, 사용 한도, 도구 라벨)
   commands.js — 명령어 처리 (!new, !cd, !session, !pause, !resume, !status, !stop, !queue, !usage)
@@ -59,6 +60,7 @@ npm run dev    # 개발 (--watch)
    - string prompt 를 쓰면 SDK 가 첫 `result` 에서 stdin 을 닫고, 그러면 CLI 가 `run_in_background` 셸을 5초 만에 종료하고 이후 턴의 AskUserQuestion 도 `Stream closed` 로 실패한다
    - 턴이 끝나도 백그라운드 작업(셸·서브에이전트)이 남아 있으면 입력을 열어 둔다. 완료 알림마다 턴이 이어져 `result` 가 여러 번 온다
    - 남은 작업도 넣을 메시지도 없을 때 입력을 닫아 끝낸다. 대기 한도(`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`)는 브릿지가 집행한다 (`stopTask()`)
+   - resume 하면 CLI 는 이전 프로세스에서 끝나지 않은 백그라운드 작업 알림(`shouldQuery: false`)을 프롬프트보다 먼저 처리하고, 모델 호출 없는 빈 `result`(`num_turns: 0`)를 보낸다. 그래서 첫 프롬프트에 uuid 를 지정하고, 그 uuid 를 `user_message_uuids` 로 반환하는 `result` 보다 먼저 온 이런 `result` 는 턴 종료로 처리하지 않는다 — 턴 종료로 처리하면 "처리완료 (0s)" 만 남고 입력이 닫혀, 이어지는 실제 턴의 AskUserQuestion·백그라운드 셸이 실패한다
 5. Slack 표시는 턴 단위 (`turn-view.js`)
    - 턴마다 스트리밍 메시지 하나(`chat.startStream`, timeline): 모델의 글 + 도구 호출 카드(`task_update`). 병렬 호출은 카드 하나로 묶는다
    - `task_update` 는 같은 id 로 다시 보내면 title·status 는 교체, details·output 은 **이어 붙는다** — 바뀌는 정보(서브에이전트 진행)는 title 에 넣는다
@@ -78,6 +80,10 @@ npm run dev    # 개발 (--watch)
 9. 사용 한도 (턴 푸터 `5h: 3% 4h12m | 7d: 75%`, `!usage`)
    - `rate_limit_event` 의 `unifiedWindows`(5h·7d 창별 사용률·리셋 시각)를 읽는다. CLI 가 응답 헤더(`anthropic-ratelimit-unified-*`)에서 읽은 값을 담는 내부 필드라 SDK 타입에는 없다. 이벤트의 `rateLimitType`·`utilization` 은 경고 대상 창 하나뿐이라(7d 경고면 7d 값) 그것만으로는 5h 를 알 수 없다
    - `!usage` 는 haiku 로 짧게 한 번 요청해 이 이벤트를 받는다 (thinking 끔, 도구·설정·세션 저장 없음, 2~3초). `claude setup-token` 토큰에는 usage API(`/api/oauth/usage`, SDK `usage_EXPERIMENTAL…`)에 필요한 `user:profile` 권한이 없어서다. 5시간 창이 시작되기 전이면 이 요청으로 시작된다
+10. 세션 이어가기 (resume)
+   - resume 전에 `~/.claude/sessions/<pid>.json`(CLI 가 실행 중 기록하는 파일)으로 같은 세션을 열어 둔 다른 프로세스(로컬 터미널 등)를 찾고, 있으면 이어받지 않는다 (`live-sessions.js`). 두 곳에서 이어가면 같은 작업을 따로 진행하고 같은 기록 파일에 분기가 섞인다. 끝났거나 PID 가 재사용된 기록(`procStart` 불일치)과 브릿지가 실행한 프로세스는 제외한다
+   - `!session <id> takeover` 는 그 프로세스를 SIGTERM 으로 종료하고(최대 10초 대기) 이어받는다. `!session <id>`·`!sync <id>` 는 세션을 연결하면서 실행 중인 곳이 있으면 알린다
+   - 스레드의 세션 매핑은 resume 할 세션을 찾지 못했을 때(`No conversation found`)만 지운다. 한도 초과·API 오류·프로세스 종료로 실패해도 매핑을 삭제하지 않아 다음 메시지가 같은 세션을 이어간다
 
 ## 개발 컨벤션
 
@@ -148,6 +154,7 @@ watch 는 새 메시지가 trigger 에 해당하는지 판정하는 호출(`watc
 | `!skills` | 스킬 선택창. 고른 뒤 다음 메시지를 `/스킬 메시지` 로 실행 |
 | `!session` | 현재 세션 ID 확인 |
 | `!session <id>` | 세션 전환 (작업 디렉토리 자동 감지) |
+| `!session <id> takeover` | 다른 곳(로컬 터미널 등)에서 열려 있는 세션의 프로세스를 종료하고 이어받기 |
 | `!pause` / `!resume` | 스레드 일시정지/재개 |
 | `!status` | 진행 중인 작업 상태 확인 (백그라운드 대기 중인지 포함) |
 | `!stop` | 실행 중 작업 중단 (백그라운드 작업 포함). `!stop all` 은 대기열도 비움 |

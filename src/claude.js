@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { getSession, saveSession, clearSession, getActiveToken } from './store.js';
 import { describeTool, truncate, RATE_LIMIT_WINDOWS } from './format.js';
+import { assertSessionNotHeld } from './live-sessions.js';
 
 // 실행 중인 SDK query (세션별) — 중단·메시지 주입·상태 확인용
 const liveQueries = new Map();
@@ -61,9 +62,10 @@ function createInputStream() {
   let wake = null;
   let closed = false;
   return {
-    push(text) {
+    // uuid 를 지정하면 CLI 가 그 메시지에 답한 result 의 user_message_uuids 로 반환한다
+    push(text, uuid) {
       if (closed) return false;
-      pending.push({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] }, parent_tool_use_id: null, session_id: '' });
+      pending.push({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] }, parent_tool_use_id: null, session_id: '', ...(uuid && { uuid }) });
       wake?.();
       return true;
     },
@@ -142,6 +144,8 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
   } = handlers;
   let sessionId = getSession(sessionKey);
   const isResume = !!sessionId;
+  // 다른 프로세스(로컬 터미널 등)가 열어 둔 세션은 이어받지 않는다
+  if (isResume) assertSessionNotHeld(sessionId);
 
   const allowedDirs = process.env.CLAUDE_ALLOWED_DIRS || '';
   const skipPermissions = process.env.CLAUDE_SKIP_PERMISSIONS === 'true';
@@ -205,7 +209,8 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
   };
 
   const input = createInputStream();
-  input.push(prompt);
+  const promptUuid = randomUUID();
+  input.push(prompt, promptUuid);
 
   const q = query({
     prompt: input.messages,
@@ -217,6 +222,7 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
 
   // 턴 상태 — 첫 턴은 프롬프트를 넣는 순간 시작된 것으로 본다
   let inTurn = true;
+  let promptAnswered = false;
   let inputClosed = false;
   let sentSinceResult = false; // 마지막 result 이후 넣은 메시지 — 곧 턴이 열리므로 입력을 닫지 않는다
   let closeTimer = null;
@@ -419,15 +425,18 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
 
       // result 이벤트 — 턴 종료. 백그라운드 작업이 남아 있으면 query 는 계속 열려 있다
       if (msg.type === 'result') {
-        if (msg.subtype !== 'success') {
-          // error result
-          const errMsg = msg.error || msg.subtype || 'Unknown error';
-          if (isResume && msg.subtype === 'error_during_execution') {
-            clearSession(sessionKey);
-            console.log(`[Claude] Resume failed for session ${sessionId}, cleared. Error: ${errMsg}`);
-            throw new Error(`세션 resume 실패 (${sessionId}): ${errMsg}\n새 세션으로 다시 시도해주세요.`);
+        // resume 하면 CLI 는 이전 프로세스에서 끝나지 않은 백그라운드 작업 알림을 프롬프트보다 먼저, 모델 호출 없이 처리하고 빈 result 를 보낸다.
+        // 이 result 를 턴 종료로 처리하면 "처리완료 (0s)" 만 남고 입력이 닫혀, 이어지는 실제 턴의 질문 응답·백그라운드 셸이 실패한다 — 프롬프트의 답이 올 때까지 건너뛴다
+        if (!promptAnswered) {
+          const replyTo = msg.user_message_uuids || (msg.user_message_uuid ? [msg.user_message_uuid] : []);
+          if (msg.subtype === 'success' && msg.num_turns === 0 && !msg.result && !replyTo.includes(promptUuid)) {
+            console.log(`[Claude] Skipped a result with no model call before the prompt's reply for ${sessionKey}`);
+            continue;
           }
-          throw new Error(errMsg);
+          promptAnswered = true;
+        }
+        if (msg.subtype !== 'success') {
+          throw new Error(msg.errors?.join('\n') || msg.subtype || 'Unknown error');
         }
         if (msg.modelUsage) {
           const entries = Object.entries(msg.modelUsage);
@@ -461,12 +470,9 @@ export async function runClaudeCode(sessionKey, prompt, workdir, handlers = {}) 
     if (abortController.signal.aborted) {
       throw new Error('중단됨 (사용자 요청)');
     }
-    // resume 실패 처리
-    if (isResume && !getSession(sessionKey)) {
-      // 이미 clearSession 된 경우 (위 result 핸들러에서)
-      throw err;
-    }
-    if (isResume) {
+    // resume 할 세션을 찾지 못했을 때만 매핑을 지운다. 한도 초과·API 오류·프로세스 종료에도 지우면
+    // 다음 메시지가 새 세션으로 시작해 맥락을 잃는다
+    if (isResume && /No conversation found/i.test(err.message)) {
       clearSession(sessionKey);
       console.log(`[Claude] Resume failed for session ${sessionId}, cleared. Error: ${err.message}`);
       throw new Error(`세션 resume 실패 (${sessionId}): ${err.message}\n새 세션으로 다시 시도해주세요.`);
