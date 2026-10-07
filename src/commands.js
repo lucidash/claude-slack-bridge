@@ -7,6 +7,7 @@ import { stopClaudePtyQuery } from './claude-pty.js';
 import { formatBackgroundTasks, formatRateLimit, formatUsageLines } from './format.js';
 import { addCronJob, removeCronJob, pauseCronJob, resumeCronJob, runCronJobNow, listCronJobs, getCronHistory } from './cron.js';
 import { repoPickerBlocks, skillPickerBlocks, workdirBlock } from './picker.js';
+import { findSessionHolders, describeSessionHolders, terminateSessionHolders } from './live-sessions.js';
 
 // !model / !cron add --model 에서 공통으로 쓰는 허용 모델 목록
 const VALID_MODELS = ['sonnet', 'opus', 'haiku',
@@ -30,6 +31,13 @@ function stopLiveQuery(sessionKey) {
   return stopClaudeQuery(sessionKey) ? '\n🛑 진행 중이던 작업(백그라운드 포함)을 중단했습니다.' : '';
 }
 
+// 다른 프로세스(로컬 터미널 등)가 열어 둔 세션이면 그쪽이 끝나기 전에는 이어받지 않는다는 안내 (없으면 빈 문자열)
+function heldSessionNotice(sessionId, holders = findSessionHolders(sessionId)) {
+  if (!holders.length) return '';
+  return `⚠️ 이 세션은 다른 곳에서 실행 중입니다: ${describeSessionHolders(holders)}\n`
+    + `그쪽이 끝나기 전에는 메시지를 보내도 이어받지 않습니다. 종료하고 이어받으려면 \`!session ${sessionId} takeover\``;
+}
+
 /**
  * 스레드 작업 디렉토리를 바꾸고 세션을 초기화한다 (`!wd <path>`, 레포 선택창). 중단한 작업이 있으면 안내 문구를 돌려준다
  */
@@ -49,6 +57,7 @@ const HELP_TEXT = `*Claude Slack Bridge — 명령어 안내*
 \`!new\` / \`!reset\` — 새 세션 시작 (기존 세션 초기화)
 \`!session\` — 현재 세션 ID 확인
 \`!session <id>\` — 다른 세션으로 전환 (작업 디렉토리 자동 감지)
+\`!session <id> takeover\` — 다른 곳(로컬 터미널 등)에서 열려 있는 세션의 프로세스를 종료하고 이어받기
 \`!sync <id>\` — 로컬 세션 대화를 슬랙에 동기화 후 이어서 작업
 \`!sync-all\` — 최근 24h 내 변경된 모든 세션 일괄 동기화
 \`!sync-all <duration>\` — 지정 기간 내 변경 세션 동기화 (예: \`6h\`, \`30m\`)
@@ -136,10 +145,10 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     return true;
   }
 
-  // session <id>
+  // session <id> [takeover]
   const sessionMatch = userMessage.match(/^[!\/]session\s+(.+)$/i);
   if (sessionMatch) {
-    const newSessionId = sessionMatch[1].trim().replace(/`/g, '');
+    const [newSessionId, option] = sessionMatch[1].replace(/`/g, '').trim().split(/\s+/);
     const stopped = stopLiveQuery(sessionKey);
     saveSession(sessionKey, newSessionId);
 
@@ -153,6 +162,17 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
       lines.push(`\`\`\`cd ${detectedDir} && claude --resume ${newSessionId}\`\`\``);
     } else {
       lines.push(`⚠️ 세션 파일을 찾을 수 없습니다. resume 실패 시 \`!wd\`로 디렉토리를 맞춰주세요.`);
+    }
+
+    // takeover 면 세션을 열어 둔 다른 프로세스를 종료한다
+    const holders = findSessionHolders(newSessionId);
+    if (holders.length && option?.toLowerCase() === 'takeover') {
+      const remaining = await terminateSessionHolders(newSessionId, holders);
+      lines.push(remaining.length
+        ? `⚠️ 10초 안에 끝나지 않았습니다: ${describeSessionHolders(remaining)}\n직접 종료한 뒤 메시지를 보내주세요.`
+        : `🔌 종료했습니다: ${describeSessionHolders(holders)}\n이제 메시지를 보내면 이어서 진행합니다.`);
+    } else if (holders.length) {
+      lines.push(heldSessionNotice(newSessionId, holders));
     }
 
     await slack.chat.postMessage({
@@ -824,9 +844,10 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     // sync point 업데이트 (현재 시점까지 동기화 완료)
     saveSyncPoint(sessionId, totalTurns);
 
+    const notice = heldSessionNotice(sessionId);
     await slack.chat.postMessage({
       channel,
-      text: '✅ 동기화 완료. 이제 이 스레드에서 이어서 작업할 수 있습니다.',
+      text: notice ? `✅ 동기화 완료.\n${notice}` : '✅ 동기화 완료. 이제 이 스레드에서 이어서 작업할 수 있습니다.',
       thread_ts: replyThreadTs,
     });
     return true;

@@ -8,7 +8,7 @@ Send a DM or mention the bot, and Claude Code runs on your local machine with re
 
 - **Thread = Session** — Each Slack thread maps 1:1 to a Claude Code session. Run multiple independent sessions across threads simultaneously
 - **HTTP or Socket Mode** — Receive Slack events via Events API webhook *or* WebSocket Socket Mode (no public URL/tunnel required)
-- **Session Management** — Start new sessions, switch between sessions, sync local CLI work to Slack, split long threads
+- **Session Management** — Start new sessions, switch between sessions, sync local CLI work to Slack, split long threads. A session still open in another Claude Code process (e.g. a local terminal) is not resumed until that process ends or is taken over
 - **Working Directory** — Global, per-thread, and per-cron working directory settings with auto-detection on session switch
 - **Per-thread Model / Effort** — Override Claude model (`opus`/`sonnet`/`haiku`) and reasoning effort per thread
 - **Live Turn View** — Each turn streams into one Slack message: Claude's narration plus a task timeline (tool calls as cards going in progress → done/failed, parallel calls grouped, subagent progress summaries), ending with elapsed time, context usage (`ctx: 45k/200k`) and 5h / 7d rate-limit %
@@ -101,6 +101,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!new` / `!reset` | Clear session, start fresh |
 | `!session` | Show current session ID |
 | `!session <id>` | Switch to a specific session (auto-detects working directory) |
+| `!session <id> takeover` | Switch to a session still open elsewhere (e.g. a local terminal), terminating that process first |
 | `!sync <id>` | Sync local CLI session history to Slack thread |
 | `!sync-all [<duration>]` | Sync all sessions changed within window (default 24h, e.g. `6h`, `30m`) |
 | `!split` | Archive current thread and continue in a fresh thread (long-context relief) |
@@ -172,6 +173,7 @@ src/
 ├── picker.js      # Repo / skill pickers (!wd, !skills) — skill catalog, buttons, argument modal (appends other skills)
 ├── session.js     # Claude engine flow — per-turn views, message injection while waiting on background work
 ├── claude.js      # Agent SDK query() wrapper (streaming input), turn / tool / background task events
+├── live-sessions.js # Sessions held open by other Claude Code processes (~/.claude/sessions) — detect / terminate
 ├── turn-view.js   # Slack rendering — streamed turn message (task timeline), background status card
 ├── format.js      # Shared formatting (elapsed, ctx, rate limits, tool labels)
 ├── commands.js    # Command handlers (!new, !session, !wd, !cron, !watch, etc.)
