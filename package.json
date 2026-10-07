@@ -22,7 +22,7 @@
     "@slack/web-api": "^8.1.1",
     "@xterm/headless": "^5.5.0",
     "croner": "^10.0.1",
-    "dotenv": "^17.2.3",
+    "dotenv": "^18.0.4",
     "express": "^4.21.0",
     "node-pty": "^1.0.0"
   },
