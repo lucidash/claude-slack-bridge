@@ -134,6 +134,8 @@ cron / watch 도 작업 단위로 엔진 지정 가능:
 cron 은 모델도 작업 단위로 지정 가능:
 - `!cron add "<schedule>" <msg> --model sonnet -- <설명>` — 해당 cron 이 만든 스레드에 `!model` 과 동일하게 적용
 - 지정 안 하면 `CLAUDE_MODEL` 기본값 사용
+- `sonnet`·`opus`·`haiku` 는 CLI 가 정한 최신 모델이라 CLI 를 업데이트하면 바뀐다 (10/7 CLI 2.1.284 에서 `sonnet` 이 Sonnet 5 → 5.5). 고정하려면 전체 ID(`claude-sonnet-5` 등, `commands.js` 의 `VALID_MODELS`)를 쓴다
+- 등록된 cron 의 모델을 바꾸는 명령은 없다. `crons.json` 의 `model` 을 고친 뒤 `!cron resume <id>` 로 다시 예약한다 (예약은 메모리에 있어서 파일만 고치면 반영되지 않는다)
 
 cron 은 effort 도 작업 단위로 지정 가능:
 - `!cron add "<schedule>" <msg> --effort high -- <설명>` — 해당 cron 이 만든 스레드에 `!effort` 와 동일하게 적용 (`low`·`medium`·`high`·`xhigh`·`max`)

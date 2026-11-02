@@ -10,7 +10,10 @@ import { repoPickerBlocks, skillPickerBlocks, workdirBlock } from './picker.js';
 import { findSessionHolders, describeSessionHolders, terminateSessionHolders } from './live-sessions.js';
 
 // !model / !cron add --model 에서 공통으로 쓰는 허용 모델 목록
+// sonnet·opus·haiku 는 CLI 가 정한 최신 모델이라 CLI 를 업데이트하면 바뀐다 (10/7 CLI 2.1.284 에서 sonnet 이 Sonnet 5 → 5.5).
+// 모델을 고정하려면 전체 ID 를 쓴다
 const VALID_MODELS = ['sonnet', 'opus', 'haiku',
+  'claude-sonnet-5', 'claude-sonnet-5-5',
   'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7', 'claude-haiku-4-5-20251001'];
 
 function formatElapsed(ms) {
@@ -284,7 +287,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
     if (!VALID_MODELS.includes(arg)) {
       await slack.chat.postMessage({
         channel,
-        text: `❌ 알 수 없는 모델: \`${arg}\`\n사용 가능: \`sonnet\`, \`opus\`, \`haiku\``,
+        text: `❌ 알 수 없는 모델: \`${arg}\`\n사용 가능: ${VALID_MODELS.map(m => `\`${m}\``).join(', ')}`,
         thread_ts: replyThreadTs,
       });
       return true;
@@ -905,7 +908,7 @@ export async function handleCommand(userMessage, { channel, replyThreadTs, sessi
         if (!VALID_MODELS.includes(model)) {
           await slack.chat.postMessage({
             channel,
-            text: `❌ 알 수 없는 모델: \`${model}\`\n사용 가능: \`sonnet\`, \`opus\`, \`haiku\``,
+            text: `❌ 알 수 없는 모델: \`${model}\`\n사용 가능: ${VALID_MODELS.map(m => `\`${m}\``).join(', ')}`,
             thread_ts: replyThreadTs,
           });
           return true;
