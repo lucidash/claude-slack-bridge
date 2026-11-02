@@ -114,7 +114,7 @@ Socket mode requires no tunnel — the server initiates the WebSocket outbound.
 | `!wd <path>` | Set thread working directory (resets session) |
 | `!pwd` | Show current working directory |
 | `!skills` / `!sk` | Skill picker for the thread's working directory. After picking a skill, the next message is sent as `/<skill> <message>`; the *입력창 열기* (open input) button takes the arguments in a modal, where picking another skill appends ` /<skill> ` to the input (e.g. `/open-pr on /wt 해줘`) |
-| `!model [<opus\|sonnet\|haiku>]` | Show or override Claude model for this thread (`!model reset` to clear) |
+| `!model [<opus\|sonnet\|haiku>]` | Show or override Claude model for this thread (`!model reset` to clear). The aliases follow the CLI's latest model; pass a full ID such as `claude-sonnet-5` to pin a version (`--model` of `!cron add` too) |
 | `!effort [<low\|medium\|high\|xhigh\|max>]` | Show or override reasoning effort for this thread (default `xhigh` on the SDK engine; `!effort reset` to clear) |
 
 ### Execution Control
